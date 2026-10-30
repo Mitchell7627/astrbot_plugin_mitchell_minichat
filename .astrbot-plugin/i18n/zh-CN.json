@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "主动私聊Mini"
+  },
+  "pages": {
+    "mini": {
+      "title": "主动私聊Mini",
+      "description": "任务、概率与配置"
+    }
+  }
+}

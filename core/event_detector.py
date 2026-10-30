@@ -1,0 +1,381 @@
+"""用户活动事件识别（关键词规则，不调用 LLM）。
+
+作用有两个：
+1. 供调度器判断"用户当前是不是在做某件会持续一阵的事"，从而调整触发概率；
+2. 为提示词生成一段 event_hint，让她能顺着这件事往下说，而不是重新问"你在干嘛"。
+
+规则表落在 plugin_data/event_rules.json，用户可直接编辑，插件升级不会覆盖。
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+from astrbot.api import logger
+
+BUILTIN_RULES = {
+    "version": 1,
+    "default_ttl_minutes": 45,
+    "negation_prefixes": ["不想", "不要", "还没", "没去", "待会", "晚点", "不打算", "不饿", "不去", "别去", "不去了"],
+    "away_keywords": ["去上课", "上课去", "去上班", "上班去", "出门", "走了", "我走", "去公司",
+                      "去学校", "出去", "下楼", "去一趟", "先走了", "去开个会"],
+    "return_keywords": ["到家", "回来了", "我回来", "进家门", "进门", "我到了", "已经到家"],
+    "rules": [
+        {
+            "name": "eating",
+            "label": "在吃饭",
+            "ttl_minutes": 40,
+            "boost": 3.0,
+            "boost_budget": 1,
+            "keywords": ["吃饭", "吃面", "吃了", "干饭", "外卖", "点餐", "下馆子", "食堂", "吃早饭", "吃午饭", "吃晚饭", "吃宵夜"],
+            "stop_keywords": ["吃完了", "吃饱", "不吃了", "吃撑", "收碗", "洗碗", "吃完"],
+            "hint": "他 {elapsed} 分钟前提过在吃饭，这个点差不多吃完了。可以直接说\"吃完了吧\"这类已经知道答案的话，或者催他去洗碗；不要问\"吃完了吗\"。",
+        },
+        {
+            "name": "cooking",
+            "label": "在做饭",
+            "ttl_minutes": 40,
+            "boost": 2.5,
+            "boost_budget": 1,
+            "keywords": ["做饭", "炒菜", "做菜", "下厨", "烧菜", "做晚饭", "做午饭", "做早饭", "煲汤", "炖汤", "切菜", "准备做饭", "开火"],
+            "stop_keywords": ["做好了", "做完了", "炒好了", "出锅", "上桌", "开饭"],
+            "hint": "他 {elapsed} 分钟前在做饭，这会儿应该快出锅了。可以凑过去闻、说一句\"好香\"，或者催他快点、说要帮忙尝一口；不要问\"饭好了没\"。",
+        },
+        {
+            "name": "drinking",
+            "label": "在喝东西",
+            "ttl_minutes": 25,
+            "boost": 2.0,
+            "boost_budget": 1,
+            "keywords": ["喝奶茶", "喝咖啡", "喝水", "喝饮料", "喝果汁", "喝酒", "喝汤", "喝茶", "泡茶", "点奶茶", "点咖啡"],
+            "stop_keywords": ["喝完了", "喝饱", "不喝了", "喝不下", "收杯子", "洗杯子"],
+            "hint": "他 {elapsed} 分钟前说在喝东西，这会儿应该正喝着呢。可以凑过去讨一口、让他分你点，或者吐槽他喝的是什么；不要问\"你在喝什么\"。",
+        },
+        {
+            "name": "commute",
+            "label": "在路上",
+            "ttl_minutes": 50,
+            "boost": 2.5,
+            "boost_budget": 1,
+            "keywords": ["出门", "在路上", "地铁", "公交", "打车", "开车", "高铁", "机场", "上班路", "回家路", "到楼下"],
+            "stop_keywords": ["到了", "下车", "进公司", "到家了", "到公司"],
+            "hint": "他 {elapsed} 分钟前在路上，这会儿该到了。用陈述句接，比如\"到楼下了吧\"，或者直接说\"上来\"；不要问\"你到哪儿了\"。",
+        },
+        {
+            "name": "working",
+            "label": "在忙",
+            "ttl_minutes": 90,
+            "boost": 1.8,
+            "boost_budget": 1,
+            "keywords": ["开会", "加班", "写代码", "改bug", "赶论文", "复习", "考试", "上课", "写作业", "赶进度"],
+            "stop_keywords": ["开完了", "忙完了", "写完了", "下课", "考完了", "弄完了", "搞定了"],
+            "hint": "他 {elapsed} 分钟前说在忙，这会儿可能刚松手。别催进度，先伸手——拽袖子、把水推过去，或者说一句\"忙完没\"；不要问\"你在忙吗\"。",
+        },
+        {
+            "name": "shower",
+            "label": "在洗澡",
+            "ttl_minutes": 30,
+            "boost": 3.5,
+            "boost_budget": 1,
+            "keywords": ["洗澡", "冲个凉", "冲凉", "洗头", "洗漱", "去洗"],
+            "stop_keywords": ["洗完了", "出来了", "洗完"],
+            "hint": "他 {elapsed} 分钟前说去洗澡，现在该出来了。可以拿这个打趣，或者直接说\"头发别滴水\"、\"擦干了吗\"。",
+        },
+        {
+            "name": "gaming",
+            "label": "在打游戏",
+            "ttl_minutes": 60,
+            "boost": 2.0,
+            "boost_budget": 1,
+            "keywords": ["打游戏", "开黑", "上分", "开一把", "排位", "在玩"],
+            "stop_keywords": ["不玩了", "下机", "关电脑", "打完了", "打完"],
+            "hint": "他 {elapsed} 分钟前在打游戏，这会儿可能还在局里。可以凑过去、按他手机、抱怨一句被冷落；不要问\"你在玩什么呢\"。",
+        },
+        {
+            "name": "errand",
+            "label": "在忙家里的事",
+            "ttl_minutes": 45,
+            "boost": 2.5,
+            "boost_budget": 1,
+            "keywords": ["洗衣服", "收拾", "打扫", "遛狗", "买菜", "取快递", "超市", "倒垃圾", "拖地"],
+            "stop_keywords": ["弄完了", "回来了", "买好了", "收拾完"],
+            "hint": "他 {elapsed} 分钟前在忙家里的事，差不多该收尾了。可以接着问结果，比如\"弄完了？\"，或者直接要他过来。",
+        },
+    ],
+}
+
+
+def extract_message_text(event) -> str:
+    """从 AstrBot 事件里提取纯文本。"""
+    parts = []
+    try:
+        for comp in event.get_messages() or []:
+            text = getattr(comp, "text", None)
+            if text:
+                parts.append(str(text))
+    except Exception:
+        pass
+    if parts:
+        return " ".join(parts).strip()
+    try:
+        return str(getattr(event, "message_str", "") or "").strip()
+    except Exception:
+        return ""
+
+
+class EventRuleStore:
+    """事件规则表的加载与匹配。"""
+
+    def __init__(self, data_dir, engine_config=None) -> None:
+        self.path = Path(data_dir) / "event_rules.json"
+        self._engine = engine_config if isinstance(engine_config, dict) else {}
+        self._rules: list[dict] = []
+        self._negations: list[str] = []
+        self._away_keywords: list[str] = []
+        self._return_keywords: list[str] = []
+        self._default_ttl = 45
+        self._mtime = 0.0
+        self._last_check = 0.0
+        self._from_config = False
+        self._ensure_file()
+        self._load()
+
+    def _ensure_file(self) -> None:
+        try:
+            if not self.path.exists():
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_text(
+                    json.dumps(BUILTIN_RULES, ensure_ascii=False, indent=4),
+                    encoding="utf-8",
+                )
+                logger.info(f"[Minichat] 已生成事件词表模板喵: {self.path}")
+        except Exception as e:
+            logger.warning(f"[Minichat] 生成事件词表失败喵: {e}")
+
+    @staticmethod
+    def _split_kw(value):
+        """把配置里的“a,b,c”或列表统一成关键词列表，兼容中文逗号。"""
+        if isinstance(value, list):
+            return [str(x).strip() for x in value if str(x).strip()]
+        raw = str(value or "").replace("，", ",")
+        return [x.strip() for x in raw.split(",") if x.strip()]
+
+    @staticmethod
+    def _builtin_by_name(name):
+        for rule in BUILTIN_RULES.get("rules") or []:
+            if rule.get("name") == name:
+                return rule
+        return {}
+
+    @staticmethod
+    def _as_float(value, default):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _normalize_rule(self, rule: dict) -> dict:
+        """把界面配置里的一条规则补齐成内部结构。
+
+        boost / boost_budget 优先用规则里写的；没写就按 name 从内置规则回填，
+        这样已存在的配置文件（7 条规则没有这两个字段）无需手工编辑也能拿到
+        差异化加成，而不是所有事件都被拉平成同一个倍数。
+        """
+        name = rule.get("name")
+        builtin = self._builtin_by_name(name)
+
+        boost = rule.get("boost")
+        if boost is None:
+            boost = builtin.get("boost", 3.0)
+        boost = max(0.01, self._as_float(boost, 3.0))
+
+        budget = rule.get("boost_budget")
+        if budget is None:
+            budget = builtin.get("boost_budget", 1)
+        try:
+            budget = max(0, int(budget))
+        except (TypeError, ValueError):
+            budget = 1
+
+        return {
+            "name": name,
+            "label": rule.get("label") or name,
+            "ttl_minutes": int(rule.get("ttl_minutes") or self._default_ttl),
+            "boost": boost,
+            "boost_budget": budget,
+            "keywords": self._split_kw(rule.get("keywords")),
+            "stop_keywords": self._split_kw(rule.get("stop_keywords")),
+            "hint": rule.get("hint") or "",
+        }
+
+    def _load(self) -> None:
+        cfg_rules = self._engine.get("event_rules") or []
+        if isinstance(cfg_rules, list) and cfg_rules:
+            self._from_config = True
+            self._rules = [self._normalize_rule(r) for r in cfg_rules
+                           if isinstance(r, dict) and r.get("name")]
+            cfg_away = self._split_kw(self._engine.get("away_keywords"))
+            cfg_ret = self._split_kw(self._engine.get("return_keywords"))
+            self._away_keywords = cfg_away
+            self._return_keywords = cfg_ret
+            negs = self._engine.get("negation_prefixes")
+            self._negations = (list(BUILTIN_RULES["negation_prefixes"])
+                               if not isinstance(negs, list) or not negs else [str(x) for x in negs])
+            logger.info(
+                f"[Minichat] 事件规则来自界面配置，共 {len(self._rules)} 类喵。"
+            )
+            return
+        self._from_config = False
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8-sig"))
+            rules = data.get("rules") or []
+            self._rules = [
+                r for r in rules if isinstance(r, dict) and r.get("name")
+            ]
+            for r in self._rules:
+                builtin = self._builtin_by_name(r.get("name"))
+                if r.get("boost") is None:
+                    r["boost"] = builtin.get("boost", 3.0)
+                if r.get("boost_budget") is None:
+                    r["boost_budget"] = builtin.get("boost_budget", 1)
+            self._negations = [str(p) for p in (data.get("negation_prefixes") or []) if p]
+            self._away_keywords = [str(k) for k in (data.get("away_keywords") or []) if k]
+            self._return_keywords = [str(k) for k in (data.get("return_keywords") or []) if k]
+            self._default_ttl = int(data.get("default_ttl_minutes") or 45)
+            self._mtime = self.path.stat().st_mtime
+            logger.info(f"[Minichat] 事件词表已加载，共 {len(self._rules)} 类喵。")
+        except Exception as e:
+            logger.warning(f"[Minichat] 读取事件词表失败，退回内置规则喵: {e}")
+            self._rules = [r for r in BUILTIN_RULES["rules"] if r.get("name")]
+            self._negations = list(BUILTIN_RULES["negation_prefixes"])
+            self._away_keywords = list(BUILTIN_RULES["away_keywords"])
+            self._return_keywords = list(BUILTIN_RULES["return_keywords"])
+            self._default_ttl = BUILTIN_RULES["default_ttl_minutes"]
+
+    def reload_if_changed(self) -> bool:
+        """按 mtime 热加载，60 秒内最多检查一次。
+
+        规则来自界面配置时无需热加载文件（改了配置得重载插件），直接跳过。
+        """
+        if self._from_config:
+            return False
+        now = time.time()
+        if now - self._last_check < 60:
+            return False
+        self._last_check = now
+        try:
+            mtime = self.path.stat().st_mtime
+        except OSError:
+            return False
+        if mtime != self._mtime:
+            self._load()
+            return True
+        return False
+
+    def _is_negated(self, text: str, idx: int) -> bool:
+        # 命中词前 4 个字符里出现否定词，就当成否定。
+        # 4 个字能覆盖「不去」「别去」「不去了」这类紧贴否定，也能容纳「还没/待会/不打算」。
+        head = text[max(0, idx - 4): idx]
+        if any(p in head for p in self._negations):
+            return True
+        # 兜底：命中词紧跟着一个孤立的「不 / 别」，且再往前不是动词场景（避免「不错」「不要紧」误伤）
+        if head and head[-1] in ("不", "别"):
+            return True
+        return False
+
+    def match(self, text: str):
+        """返回命中的规则；未命中返回 None。"""
+        if not text:
+            return None
+        for rule in self._rules:
+            for kw in rule.get("keywords") or []:
+                idx = text.find(kw)
+                while idx != -1:
+                    if not self._is_negated(text, idx):
+                        return rule
+                    idx = text.find(kw, idx + 1)
+        return None
+
+    def _match_list(self, text: str, keywords: list[str]):
+        """在一组关键词里找第一个未被否定的命中词。"""
+        if not text:
+            return None
+        for kw in keywords:
+            idx = text.find(kw)
+            while idx != -1:
+                if not self._is_negated(text, idx):
+                    return kw
+                idx = text.find(kw, idx + 1)
+        return None
+
+    def match_away(self, text: str):
+        """判断这句话是否表示“我要离开，不在你身边了”，返回命中的离开词。"""
+        self.reload_if_changed()
+        return self._match_list(text, self._away_keywords)
+
+    def match_return(self, text: str):
+        """判断这句话是否表示“我回来了，回到你身边了”，返回命中的回归词。"""
+        self.reload_if_changed()
+        return self._match_list(text, self._return_keywords)
+
+    def is_stop(self, event: dict, text: str) -> bool:
+        """文本是否表示当前事件已结束。"""
+        if not isinstance(event, dict) or not text:
+            return False
+        name = event.get("name")
+        for rule in self._rules:
+            if rule.get("name") != name:
+                continue
+            for kw in rule.get("stop_keywords") or []:
+                idx = text.find(kw)
+                while idx != -1:
+                    if not self._is_negated(text, idx):
+                        return True
+                    idx = text.find(kw, idx + 1)
+            return False
+        return False
+
+    def build_hint(self, event: dict, elapsed_minutes: int) -> str:
+        """渲染事件提示文本。
+
+        默认只陈述事实（他说了什么、过了多久），不给出“该不该做完了”的结论，
+        判断交给模型按常识推理。规则表若显式提供 hint 则优先使用，
+        支持 {elapsed} 与 {label} 两个占位符。
+        """
+        if not isinstance(event, dict):
+            return ""
+        elapsed = str(max(1, int(elapsed_minutes)))
+        label = str(event.get("label") or event.get("name") or "")
+        # 容错：若在中文描述里填了多个别名（顿号/逗号分隔），只取第一个，
+        # 否则拼进句子会变成“提过在吃饭、吃东西”这种不通顺的表达。
+        for sep in ("、", "，", ",", "/", "|"):
+            if sep in label:
+                head = label.split(sep)[0].strip()
+                if head:
+                    label = head
+                break
+        template = str(event.get("hint") or "")
+        if template:
+            return template.replace("{elapsed}", elapsed).replace("{label}", label)
+        return f"他 {elapsed} 分钟前提过{label}。"
+
+    def rules_snapshot(self):
+        """返回当前生效的规则列表（供语义识别使用）。"""
+        self.reload_if_changed()
+        return list(self._rules)
+
+    def get_rule(self, name: str):
+        """按标识取规则。"""
+        self.reload_if_changed()
+        for rule in self._rules:
+            if rule.get("name") == name:
+                return rule
+        return None
+
+    def ttl_for(self, rule: dict) -> int:
+        try:
+            return int(rule.get("ttl_minutes") or self._default_ttl)
+        except (TypeError, ValueError):
+            return self._default_ttl

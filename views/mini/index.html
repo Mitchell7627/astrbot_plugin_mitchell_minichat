@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>主动私聊 Mini</title>
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="status-dot"></span>
+      <strong>主动私聊 Mini</strong>
+      <span class="muted" id="status-text">连接中…</span>
+    </div>
+    <div class="top-actions">
+      <span class="mono muted" id="panel-url"></span>
+      <button class="btn ghost sm" data-act="refresh">刷新</button>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="overview">概览</button>
+    <button class="tab" data-tab="tasks">任务</button>
+    <button class="tab" data-tab="prob">概率</button>
+    <button class="tab" data-tab="config">配置</button>
+  </nav>
+
+  <main class="main">
+    <section class="view" data-view="overview">
+      <div class="card">
+        <div class="card-head"><h3>会话</h3><span class="muted" id="ov-count"></span></div>
+        <div class="row wrap gap8">
+          <select class="input grow" id="ov-umo"></select>
+          <button class="btn ghost sm" data-act="refresh">刷新</button>
+        </div>
+      </div>
+      <div class="grid cards" id="ov-cards"></div>
+    </section>
+
+    <section class="view hidden" data-view="tasks">
+      <div class="card">
+        <div class="card-head"><h3>会话任务</h3><span class="muted" id="task-count"></span></div>
+        <div class="row wrap gap8">
+          <input class="input grow" id="add-umo" placeholder="添加会话：name:FriendMessage:QQ号">
+          <button class="btn sm" data-act="add-session">添加</button>
+          <button class="btn sm ghost" data-act="reload-plugin">重载插件</button>
+        </div>
+      </div>
+      <div id="task-list" class="stack"></div>
+    </section>
+
+    <section class="view hidden" data-view="prob">
+      <div class="card">
+        <div class="card-head"><h3>会话</h3><span class="muted" id="prob-hint"></span></div>
+        <div class="row wrap gap8">
+          <select class="input grow" id="prob-umo"></select>
+          <button class="btn sm" data-act="reload-prob">重新计算</button>
+          <button class="btn sm ghost" data-act="prob-resched">重新排程</button>
+        </div>
+      </div>
+
+      <div class="prob-top">
+      <div class="card" id="prob-base-card">
+        <div class="card-head"><h3>无事件时</h3><span class="muted" id="prob-base-meta"></span></div>
+        <div class="note">从你最后一句话开始算，覆盖 最短–最长 分钟的整段区间；每根柱子 = 下一次触发落在这段时间里的概率。</div>
+        <div class="chart-wrap">
+          <div class="chart" id="chart-base"></div>
+          <div class="axis" id="axis-base"></div>
+        </div>
+        <div class="stack gap8" id="stats-base"></div>
+      </div>
+
+      <div class="card" id="prob-sched-card">
+        <div class="card-head">
+          <h3>排程</h3>
+          <span class="muted" id="preset-hint">决定左边柱形图的形状</span>
+        </div>
+        <div class="preset-row" id="preset-row">
+          <button class="btn sm ghost preset" data-preset="light" data-act="preset-apply">偶尔聊</button>
+          <button class="btn sm ghost preset" data-preset="medium" data-act="preset-apply">默认</button>
+          <button class="btn sm ghost preset" data-preset="slightly" data-act="preset-apply">稍微有点粘人</button>
+          <button class="btn sm ghost preset" data-preset="clingy" data-act="preset-apply">粘人</button>
+          <button class="btn sm ghost preset" data-preset="custom" data-act="preset-apply">自定义</button>
+        </div>
+        <div id="prob-sched" class="form-grid"></div>
+      </div>
+
+      <div class="card" id="prob-weights-card">
+        <div class="card-head">
+          <h3>加权采样</h3>
+          <div class="row gap8" style="align-items:center">
+            <span class="badge warn hidden" id="prob-preview-badge">预览中 · 未保存</span>
+            <button class="btn sm ghost hidden" id="prob-preview-reset" data-act="preview-reset">还原</button>
+          </div>
+        </div>
+        <div id="prob-weights" class="form-grid"></div>
+      </div>
+      </div>
+
+      <div class="prob-group-title">全局事件设置</div>
+
+      <div class="prob-mid">
+      <div class="card" id="prob-event-card">
+        <div class="card-head"><h3>事件生效时</h3><span class="muted" id="prob-event-meta"></span></div>
+        <div class="note">横轴只到事件剩余有效期为止，比上图短；柱子越高表示越可能在那个时间段开口。</div>
+        <div class="chart-wrap">
+          <div class="chart" id="chart-event"></div>
+          <div class="axis" id="axis-event"></div>
+        </div>
+        <div class="stack gap8" id="stats-event"></div>
+      </div>
+
+      <div class="card" id="prob-away-card">
+        <div class="card-head"><h3>在场状态</h3><span class="muted">关键词一般留空，交给模型判断</span></div>
+        <div id="prob-away" class="form-grid"></div>
+      </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>加速事件消息</h3><span class="muted">只在「出门/在路上」这类事件生效时起作用</span></div>
+        <div id="prob-returnsoon" class="form-grid"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>事件规则</h3><span class="muted" id="rules-source"></span></div>
+        <div class="rules" id="rules-list"></div>
+        <div class="row gap8" style="margin-top:12px">
+          <button class="btn sm ghost" data-act="rule-add">添加规则</button>
+        </div>
+      </div>
+
+      <div class="prob-group-title">睡觉与提醒设置</div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>睡眠提醒</h3>
+          <div class="row gap8" style="align-items:center">
+            <span class="muted">拖右边的滑块，左边两张图跟着变（不保存）</span>
+            <span class="badge warn hidden" id="sleep-preview-badge">预览中 · 未保存</span>
+            <button class="btn sm ghost hidden" id="sleep-preview-reset" data-act="preview-reset">还原</button>
+          </div>
+        </div>
+        <div class="sleep-grid">
+          <div class="sleep-charts">
+            <div class="sleep-chart">
+              <div class="sleep-chart-head"><h4>晚睡提醒</h4><span class="muted" id="prob-night-meta"></span></div>
+              <div class="note">窗口内各时段被催的概率，由右边「晚睡」三段权重决定；某段权重调到 0，那段基本不会开口。</div>
+              <div class="chart-wrap">
+                <div class="chart" id="chart-night"></div>
+                <div class="axis" id="axis-night"></div>
+              </div>
+            </div>
+            <div class="sleep-chart" id="nap-chart-card">
+              <div class="sleep-chart-head"><h4>午睡提醒</h4><span class="muted" id="prob-nap-meta"></span></div>
+              <div class="note">午睡窗口内各时段被催的概率，权重和晚睡完全独立；关掉午睡提醒后这张图会变灰。</div>
+              <div class="chart-wrap">
+                <div class="chart" id="chart-nap"></div>
+                <div class="axis" id="axis-nap"></div>
+              </div>
+            </div>
+          </div>
+          <div class="sleep-controls">
+            <div class="sleep-ctl-block">
+              <div class="sleep-ctl-title">晚睡提醒</div>
+              <div id="sleep-night-controls" class="form-grid"></div>
+            </div>
+            <div class="sleep-ctl-block">
+              <div class="sleep-ctl-title">午睡提醒</div>
+              <div id="sleep-nap-controls" class="form-grid"></div>
+            </div>
+            <div class="sleep-ctl-block">
+              <div class="sleep-ctl-title">等会再睡（临时提醒）</div>
+              <div class="muted" style="font-size:12px;line-height:1.5;margin-bottom:6px">
+                说「等会睡 / 再看会手机」后，按这个区间和权重单独催一次。只影响这一次，不动上面两张图。
+              </div>
+              <div id="sleep-wait-controls" class="form-grid"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>作息与词表</h3><span class="muted">起床 / 夜晚起点 / 静音时长 / 睡句话术</span></div>
+        <div id="prob-sleep" class="form-grid"></div>
+      </div>
+    </section>
+
+    <section class="view hidden" data-view="config">
+      <div id="config-root" class="stack"></div>
+      <div class="savebar">
+        <span class="muted" id="save-hint"></span>
+        <div class="row gap8">
+          <button class="btn ghost sm" data-act="config-reload">放弃改动</button>
+          <button class="btn sm" data-act="config-save">保存</button>
+          <button class="btn sm" data-act="config-save-reload">保存并重载</button>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="overlay hidden" id="login-overlay">
+  <form class="login-card" id="login-form">
+    <h2>需要访问密码</h2>
+    <p class="muted">这个面板设置了密码，输入后即可进入。</p>
+    <input class="input" type="password" id="login-password" placeholder="密码" autocomplete="current-password">
+    <button class="btn w-full" type="submit">进入</button>
+    <p class="err" id="login-error"></p>
+  </form>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<a class="git-badge" id="ov-git" href="https://github.com/Mitchell7627/astrbot_plugin_mitchell_minichat" target="_blank" rel="noopener" title="前往 GitHub 仓库">
+  <span class="git-name">Mitchell7627</span>
+  <span class="git-link">github.com/Mitchell7627/astrbot_plugin_mitchell_minichat</span>
+</a>
+
+<div class="fab hidden" id="prob-fab" data-act="prob-save-all" title="保存本页所有改动">
+  <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4Zm-5 16a3 3 0 0 1-3-3 3 3 0 0 1 3-3 3 3 0 0 1 3 3 3 3 0 0 1-3 3Zm3-9H7V5h8v5Z"/></svg>
+  <span class="fab-label">保存</span>
+</div>
+<script src="./lib.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>
