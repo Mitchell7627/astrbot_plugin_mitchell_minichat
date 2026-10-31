@@ -2,7 +2,7 @@
 
 一个为 AstrBot 打造的**轻量主动私聊插件**：让机器人不用你招呼，自己挑时机凑过来开口，语气像真人一样自然。
 
-支持平台：aiocqhttp、qq_official、Telegram、企业微信、飞书、钉钉、KOOK。
+支持平台：aiocqhttp
 
 ## 它做什么
 
