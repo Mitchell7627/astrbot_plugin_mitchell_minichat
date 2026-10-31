@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import random
 import re
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.core.message.components import Plain
@@ -31,7 +33,9 @@ from .sleep_reminder import (
     current_window_start_ts,
     in_remind_window,
     match_sleep,
+    match_sleep_detail,
     match_wait,
+    match_wait_detail,
     pick_weighted_offset,
     pick_window_offset,
     wake_at_timestamp,
@@ -39,6 +43,7 @@ from .sleep_reminder import (
     _parse_hhmm,
 )
 from .splitter import calc_delay, split_text
+from .decisions import DecisionLog, clip_text
 
 TAG = "[Minichat]"
 
@@ -67,6 +72,15 @@ def _as_float_safe(value, default: float = 0.0) -> float:
         return default
 
 
+def _split_nicknames(raw) -> tuple[str, ...]:
+    """把「宝宝,宝贝」这类配置拆成元组（给谓语闸门判断「陪你/陪妃爱」用）。"""
+    if isinstance(raw, (list, tuple)):
+        parts = [str(x).strip() for x in raw]
+    else:
+        parts = [p.strip() for p in str(raw or "").replace("，", ",").split(",")]
+    return tuple(p for p in parts if p)
+
+
 def time_text(now: datetime | None = None) -> str:
     now = now or datetime.now()
     week = "一二三四五六日"[now.weekday()]
@@ -85,6 +99,15 @@ class Runner:
         self._firing: set[str] = set()
         # 事件过期巡检（30 秒一次），到点清事件并按规则决定要不要重排
         self._expiry_task: asyncio.Task | None = None
+        # 判定记录：「为什么记 / 为什么没记」+ 一键撤销
+        self.decisions = DecisionLog(
+            Path(getattr(plugin, "data_dir", ".") or ".") / "decisions.json",
+            limit=_as_int((plugin.engine_cfg or {}).get("decision_log_size"), 50),
+        )
+        self._dec_buffer: list[dict] = []
+        # 灰区复核（默认关得更省 token；开了也有小时/日上限兜着）
+        self._gray_candidate: dict | None = None
+        self._gray_calls: list[float] = []
 
     # ------------------------------------------------------------------
     # 配置
@@ -615,6 +638,10 @@ class Runner:
             "wait_early_weight": _as_float_safe(eng.get("wait_weight_early"), 1.4),
             "wait_mid_weight": _as_float_safe(eng.get("wait_weight_mid"), 1.0),
             "wait_tail_weight": _as_float_safe(eng.get("wait_weight_tail"), 0.6),
+            # 谓语闸门：判「睡觉」是不是真在说要去睡（「睡觉时间被占用了」不算）
+            "enable_judge": bool(eng.get("enable_utterance_judge", True)),
+            "judge_strict": bool(eng.get("judge_strict", True)),
+            "nicknames": _split_nicknames(eng.get("bot_nicknames")),
         }
 
     def _sleep_state(self, umo: str) -> dict | None:
@@ -658,8 +685,14 @@ class Runner:
         store = self.store
 
         # 1) 确定要睡 → sleeping（智能免打扰时长）
-        sleep_kw = match_sleep(text, cfg["sleep_keywords"])
-        if sleep_kw:
+        sleep = match_sleep_detail(
+            text, cfg["sleep_keywords"],
+            enable_judge=cfg["enable_judge"], strict=cfg["judge_strict"],
+            nicknames=cfg["nicknames"],
+        )
+        self._note("sleep", sleep)
+        if sleep["hit"]:
+            sleep_kw = sleep["hit"]["kw"]
             wake_at = self._sleep_wake_at(now, cfg)
             prev = self._sleep_state(umo) or {}
             store.set(umo, SLEEP_KEY, {
@@ -680,8 +713,14 @@ class Runner:
         #    （归「晚睡提醒」管：它关着就不排，午睡开关不影响这里）
         if not cfg["night_enabled"]:
             return False
-        wait_kw = match_wait(text, cfg["wait_keywords"])
-        if wait_kw:
+        wait = match_wait_detail(
+            text, cfg["wait_keywords"],
+            enable_judge=cfg["enable_judge"], strict=cfg["judge_strict"],
+            nicknames=cfg["nicknames"],
+        )
+        self._note("wait", wait)
+        if wait["hit"]:
+            wait_kw = wait["hit"]["kw"]
             prev = self._sleep_state(umo) or {}
             lo, hi = cfg["wait_lo"], cfg["wait_hi"]
             if lo > hi:
@@ -891,11 +930,259 @@ class Runner:
         self.store.save()
         logger.info(f"{TAG} 用户说「{kw}」，解除睡眠免打扰")
 
+    # ------------------------------------------------------------------
+    # 判定记录（面板「最近判定」+ 一键撤销）
+    # ------------------------------------------------------------------
+    WATCH_KEYS = ("away", "together", "active_event", "pre_event_next_at", "sleep_state")
+
+    def _dec_limit(self) -> int:
+        return max(0, _as_int(self.engine_cfg.get("decision_log_size"), 50))
+
+    def _snapshot(self, umo: str) -> dict:
+        return {k: copy.deepcopy(self.store.get(umo, k)) for k in self.WATCH_KEYS}
+
+    def _note(self, kind: str, detail) -> None:
+        """把一次匹配结果塞进本次消息的缓冲区，等出门时统一落记录。"""
+        if not isinstance(detail, dict):
+            return
+        hit = detail.get("hit")
+        if isinstance(hit, dict) and hit.get("kw"):
+            self._dec_buffer.append({
+                "kind": kind,
+                "kw": str(hit.get("kw")),
+                "verdict": hit.get("verdict") or "accept",
+                "rule": hit.get("gate_rule") or "",
+                "reason": hit.get("reason") or "",
+            })
+        for d in detail.get("dropped") or []:
+            if isinstance(d, dict) and d.get("kw"):
+                self._dec_buffer.append({
+                    "kind": d.get("kind") or kind,
+                    "kw": str(d.get("kw")),
+                    "verdict": d.get("verdict") or "gray",
+                    "rule": d.get("rule") or "",
+                    "reason": d.get("reason") or "",
+                    "name": d.get("name") or "",
+                })
+
+    def _flush_decisions(self, umo: str, text: str, before: dict, handled: bool) -> bool:
+        buf = self._dec_buffer
+        self._dec_buffer = []
+        if not buf:
+            return handled
+        self.decisions.limit = self._dec_limit()
+        # 灰区里「G2 兜底 / 事件类」才值得问一次模型；
+        # G1（后面接评价）是结构性灰区，问也是浪费 token。
+        self._gray_candidate = None
+        for d in buf:
+            if d.get("verdict") == "gray" and d.get("rule") == "G2" and d.get("kind") == "event":
+                self._gray_candidate = {"text": text, "kw": d["kw"], "name": d.get("name") or ""}
+                break
+        after = self._snapshot(umo)
+        touched = [
+            {"key": k, "before": before.get(k), "after": after.get(k)}
+            for k in self.WATCH_KEYS
+            if before.get(k) != after.get(k)
+        ]
+        stamp = time.time()
+        granted = False
+        seen: set[tuple] = set()
+        for i, d in enumerate(buf[:6]):
+            sig = (d["kind"], d["kw"], d["verdict"])
+            if sig in seen:
+                continue
+            seen.add(sig)
+            applied = d["verdict"] == "accept"
+            rec = {
+                "id": round(stamp + i * 0.001, 3),
+                "ts": stamp,
+                "umo": umo,
+                "kind": d["kind"],
+                "kw": d["kw"],
+                "verdict": d["verdict"],
+                "rule": d["rule"],
+                "reason": d["reason"],
+                "action": "applied" if applied else "dropped",
+                "source": "kw",
+                "text": clip_text(text),
+                "text_len": len(str(text or "")),
+                "touched": [],
+                "undo_state": "none",
+            }
+            # 一句话可能同时写 away + active_event，撤销要一次全回滚，
+            # 所以快照只挂在这句话的第一条 applied 记录上。
+            if applied and touched and not granted:
+                rec["touched"] = touched
+                rec["undo_state"] = "available"
+                granted = True
+            self.decisions.add(rec)
+        self.decisions.maybe_save()
+        # 有判定记录就说明这句话已经被「处理过」，别让 main.py 再用大提示重判一次
+        return True
+
+    def undo_decision(self, did) -> dict:
+        """撤销一条判定：把这句话改过的状态整条还原。"""
+        rec = self.decisions.get(did)
+        if not isinstance(rec, dict):
+            raise KeyError("找不到这条判定")
+        if rec.get("undo_state") != "available":
+            raise ValueError("这条判定已经不能撤销了")
+        umo = rec.get("umo")
+        items = rec.get("touched") or []
+        for item in items:
+            if self.store.get(umo, item.get("key")) != item.get("after"):
+                rec["undo_state"] = "stale"
+                self.decisions.maybe_save(0)
+                raise ValueError("状态已经变了，撤销会覆盖后来发生的事")
+        for item in items:
+            key = item.get("key")
+            if item.get("before") is None:
+                self.store.pop(umo, key)
+            else:
+                self.store.set(umo, key, item.get("before"))
+        self.store.save()
+        rec["undo_state"] = "undone"
+        self.decisions.maybe_save(0)
+        return rec
+
+    # ------------------------------------------------------------------
+    # 灰区复核：只有「拿不准」的句子才问一次模型（默认关，开了有上限）
+    # ------------------------------------------------------------------
+    JUDGE_SYS_PROMPT = (
+        "你只判断一件事：一个词是不是在说「说话的人自己此刻正在做（或马上要做）」这件事。\n"
+        "只回答 YES 或 NO，不要解释。\n\n"
+        "YES：他在说自己去做 / 正在做 / 刚做完（我要去上课了 / 上课了 / 我洗澡呢 / 陪她去洗澡）。\n"
+        "NO：只是提到、评价、抱怨、名词短语、明天的安排、过去的事、说别人、问句\n"
+        "    （讨厌上课 / 睡觉时间被补课占了 / 没人喜欢上课 / 他睡了 / 明天上课 / 上课了吗）。"
+    )
+
+    def _gray_budget_ok(self) -> bool:
+        now = time.time()
+        eng = self.engine_cfg
+        per_hour = _as_int(eng.get("gray_review_per_hour"), 6)
+        per_day = _as_int(eng.get("gray_review_per_day"), 30)
+        if per_hour <= 0 or per_day <= 0:
+            return False
+        self._gray_calls = [t for t in self._gray_calls if now - t < 86400]
+        if sum(1 for t in self._gray_calls if now - t < 3600) >= per_hour:
+            return False
+        if len(self._gray_calls) >= per_day:
+            return False
+        self._gray_calls.append(now)
+        return True
+
+    def take_gray_review(self) -> dict | None:
+        """取走本次消息的灰区候选；开关关着或超配额就返回 None。"""
+        cand = self._gray_candidate
+        self._gray_candidate = None
+        if not cand or not cand.get("name"):
+            return None
+        if not bool(self.engine_cfg.get("enable_gray_review", True)):
+            return None
+        if not self._gray_budget_ok():
+            return None
+        return cand
+
+    async def _resolve_provider(self, umo: str):
+        eng = self.engine_cfg
+        provider = None
+        try:
+            provider_id = str(eng.get("llm_event_provider") or "").strip()
+            if provider_id:
+                provider = await self.context.provider_manager.get_provider_by_id(provider_id)
+            if provider is None:
+                provider = self.context.get_using_provider(umo=umo)
+        except Exception:
+            return None
+        return provider
+
+    async def _verify_use(self, umo: str, text: str, kw: str) -> str:
+        """问一次极短 YES/NO。返回 yes / no / error。"""
+        provider = await self._resolve_provider(umo)
+        if provider is None:
+            return "error"
+        user_prompt = f"词：{kw}\n句：{text}"
+        try:
+            resp = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=user_prompt, contexts=[], system_prompt=self.JUDGE_SYS_PROMPT
+                ),
+                timeout=3.5,
+            )
+        except Exception as e:
+            logger.debug(f"{TAG} 灰区复核失败: {e!r}")
+            return "error"
+        raw = str(getattr(resp, "completion_text", "") or "").strip().upper()
+        if raw.startswith("YES"):
+            return "yes"
+        if raw.startswith("NO"):
+            return "no"
+        return "error"
+
+    async def review_gray(self, umo: str, cand: dict) -> None:
+        """灰区复核：模型说 YES 才落状态，其余一律不记（宁可漏，不要错）。"""
+        text = str(cand.get("text") or "")
+        kw = str(cand.get("kw") or "")
+        name = str(cand.get("name") or "")
+        verdict = await self._verify_use(umo, text, kw)
+        rule = self.engine.get_rule(name) if name else None
+        if verdict != "yes" or rule is None:
+            logger.info(
+                f"{TAG} 灰区未采信（{verdict}）：「{text[:16]}」命中「{kw}」"
+            )
+            return
+        before = self._snapshot(umo)
+        self._set_event(umo, rule, "灰区:" + name, source_text=text)
+        self.store.save()
+        after = self._snapshot(umo)
+        touched = [
+            {"key": k, "before": before.get(k), "after": after.get(k)}
+            for k in self.WATCH_KEYS if before.get(k) != after.get(k)
+        ]
+        rec = {
+            "id": round(time.time(), 3),
+            "ts": time.time(),
+            "umo": umo,
+            "kind": "event",
+            "kw": kw,
+            "verdict": "gray",
+            "rule": "G2",
+            "reason": "拿不准，模型说是",
+            "action": "llm_yes",
+            "source": "gray_llm",
+            "text": clip_text(text),
+            "text_len": len(text),
+            "touched": touched,
+            "undo_state": "available" if touched else "none",
+        }
+        self.decisions.limit = self._dec_limit()
+        self.decisions.add(rec)
+        self.decisions.maybe_save(0)
+        logger.info(f"{TAG} 灰区复核采信：「{text[:16]}」→ {rule.get('label')}")
+        try:
+            self.reschedule(umo)
+        except Exception as e:
+            logger.debug(f"{TAG} 灰区复核后重排失败: {e}")
+
     def update_from_message(self, umo: str, text: str) -> bool:
-        """根据消息更新事件与在场状态。返回 False 表示关键词没认出。"""
+        """根据消息更新事件与在场状态。返回 False 表示什么都没认出。
+
+        外层只做两件事：进门前拍快照、出门后落判定记录（含一键撤销要用的 before/after）。
+        真正的判定顺序在 `_update_inner`，一行没动。
+        """
         if not text:
             return False
+        before = self._snapshot(umo)
+        self._dec_buffer = []
+        self._gray_candidate = None
+        handled = False
+        try:
+            handled = self._update_inner(umo, text)
+        finally:
+            handled = self._flush_decisions(umo, text, before, handled)
+        return handled
 
+    def _update_inner(self, umo: str, text: str) -> bool:
         now = time.time()
         store = self.store
 
@@ -925,7 +1212,9 @@ class Runner:
             return True
 
         # 回归优先
-        return_kw = self.engine.match_return(text)
+        ret = self.engine.match_return_ex(text)
+        self._note("return", {"hit": ret["hit"], "dropped": ret["dropped"]})
+        return_kw = ret["hit"]["kw"] if ret["hit"] else None
         if return_kw:
             prev = store.get(umo, "away") or {}
             store.set(umo, "away", {
@@ -939,7 +1228,9 @@ class Runner:
             logger.info(f"{TAG} 回到身边（命中“{return_kw}”）")
             return True
 
-        away_kw = self.engine.match_away(text)
+        away_ex = self.engine.match_away_ex(text)
+        self._note("away", {"hit": away_ex["hit"], "dropped": away_ex["dropped"]})
+        away_kw = away_ex["hit"]["kw"] if away_ex["hit"] else None
         if away_kw and self._is_request_to_someone(text, away_kw):
             # 「帮我拿快递」「给你取外卖」是支使别人去做，不是用户自己要出门
             away_kw = None
@@ -968,8 +1259,13 @@ class Runner:
             # 「改天一起看电影」「昨天一起吃了饭」是计划/过去，不该现在就记在一起。
             self._touch_together(umo, now)
 
-        # 结束词
-        stopping = isinstance(event, dict) and self.engine.is_stop(event, text)
+        # 结束词（带闸门：「吃完了的时候」这种名词化不算结束）
+        stop = self.engine.stop_detail(event, text) if isinstance(event, dict) else {"stopped": False, "dropped": []}
+        if stop.get("stopped"):
+            self._note("stop", {"hit": stop, "dropped": stop.get("dropped") or []})
+        else:
+            self._note("stop", {"hit": None, "dropped": stop.get("dropped") or []})
+        stopping = bool(stop.get("stopped"))
 
         # 命中加速词、而这句话本来会结束当前事件（典型：「快吃完了」含结束词「吃完」）：
         # 用户是想"加速"，别让同一句话把整个事件吃掉。
@@ -984,7 +1280,9 @@ class Runner:
             logger.info(f"{TAG} 事件结束：{event.get('label')}")
             return True
 
-        rule = self.engine.match(text)
+        md = self.engine.match_detail(text)
+        self._note("event", {"hit": md if md.get("rule") else None, "dropped": md.get("dropped") or []})
+        rule = md["rule"]
         if rule is None:
             return False
 

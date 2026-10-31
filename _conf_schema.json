@@ -513,6 +513,45 @@
                 "type": "string",
                 "default": ""
             },
+            "enable_utterance_judge": {
+                "description": "谓语闸门",
+                "type": "bool",
+                "default": true,
+                "hint": "命中关键词后再看一眼：这个词是不是在说「你此刻正在做」。「讨厌上课」「睡觉时间被占了」这种只是提到，不再标记状态。关掉就退回旧行为。"
+            },
+            "judge_strict": {
+                "description": "拿不准就不记",
+                "type": "bool",
+                "default": true,
+                "hint": "闸门判断不了的句子（「看书很重要」这种）一律不记录。关掉则退回旧规则，只在明显是名词短语时才拦。"
+            },
+            "enable_gray_review": {
+                "description": "拿不准时问一次模型",
+                "type": "bool",
+                "default": true,
+                "hint": "只对判不准的句子问一次，每次约 200 字，下面两个上限兜着。关掉就更省。"
+            },
+            "gray_review_per_hour": {
+                "description": "模型复核·每小时上限",
+                "type": "int",
+                "default": 6,
+                "slider": {"min": 0, "max": 60, "step": 1},
+                "hint": "每小时最多问几次。0 = 不启用。"
+            },
+            "gray_review_per_day": {
+                "description": "模型复核·每天上限",
+                "type": "int",
+                "default": 30,
+                "slider": {"min": 0, "max": 300, "step": 5},
+                "hint": "每天最多问几次。0 = 不启用。"
+            },
+            "decision_log_size": {
+                "description": "判定记录条数",
+                "type": "int",
+                "default": 50,
+                "slider": {"min": 0, "max": 200, "step": 10},
+                "hint": "面板任务页显示最近多少条判定。只存本地、不联网、不占 token。0 = 不记录。"
+            },
             "enable_return_soon": {
                 "description": "加速事件消息",
                 "hint": "说「快到家」这类话时，把出门事件的开口概率提前。",

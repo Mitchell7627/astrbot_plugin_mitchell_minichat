@@ -159,6 +159,17 @@ textarea.input{min-height:110px;resize:vertical;line-height:1.6}
 .kv .v{font-size:13px;margin-top:2px}
 .task-actions{display:flex;flex-wrap:wrap;gap:8px}
 
+/* 最近判定（折叠） */
+.task-log{margin-top:10px;border-top:1px solid var(--line);padding-top:8px}
+.task-log summary{cursor:pointer;font-size:12px;color:var(--fg-2);display:flex;align-items:center;gap:6px;list-style:none}
+.task-log summary::-webkit-details-marker{display:none}
+.task-log summary::before{content:"▸";font-size:10px;color:var(--fg-3);transition:transform .15s}
+.task-log[open] summary::before{transform:rotate(90deg)}
+.task-log .stack{margin-top:8px}
+.log-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:12px;line-height:1.6}
+.log-row .log-kw{color:var(--fg)}
+.log-row .log-why{flex:1 1 120px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
 /* 图表 */
 .chart-wrap{margin-top:10px}
 .chart{position:relative;display:flex;align-items:flex-end;gap:4px;height:132px;padding:8px 0 0;border-bottom:1px solid var(--line)}

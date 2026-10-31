@@ -21,7 +21,7 @@ from .core.store import Store
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.0.7"
+VERSION = "v0.0.8"
 
 
 class ProactiveMiniPlugin(star.Star):
@@ -202,3 +202,14 @@ class ProactiveMiniPlugin(star.Star):
                 task.add_done_callback(self._bg_tasks.discard)
             except Exception as e:
                 logger.debug(f"{TAG} 语义识别任务创建失败: {e}")
+        else:
+            # 关键词命中但被判灰区的句子，才是真的「语义层能帮上忙」的场合。
+            # 关键词明确否决（reject）的不再问模型——那正是省 token 的地方。
+            gray = self.runner.take_gray_review()
+            if gray:
+                try:
+                    task = asyncio.create_task(self.runner.review_gray(umo, gray))
+                    self._bg_tasks.add(task)
+                    task.add_done_callback(self._bg_tasks.discard)
+                except Exception as e:
+                    logger.debug(f"{TAG} 灰区复核任务创建失败: {e}")

@@ -15,7 +15,7 @@
     }
     return bridge();
   }
-  const state = { status: null, tasks: null, config: null, prob: null, probPreview: null, tab: "overview", busy: new Set() };
+  const state = { status: null, tasks: null, config: null, prob: null, probPreview: null, tab: "overview", busy: new Set(), decisions: {}, logOpen: new Set() };
   const $ = (sel, root) => (root || document).querySelector(sel);
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
@@ -101,7 +101,21 @@
       api("GET", "status"), api("GET", "tasks"), api("GET", "config"), api("GET", "schema"),
     ]);
     state.status = status; state.tasks = tasks; state.config = config; state.schema = schema;
+    await loadDecisions();
     renderAll();
+  }
+
+  // 判定记录：按会话分组，只取最近 20 条（本地环形缓冲，不联网不花 token）
+  async function loadDecisions() {
+    try {
+      const r = await api("GET", "decisions", { limit: 20 });
+      const byUmo = {};
+      (r.items || []).forEach((d) => {
+        const k = d.umo || "";
+        (byUmo[k] = byUmo[k] || []).push(d);
+      });
+      state.decisions = byUmo;
+    } catch (_) { /* 旧版后端没有这个接口时静默跳过 */ }
   }
 
   async function refreshStatus() {
@@ -192,6 +206,11 @@
   function renderTasks() {
     const t = state.tasks;
     if (!t) return;
+    // 重渲染前把折叠状态记下来，否则 12 秒一刷新就会被合上
+    $$("#task-list details[data-log-umo]").forEach((el) => {
+      if (el.open) state.logOpen.add(el.dataset.logUmo);
+      else state.logOpen.delete(el.dataset.logUmo);
+    });
     $("#task-count").textContent = `${t.counts.total} 个会话 · ${t.counts.scheduled} 个在排程`;
     if (!t.sessions.length) {
       $("#task-list").innerHTML = `<div class="card muted">还没有配置会话。上面输入完整的会话标识后点「添加」。</div>`;
@@ -250,6 +269,32 @@
         }
         return "—";
       })();
+      // 最近判定：判错了能看见原因，也能一键撤回来
+      const logs = (state.decisions || {})[it.umo] || [];
+      const kindName = { event: "事件", away: "离开", return: "回来", sleep: "睡觉", wait: "待睡", stop: "结束" };
+      const logRows = logs.length
+        ? logs.map((d) => {
+            const badge = d.action === "llm_yes" ? ["模型确认", "ok"]
+              : d.action === "applied" ? ["已记录", "ok"]
+                : d.verdict === "reject" ? ["否决", "err"]
+                  : ["拿不准", "warn"];
+            const tail = d.undo_state === "available"
+              ? `<button class="btn sm ghost" data-act="task" data-op="undo" data-id="${d.id}">撤销</button>`
+              : `<span class="muted">${d.undo_state === "undone" ? "已撤销" : (d.undo_state === "stale" ? "状态已变" : "")}</span>`;
+            return `<div class="log-row">
+              <span class="muted">${L.fmtClock(d.ts)}</span>
+              <span class="badge ${badge[1]}">${badge[0]}</span>
+              <span class="log-kw">${esc(kindName[d.kind] || d.kind)}·${esc(d.kw)}</span>
+              <span class="muted log-why" title="${esc(d.text || "")}">${esc(d.reason || "")}</span>
+              ${tail}
+            </div>`;
+          }).join("")
+        : `<div class="muted" style="font-size:12px">还没有判定记录</div>`;
+      const logBlock = `
+        <details class="task-log" data-log-umo="${esc(it.umo)}"${state.logOpen.has(it.umo) ? " open" : ""}>
+          <summary>最近判定 ${logs.length ? `<span class="badge warn">${logs.length}</span>` : ""}</summary>
+          <div class="stack gap8">${logRows}</div>
+        </details>`;
       return `
       <div class="task">
         <div class="task-head">
@@ -274,6 +319,7 @@
             ? `<button class="btn sm ghost" data-act="task" data-op="clear-together" data-umo="${esc(it.umo)}">取消在一起</button>`
             : `<button class="btn sm ghost" data-act="task" data-op="together" data-umo="${esc(it.umo)}">设为在一起</button>`}
         </div>
+        ${logBlock}
       </div>`;
     }).join("");
   }
@@ -836,6 +882,11 @@
       paths: ["enable_event", "enable_llm_event", "llm_event_provider"],
     },
     {
+      section: "custom_engine", title: "识别判定", note: "改完立即生效",
+      paths: ["enable_utterance_judge", "judge_strict", "enable_gray_review",
+              "gray_review_per_hour", "gray_review_per_day", "decision_log_size"],
+    },
+    {
       section: "web_panel", title: "面板", note: "改动后需重载插件",
       paths: ["enable", "host", "port", "password", "allow_embed"],
     },
@@ -1191,6 +1242,11 @@
       } else if (op === "clear-together") {
         state.tasks = await api("POST", "tasks/action", { action: "clear_together", umo });
         toast("已取消在一起", "ok");
+      } else if (op === "undo") {
+        const id = Number(btn && btn.dataset ? btn.dataset.id : 0);
+        state.tasks = await api("POST", "tasks/action", { action: "undo_decision", id });
+        await loadDecisions();
+        toast("已撤销这条判定", "ok");
       } else if (op === "remove") {
         if (!confirm("确定移除这个会话？")) return;
         state.tasks = await api("POST", "tasks/action", { action: "remove", umo });
@@ -1563,8 +1619,12 @@
   // 只渲染一次的话会一直停在打开页面那一刻的快照上。
   setInterval(async () => {
     if (state.tab !== "tasks" || document.hidden || state.busy.size) return;
+    // 焦点在任务列表里（正在看判定、点按钮）时跳过这一轮，别把折叠区合上
+    const list = $("#task-list");
+    if (list && list.contains(document.activeElement)) return;
     try {
-      state.tasks = await api("GET", "tasks");
+      const [tasks] = await Promise.all([api("GET", "tasks"), loadDecisions()]);
+      state.tasks = tasks;
       renderTasks();
     } catch (_) { /* 断线/未登录时忽略，下一轮再试 */ }
   }, 12000);

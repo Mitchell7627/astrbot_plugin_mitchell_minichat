@@ -27,6 +27,8 @@ TOKEN_TTL = 12 * 3600
 MAX_TOKENS = 32
 LOGIN_MAX_FAILS = 5
 LOGIN_WINDOW = 300
+# 这些 GET 接口需要读 query（其余 GET 一律 fn()）
+_QUERY_METHODS = {"probability", "decisions"}
 
 
 class _SignalSafeServer(uvicorn.Server if uvicorn else object):
@@ -223,6 +225,7 @@ class PanelHttpServer:
         mapping = {
             "status": ("status", "GET"),
             "tasks": ("tasks", "GET"),
+            "decisions": ("decisions", "GET"),
             "config": ("config_get", "GET"),
             "config/save": ("config_save", "POST"),
             "reload": ("reload", "POST"),
@@ -261,7 +264,7 @@ class PanelHttpServer:
             fn = getattr(self.service, handler_name)
             if method == "GET":
                 query = dict(request.query_params)
-                data = fn(query) if handler_name == "probability" else fn()
+                data = fn(query) if handler_name in _QUERY_METHODS else fn()
             else:
                 body = await self._json(request)
                 if not isinstance(body, dict):

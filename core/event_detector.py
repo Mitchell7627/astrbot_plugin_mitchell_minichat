@@ -16,6 +16,7 @@ from pathlib import Path
 from astrbot.api import logger
 
 from . import text_rules as rules
+from . import utterance
 
 BUILTIN_RULES = {
     "version": 1,
@@ -338,96 +339,195 @@ class EventRuleStore:
             return False
         return any(marker in text for marker in rules.PAST_FAR)
 
-    def _accept(self, text: str, idx: int, kw: str) -> bool:
+    def _accept(self, text: str, idx: int, kw: str, kind: str = "event") -> bool:
         """这次命中能不能当成「用户此刻正在做」。"""
-        if self._is_reported(text, idx):
-            return False
-        if self._is_negated(text, idx):
-            return False
-        if self._is_future(text, idx):
-            return False
-        if self._is_past(text, idx, len(kw)):
-            return False
-        if self._is_question(text, idx, len(kw)):
-            return False
-        if self._is_third_person(text, idx):
-            return False
-        return True
+        return self._evaluate(text, idx, kw, kind)["ok"]
 
-    def match(self, text: str):
-        """返回命中的规则；未命中返回 None。
+    # ---------------------------------------------------------------- 谓语闸门
+    # 六道过滤判断的是「时态 / 语气 / 谁在做」，但都没回答最后那个问题：
+    # 这个词是在当谓语用，还是只是被提到（「讨厌上课」「睡觉时间被占了」）？
+    # 这一步交给 core/utterance.py，三档：accept / reject / gray。
+    def _judge_enabled(self) -> bool:
+        return bool(self._engine.get("enable_utterance_judge", True))
+
+    def _judge_strict(self) -> bool:
+        return bool(self._engine.get("judge_strict", True))
+
+    def _nicknames(self) -> tuple[str, ...]:
+        raw = self._engine.get("bot_nicknames") or ""
+        if isinstance(raw, (list, tuple)):
+            parts = [str(x).strip() for x in raw]
+        else:
+            parts = [p.strip() for p in str(raw).replace("，", ",").split(",")]
+        return tuple(p for p in parts if p)
+
+    def _gate(self, text: str, idx: int, kw: str, kind: str) -> dict:
+        """关掉开关时一律放行，等于回到 v0.0.7 的判定行为。"""
+        if not self._judge_enabled():
+            return {"verdict": utterance.VERDICT_ACCEPT, "rule": "", "reason": "闸门已关闭"}
+        return utterance.judge_detail(text, idx, kw, kind=kind, nicknames=self._nicknames())
+
+    @staticmethod
+    def _filtered() -> dict:
+        return {"ok": False, "verdict": "filtered", "rule": "", "reason": "前置过滤"}
+
+    def _evaluate(self, text: str, idx: int, kw: str, kind: str = "event") -> dict:
+        """前置过滤 + 闸门，返回 {"ok", "verdict", "rule", "reason"}。
+
+        前置过滤保持各链路原有口径：在场状态用「明确过去」（刚才出门了人还在外面），
+        事件用「刚才也算过去」，在场状态也不过滤第三人称。
+        """
+        if self._is_reported(text, idx):
+            return self._filtered()
+        if self._is_negated(text, idx):
+            return self._filtered()
+        if self._is_future(text, idx):
+            return self._filtered()
+        if kind in ("away", "return"):
+            if rules.is_far_past_clause(
+                text, idx, kw_len=len(kw),
+                window=self.FUTURE_WINDOW, prev_max=self.FUTURE_PREV_MAX,
+            ):
+                return self._filtered()
+        elif self._is_past(text, idx, len(kw)):
+            return self._filtered()
+        if self._is_question(text, idx, len(kw)):
+            return self._filtered()
+        if kind not in ("away", "return") and self._is_third_person(text, idx):
+            return self._filtered()
+
+        d = self._gate(text, idx, kw, kind)
+        verdict = d["verdict"]
+        if verdict == utterance.VERDICT_ACCEPT:
+            ok = True
+        elif verdict == utterance.VERDICT_GRAY:
+            # 「宁可漏，不要错」：灰区默认不放行；但结束事件例外——
+            # 事件一直挂着比误结束更糟，所以 stop 的灰区按放行处理。
+            ok = (not self._judge_strict()) or kind == "stop"
+        else:
+            ok = False
+        return {"ok": ok, "verdict": verdict, "rule": d.get("rule", ""), "reason": d.get("reason", "")}
+
+    @staticmethod
+    def _candidates(text: str, keywords):
+        for kw in keywords or []:
+            if not kw:
+                continue
+            idx = text.find(kw)
+            while idx != -1:
+                yield kw, idx
+                idx = text.find(kw, idx + 1)
+
+    @staticmethod
+    def _drop(kind: str, kw: str, idx: int, ev: dict, name: str = "") -> dict:
+        return {
+            "kind": kind, "kw": kw, "idx": idx, "name": name,
+            "verdict": ev["verdict"], "rule": ev["rule"], "reason": ev["reason"],
+        }
+
+    def match_detail(self, text: str) -> dict:
+        """返回 ``{"rule", "kw", "idx", "verdict", "gate_rule", "reason", "dropped"}``。
 
         取「命中关键词最长」的那条：洗衣服(3) 优先于 去洗(2)，
         避免「去洗衣服」被认成在洗澡。同长度时按规则顺序。
         """
         if not text:
-            return None
+            return {"rule": None, "dropped": []}
         best = None  # (长度, -顺序, rule)
+        detail = None
+        dropped: list[dict] = []
         for order, rule in enumerate(self._rules):
-            for kw in rule.get("keywords") or []:
-                idx = text.find(kw)
-                while idx != -1:
-                    if self._accept(text, idx, kw):
-                        cand = (len(kw), -order, rule)
-                        if best is None or cand > best:
-                            best = cand
-                    idx = text.find(kw, idx + 1)
-        return best[2] if best else None
+            for kw, idx in self._candidates(text, rule.get("keywords") or []):
+                ev = self._evaluate(text, idx, kw, "event")
+                if ev["ok"]:
+                    cand = (len(kw), -order, rule)
+                    if best is None or cand > best:
+                        best = cand
+                        detail = {
+                            "rule": rule, "kw": kw, "idx": idx,
+                            "verdict": ev["verdict"], "gate_rule": ev["rule"],
+                            "reason": ev["reason"],
+                        }
+                elif ev["verdict"] in ("reject", "gray"):
+                    dropped.append(self._drop("event", kw, idx, ev, rule.get("name") or ""))
+        if detail is None:
+            return {"rule": None, "dropped": dropped}
+        detail["dropped"] = dropped
+        return detail
 
-    def _match_list(self, text: str, keywords: list[str]):
-        """在一组关键词里找第一个「此刻成立」的命中。
+    def match(self, text: str):
+        """返回命中的规则；未命中返回 None。"""
+        return self.match_detail(text)["rule"]
 
-        过滤四类误判：
-        - 否定（「还没到家」，且不跨分句）；
-        - 将来时（「明天要出门」不该现在就标记不在身边）；
-        - 明确过去（「昨天出门了」是过去；但「刚才出门了」人还在外面，不算）；
-        - 疑问（「到家了吗」不是在报告自己到家）。
-        """
+    def _scan_list(self, text: str, keywords, kind: str):
+        """在一组关键词里找第一个「此刻成立」的命中，返回 (hit, dropped)。"""
+        dropped: list[dict] = []
         if not text:
-            return None
-        for kw in keywords:
-            idx = text.find(kw)
-            while idx != -1:
-                if (
-                    not self._is_reported(text, idx)
-                    and not self._is_negated(text, idx)
-                    and not self._is_future(text, idx)
-                    and not rules.is_far_past_clause(
-                        text, idx, kw_len=len(kw),
-                        window=self.FUTURE_WINDOW, prev_max=self.FUTURE_PREV_MAX,
-                    )
-                    and not self._is_question(text, idx, len(kw))
-                ):
-                    return kw
-                idx = text.find(kw, idx + 1)
-        return None
+            return None, dropped
+        for kw, idx in self._candidates(text, keywords):
+            ev = self._evaluate(text, idx, kw, kind)
+            if ev["ok"]:
+                return {
+                    "kw": kw, "idx": idx, "verdict": ev["verdict"],
+                    "gate_rule": ev["rule"], "reason": ev["reason"],
+                }, dropped
+            if ev["verdict"] in ("reject", "gray"):
+                dropped.append(self._drop(kind, kw, idx, ev))
+        return None, dropped
+
+    def _match_list(self, text: str, keywords, kind: str = "away"):
+        hit, _ = self._scan_list(text, keywords, kind)
+        return hit["kw"] if hit else None
+
+    def match_away_ex(self, text: str) -> dict:
+        """判断这句话是否表示“我要离开，不在你身边了”。"""
+        self.reload_if_changed()
+        hit, dropped = self._scan_list(text, self._away_keywords, "away")
+        return {"hit": hit, "dropped": dropped}
 
     def match_away(self, text: str):
-        """判断这句话是否表示“我要离开，不在你身边了”，返回命中的离开词。"""
+        hit = self.match_away_ex(text)["hit"]
+        return hit["kw"] if hit else None
+
+    def match_return_ex(self, text: str) -> dict:
+        """判断这句话是否表示“我回来了，回到你身边了”。"""
         self.reload_if_changed()
-        return self._match_list(text, self._away_keywords)
+        hit, dropped = self._scan_list(text, self._return_keywords, "return")
+        return {"hit": hit, "dropped": dropped}
 
     def match_return(self, text: str):
-        """判断这句话是否表示“我回来了，回到你身边了”，返回命中的回归词。"""
-        self.reload_if_changed()
-        return self._match_list(text, self._return_keywords)
+        hit = self.match_return_ex(text)["hit"]
+        return hit["kw"] if hit else None
 
-    def is_stop(self, event: dict, text: str) -> bool:
-        """文本是否表示当前事件已结束。"""
+    def stop_detail(self, event: dict, text: str) -> dict:
+        """文本是否表示当前事件已结束（带闸门，挡住「吃完了的时候」这类名词化）。"""
         if not isinstance(event, dict) or not text:
-            return False
+            return {"stopped": False, "dropped": []}
         name = event.get("name")
+        dropped: list[dict] = []
         for rule in self._rules:
             if rule.get("name") != name:
                 continue
-            for kw in rule.get("stop_keywords") or []:
-                idx = text.find(kw)
-                while idx != -1:
-                    if not self._is_negated(text, idx):
-                        return True
-                    idx = text.find(kw, idx + 1)
-            return False
-        return False
+            for kw, idx in self._candidates(text, rule.get("stop_keywords") or []):
+                if self._is_negated(text, idx):
+                    continue
+                d = self._gate(text, idx, kw, "stop")
+                if d["verdict"] == utterance.VERDICT_REJECT:
+                    dropped.append({
+                        "kind": "stop", "kw": kw, "idx": idx, "verdict": d["verdict"],
+                        "rule": d.get("rule", ""), "reason": d.get("reason", ""),
+                    })
+                    continue
+                return {
+                    "stopped": True, "kw": kw, "idx": idx,
+                    "verdict": d["verdict"], "gate_rule": d.get("rule", ""),
+                    "reason": d.get("reason", ""), "dropped": dropped,
+                }
+            return {"stopped": False, "dropped": dropped}
+        return {"stopped": False, "dropped": dropped}
+
+    def is_stop(self, event: dict, text: str) -> bool:
+        return self.stop_detail(event, text)["stopped"]
 
     def build_hint(self, event: dict, elapsed_minutes: int) -> str:
         """渲染事件提示文本。

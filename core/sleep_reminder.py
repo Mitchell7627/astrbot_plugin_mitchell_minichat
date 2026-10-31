@@ -18,6 +18,7 @@ import time
 from datetime import datetime
 
 from . import text_rules as rules
+from . import utterance
 
 # 睡眠状态键（session_data 里）
 SLEEP_KEY = "sleep_state"
@@ -267,8 +268,22 @@ def pick_weighted_offset(
     return max(lo, min(hi, int(round(source.uniform(a, b)))))
 
 
-def match_sleep(text: str, keywords) -> str | None:
-    """命中「确定要睡」返回命中的词，否则 None。
+def _gate_ok(text, kw, idx, kind, enable_judge, strict, nicknames):
+    """谓语闸门。「睡觉时间被占用了」这种名词短语在这里被拦下。"""
+    if not enable_judge:
+        return True, {"verdict": utterance.VERDICT_ACCEPT, "rule": "", "reason": "闸门已关闭"}
+    d = utterance.judge_detail(text, idx, kw, kind=kind, nicknames=nicknames)
+    if d["verdict"] == utterance.VERDICT_ACCEPT:
+        return True, d
+    if d["verdict"] == utterance.VERDICT_GRAY and not strict:
+        return True, d
+    return False, d
+
+
+def match_sleep_detail(
+    text: str, keywords, *, enable_judge=None, strict: bool = True, nicknames=()
+) -> dict:
+    """返回 ``{"hit": {...}|None, "dropped": [...]}``。
 
     过滤五类误判：
     - 否定（「不睡了」）；
@@ -276,13 +291,12 @@ def match_sleep(text: str, keywords) -> str | None:
     - 第三人称（「孩子睡了」「我妈睡了」）；
     - 过去时（「昨天睡了8小时」「昨晚睡了一会儿」——说已经睡过，人其实醒着）；
     - 午睡/小睡（「我午睡了」）——这类交给 nap 事件，别开整夜免打扰。
-    同一个词出现多次时逐个检查，前面那次被否定不影响后面那次。
+    再加最后一道谓语闸门（「睡觉时间被补课占用了」不是在说要睡）。
     """
     text = str(text or "")
-    if not text:
-        return None
-    if any(word in text for word in _NAP_WORDS):
-        return None
+    dropped: list[dict] = []
+    if not text or any(word in text for word in _NAP_WORDS):
+        return {"hit": None, "dropped": dropped}
     for kw, idx in _iter_hits(text, keywords):
         if _is_negated_at(text, idx, SLEEP_NEGATIONS):
             continue
@@ -292,15 +306,35 @@ def match_sleep(text: str, keywords) -> str | None:
             continue
         if _is_past_at(text, kw, idx):
             continue
-        return kw
-    return None
+        ok, d = _gate_ok(text, kw, idx, "sleep", enable_judge, strict, nicknames)
+        if ok:
+            return {
+                "hit": {
+                    "kw": kw, "idx": idx, "verdict": d["verdict"],
+                    "gate_rule": d.get("rule", ""), "reason": d.get("reason", ""),
+                },
+                "dropped": dropped,
+            }
+        dropped.append({
+            "kind": "sleep", "kw": kw, "idx": idx, "verdict": d["verdict"],
+            "rule": d.get("rule", ""), "reason": d.get("reason", ""),
+        })
+    return {"hit": None, "dropped": dropped}
 
 
-def match_wait(text: str, keywords) -> str | None:
-    """命中「待会再睡」返回命中的词，否则 None。带否定/疑问/第三人称/过去时过滤。"""
+def match_sleep(text: str, keywords, **kwargs) -> str | None:
+    hit = match_sleep_detail(text, keywords, **kwargs)["hit"]
+    return hit["kw"] if hit else None
+
+
+def match_wait_detail(
+    text: str, keywords, *, enable_judge=None, strict: bool = True, nicknames=()
+) -> dict:
+    """命中「待会再睡」。同样带否定/疑问/第三人称/过去时过滤 + 谓语闸门。"""
     text = str(text or "")
+    dropped: list[dict] = []
     if not text:
-        return None
+        return {"hit": None, "dropped": dropped}
     for kw, idx in _iter_hits(text, keywords):
         if _is_negated_at(text, idx, WAIT_NEGATIONS):
             continue
@@ -310,8 +344,25 @@ def match_wait(text: str, keywords) -> str | None:
             continue
         if _is_past_at(text, kw, idx):
             continue
-        return kw
-    return None
+        ok, d = _gate_ok(text, kw, idx, "wait", enable_judge, strict, nicknames)
+        if ok:
+            return {
+                "hit": {
+                    "kw": kw, "idx": idx, "verdict": d["verdict"],
+                    "gate_rule": d.get("rule", ""), "reason": d.get("reason", ""),
+                },
+                "dropped": dropped,
+            }
+        dropped.append({
+            "kind": "wait", "kw": kw, "idx": idx, "verdict": d["verdict"],
+            "rule": d.get("rule", ""), "reason": d.get("reason", ""),
+        })
+    return {"hit": None, "dropped": dropped}
+
+
+def match_wait(text: str, keywords, **kwargs) -> str | None:
+    hit = match_wait_detail(text, keywords, **kwargs)["hit"]
+    return hit["kw"] if hit else None
 
 
 def build_reminder_hint(state: dict, now: datetime | None = None) -> str:

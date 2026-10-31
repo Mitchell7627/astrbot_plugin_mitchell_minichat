@@ -23,6 +23,8 @@ from .splitter import split_text
 TAG = "[Minichat]"
 PLUGIN_NAME = "astrbot_plugin_mitchell_minichat"
 API_PREFIX = f"/{PLUGIN_NAME}/page"
+# 这些 GET 接口需要读 query（其余 GET 一律 fn()）
+_QUERY_METHODS = {"probability", "decisions"}
 MAX_RULES_BYTES = 256 * 1024
 
 # 与 _conf_schema.json 的 slider 范围保持一致。
@@ -59,6 +61,10 @@ _LIMITS: dict[tuple[str, str], tuple[float, float, type]] = {
     ("friend_settings", "context_settings.context_window_count"): (2, 200, int),
     ("friend_settings", "context_settings.context_window_hours"): (1, 168, int),
     ("friend_settings", "context_settings.context_window_min_messages"): (0, 50, int),
+    # 谓语闸门 / 判定记录
+    ("custom_engine", "gray_review_per_hour"): (0, 60, int),
+    ("custom_engine", "gray_review_per_day"): (0, 300, int),
+    ("custom_engine", "decision_log_size"): (0, 200, int),
 }
 
 # 这些键只影响面板显示，不参与 need_reload 判定
@@ -75,6 +81,9 @@ _HOT_PATHS = tuple("custom_engine." + k for k in (
     "wait_weight_early", "wait_weight_mid", "wait_weight_tail",
     "night_weight_early", "night_weight_mid", "night_weight_tail",
     "nap_weight_early", "nap_weight_mid", "nap_weight_tail",
+    # 谓语闸门：都在 runner 里每次现读，改完立即生效
+    "enable_utterance_judge", "judge_strict", "enable_gray_review",
+    "gray_review_per_hour", "gray_review_per_day", "decision_log_size",
 ))
 
 
@@ -381,6 +390,20 @@ class PanelService:
             },
         }
 
+    def decisions(self, query: dict | None = None) -> dict:
+        """最近判定记录（只读，本地环形缓冲，不联网不花 token）。"""
+        query = query or {}
+        umo = str(query.get("umo") or "").strip() or None
+        try:
+            limit = int(query.get("limit") or 20)
+        except (TypeError, ValueError):
+            limit = 20
+        limit = max(1, min(50, limit))
+        log = getattr(self.runner, "decisions", None) if self.runner else None
+        if log is None:
+            return {"items": [], "counts": {"total": 0, "applied": 0, "dropped": 0, "gray": 0}}
+        return {"items": log.items(umo, limit=limit), "counts": log.counts(umo)}
+
     # ------------------------------------------------------------------
     # 配置
     # ------------------------------------------------------------------
@@ -666,6 +689,20 @@ class PanelService:
             umo = self._validate_umo(umo)
             self.store.pop(umo, "active_event")
             self.store.save()
+        elif action == "undo_decision":
+            rid = payload.get("id")
+            if rid is None:
+                raise PanelError("E_BAD_REQUEST", "缺少 id")
+            runner = getattr(self.plugin, "runner", None)
+            fn = getattr(runner, "undo_decision", None) if runner is not None else None
+            if fn is None:
+                raise PanelError("E_PLUGIN_OFF", "当前版本不支持撤销")
+            try:
+                fn(rid)
+            except KeyError:
+                raise PanelError("E_NOT_FOUND", "找不到这条判定")
+            except ValueError as e:
+                raise PanelError("E_BAD_REQUEST", str(e))
         elif action == "clear_away":
             umo = self._validate_umo(umo)
             self.store.pop(umo, "away")
@@ -1028,6 +1065,7 @@ class PanelPageApi:
     ROUTES = (
         ("status", "status", "GET"),
         ("tasks", "tasks", "GET"),
+        ("decisions", "decisions", "GET"),
         ("config", "config_get", "GET"),
         ("config/save", "config_save", "POST"),
         ("reload", "reload", "POST"),
@@ -1076,7 +1114,7 @@ class PanelPageApi:
                 if http_method == "GET":
                     query = dict(req_proxy.query)
                     fn = getattr(service, method_name)
-                    data = fn(query) if method_name == "probability" else fn()
+                    data = fn(query) if method_name in _QUERY_METHODS else fn()
                 else:
                     payload = await req_proxy.json(default={}) or {}
                     if not isinstance(payload, dict):
