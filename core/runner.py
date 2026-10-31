@@ -753,13 +753,77 @@ class Runner:
         self.store.set(umo, SLEEP_KEY, state)
         self.store.save()
 
-    def _wake_if_sleeping(self, umo: str) -> None:
-        """用户主动说话时，若之前处于 sleeping，视为醒来并解除。"""
+    # 睡眠免打扰期间，命中这些「醒了」说法才解除（面板可配，这里作兜底默认）
+    WAKE_KEYWORDS_DEFAULT = ("我醒了", "睡醒了", "醒了", "起床", "起来了", "不睡了", "睡不着")
+
+    def _wake_keywords(self):
+        raw = self.engine_cfg.get("wake_keywords")
+        if not raw:
+            return list(self.WAKE_KEYWORDS_DEFAULT)
+        return [k.strip() for k in str(raw).replace("，", ",").split(",") if k.strip()]
+
+    def _match_wake(self, text: str):
+        for kw in self._wake_keywords():
+            if kw and kw in text:
+                return kw
+        return None
+
+    # 说这些词表示「一起/同行」：此时命中「出门/出去」等离开词，也不该标记「不在身边」。
+    TOGETHER_KEYWORDS = (
+        "一起", "一块", "一道", "一同", "我们", "咱", "咱俩", "俩人", "两人",
+        "陪你", "带你", "跟我", "跟我来", "陪我", "带我", "跟你", "结伴",
+        "牵手", "牵着", "手牵手", "牵着你", "抱着你", "搂着你", "靠着你",
+        "在你旁边", "在你身边", "你旁边", "你身边",
+    )
+
+    def _is_together(self, text: str) -> bool:
+        return any(k in text for k in self.TOGETHER_KEYWORDS)
+
+    # ------------------------------------------------------------------
+    # 「在一起」状态：两人就在一块，主动消息不能写成「他不在你身边」
+    # ------------------------------------------------------------------
+    def _together_ttl(self) -> float:
+        try:
+            mins = float(self.engine_cfg.get("together_ttl_minutes", 150) or 150)
+        except (TypeError, ValueError):
+            mins = 150.0
+        return max(10.0, mins) * 60
+
+    def _touch_together(self, umo: str, now: float, keyword: str = "") -> None:
+        """记下/刷新「在一起」。已有记录时保留最早的 since。"""
+        prev = self.store.get(umo, "together")
+        since = now
+        if isinstance(prev, dict) and prev.get("active"):
+            since = float(prev.get("since") or now)
+        until = now + self._together_ttl()
+        event = self.store.get(umo, "active_event")
+        if isinstance(event, dict):
+            exp = float(event.get("expires_at") or 0)
+            if exp > until:
+                # 事件比默认时长还长（约会的 ttl 是 3 小时），就跟到事件结束
+                until = min(exp, now + self._together_ttl() * 2)
+        self.store.set(umo, "together", {
+            "active": True,
+            "since": since,
+            "until": until,
+            "keyword": keyword or (prev or {}).get("keyword") or "",
+        })
+
+    def _clear_together(self, umo: str) -> None:
+        if isinstance(self.store.get(umo, "together"), dict):
+            self.store.pop(umo, "together")
+
+    def _wake_if_sleeping(self, umo: str, text: str) -> None:
+        """睡眠免打扰只在明确说「醒了/起床/睡不着」时解除，睡前闲聊不误触。"""
         state = self._sleep_state(umo)
-        if state and state.get("state") == STATE_SLEEPING:
-            self.store.pop(umo, SLEEP_KEY)
-            self.store.save()
-            logger.info(f"{TAG} 检测到用户说话，解除睡眠免打扰")
+        if not state or state.get("state") != STATE_SLEEPING:
+            return
+        kw = self._match_wake(text)
+        if not kw:
+            return
+        self.store.pop(umo, SLEEP_KEY)
+        self.store.save()
+        logger.info(f"{TAG} 用户说「{kw}」，解除睡眠免打扰")
 
     def update_from_message(self, umo: str, text: str) -> bool:
         """根据消息更新事件与在场状态。返回 False 表示关键词没认出。"""
@@ -774,8 +838,8 @@ class Runner:
         if self._handle_sleep_words(umo, text):
             return True
 
-        # 用户说话了：若之前处于 sleeping，视为醒来，解除睡眠免打扰
-        self._wake_if_sleeping(umo)
+        # 用户说话了：若之前处于 sleeping，只有明确说「醒了」才解除免打扰
+        self._wake_if_sleeping(umo, text)
 
         if not bool(self.engine_cfg.get("enable_event", True)):
             return True
@@ -797,20 +861,33 @@ class Runner:
                 "cleared_at": now,
             })
             store.pop(umo, "active_event")
+            self._clear_together(umo)
             logger.info(f"{TAG} 回到身边（命中“{return_kw}”）")
             return True
 
         away_kw = self.engine.match_away(text)
         if away_kw:
-            store.set(umo, "away", {
-                "active": True,
-                "reason": away_kw,
-                "keyword": away_kw,
-                "started_at": now,
-                "expires_at": now + float(self.engine_cfg.get("away_ttl_hours", 8.0) or 8.0) * 3600,
-                "cleared_at": None,
-            })
-            logger.info(f"{TAG} 标记不在身边（命中“{away_kw}”）")
+            if self._is_together(text):
+                # 一起出门：不算「离开」，她就在你身边。直接清掉 away 记录，
+                # 不写 cleared_at，这样 event_hint 会落到「在一起」，而不是「刚回来」。
+                store.pop(umo, "away")
+                self._touch_together(umo, now, away_kw)
+                logger.info(f"{TAG} 一起出门（命中「{away_kw}」+ 同行词），视为在身边")
+            else:
+                self._clear_together(umo)
+                store.set(umo, "away", {
+                    "active": True,
+                    "reason": away_kw,
+                    "keyword": away_kw,
+                    "started_at": now,
+                    "expires_at": now + float(self.engine_cfg.get("away_ttl_hours", 8.0) or 8.0) * 3600,
+                    "cleared_at": None,
+                })
+                logger.info(f"{TAG} 标记不在身边（命中“{away_kw}”）")
+        elif self._is_together(text):
+            # 没有离开词，但这句话明显是「我们在一起」（牵手/抱着/陪你…）：
+            # 记一段「在一起」状态，主动消息才不会按「他不在」来写。
+            self._touch_together(umo, now)
 
         # 「快回来了」优先：给出门事件叠加更猛的加成 + 缩短有效期
         soon_kw = self._return_soon_kw(text)
@@ -1014,6 +1091,22 @@ class Runner:
                 gap = int((now - cleared) // 60)
                 when = "刚刚" if gap < 1 else f"{gap} 分钟前"
                 return f"他{when}回到你这边了，人就在旁边。"
+
+        together = self.store.get(umo, "together")
+        if (isinstance(together, dict) and together.get("active")
+                and now < float(together.get("until") or 0)):
+            event = self.store.get(umo, "active_event")
+            if isinstance(event, dict) and now < float(event.get("expires_at") or 0):
+                label = str(event.get("label") or "").strip()
+                elapsed = max(1, int((now - float(event.get("started_at") or now)) // 60))
+                if label:
+                    return (
+                        f"你们现在{label}（已经 {elapsed} 分钟），他就在你旁边，不是在外面。"
+                        "别说「想你」「等你回来」「到哪了」「给你留着」这种不在身边的说法，"
+                        "也别给他留位置；直接说眼前的事——手、座位、吃的、下一步去哪，"
+                        "语气黏但踏实，不孤单。"
+                    )
+            return "你们在一起，他人就在你旁边。别用「想你」「等你回来」这种话，直接跟身边的人说话。"
 
         event = self.store.get(umo, "active_event")
         if not isinstance(event, dict):

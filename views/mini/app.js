@@ -228,11 +228,12 @@
       }
       // 在场：没记录时默认就是「在身边」（离开要靠关键词命中才会记）
       const awayKw = (((state.config || {}).custom_engine || {}).away_keywords) || [];
+      const togetherOn = !!(it.together && it.together.active);
       const away = it.away
-        ? (it.away.active ? "离开：" + (it.away.reason || "—") : "在身边")
-        : "在身边";
+        ? (it.away.active ? "离开：" + (it.away.reason || "—") : (togetherOn ? "在一起" : "在身边"))
+        : (togetherOn ? "在一起" : "在身边");
       const awayTitle = awayKw.length
-        ? "命中离开关键词后会显示「离开：原因」，回来会清掉"
+        ? "命中离开关键词会显示「离开：原因」，回来会清掉；命中「一起/牵手」这类同行词会记为「在一起」"
         : "「在场状态」里还没填离开关键词，所以永远显示在身边";
       const sleep = (() => {
         const s = it.sleep;
@@ -268,6 +269,10 @@
           <button class="btn sm ghost" data-act="task" data-op="resched" data-umo="${esc(it.umo)}">重新排程</button>
           <button class="btn sm ghost" data-act="task" data-op="reset" data-umo="${esc(it.umo)}">重置计数</button>
           <button class="btn sm ghost" data-act="task" data-op="clear-event" data-umo="${esc(it.umo)}">清除事件</button>
+          <button class="btn sm ghost" data-act="task" data-op="clear-sleep" data-umo="${esc(it.umo)}">清除睡眠</button>
+          ${togetherOn
+            ? `<button class="btn sm ghost" data-act="task" data-op="clear-together" data-umo="${esc(it.umo)}">取消在一起</button>`
+            : `<button class="btn sm ghost" data-act="task" data-op="together" data-umo="${esc(it.umo)}">设为在一起</button>`}
         </div>
       </div>`;
     }).join("");
@@ -732,7 +737,7 @@
   ];
   const SLEEP_REST_PATHS = [
     "wake_time", "night_start_time", "sleep_quiet_hours",
-    "sleep_keywords", "wait_keywords",
+    "sleep_keywords", "wait_keywords", "wake_keywords",
   ];
   const SLEEP_CONTAINERS = [
     "#sleep-night-controls", "#sleep-nap-controls",
@@ -965,7 +970,7 @@
       "custom_engine.nap_remind_enabled", "custom_engine.nap_window_start",
       "custom_engine.nap_window_end", "custom_engine.night_start_time",
       "custom_engine.sleep_quiet_hours", "custom_engine.sleep_keywords",
-      "custom_engine.wait_keywords",
+      "custom_engine.wait_keywords", "custom_engine.wake_keywords",
       "custom_engine.wait_remind_min_minutes", "custom_engine.wait_remind_max_minutes",
       "custom_engine.wait_weight_early", "custom_engine.wait_weight_mid",
       "custom_engine.wait_weight_tail",
@@ -1165,6 +1170,15 @@
       } else if (op === "clear-event") {
         state.tasks = await api("POST", "tasks/action", { action: "clear_event", umo });
         toast("已清除当前事件", "ok");
+      } else if (op === "clear-sleep") {
+        state.tasks = await api("POST", "tasks/action", { action: "clear_sleep", umo });
+        toast("已清除睡眠状态", "ok");
+      } else if (op === "together") {
+        state.tasks = await api("POST", "tasks/action", { action: "mark_together", umo });
+        toast("已设为在一起：她知道你在旁边", "ok");
+      } else if (op === "clear-together") {
+        state.tasks = await api("POST", "tasks/action", { action: "clear_together", umo });
+        toast("已取消在一起", "ok");
       } else if (op === "remove") {
         if (!confirm("确定移除这个会话？")) return;
         state.tasks = await api("POST", "tasks/action", { action: "remove", umo });

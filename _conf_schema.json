@@ -633,6 +633,12 @@
                 "type": "string",
                 "default": "待会睡,稍后睡,再看会手机,再躺会,一会睡,等会睡,再看一会,等会就睡,再玩会儿睡"
             },
+            "wake_keywords": {
+                "description": "睡醒的说法",
+                "hint": "说「晚安」进入免打扰后，只有命中这些词才解除。睡前闲聊不会误触。逗号分隔。",
+                "type": "string",
+                "default": "我醒了,睡醒了,醒了,起床,起来了,不睡了,睡不着"
+            },
             "wait_remind_min_minutes": {
                 "description": "等会睡·最短提醒",
                 "hint": "说「等会睡」后最快多久催你。",

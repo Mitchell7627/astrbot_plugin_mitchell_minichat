@@ -66,7 +66,7 @@ _HOT_PATHS = tuple("custom_engine." + k for k in (
     "enable_sleep_reminder", "remind_window_start", "remind_window_end",
     "nap_remind_enabled", "nap_window_start", "nap_window_end",
     "wake_time", "night_start_time", "sleep_quiet_hours",
-    "sleep_keywords", "wait_keywords",
+    "sleep_keywords", "wait_keywords", "wake_keywords",
     "wait_remind_min_minutes", "wait_remind_max_minutes",
     "wait_weight_early", "wait_weight_mid", "wait_weight_tail",
     "night_weight_early", "night_weight_mid", "night_weight_tail",
@@ -307,6 +307,11 @@ class PanelService:
                 "active": bool(away.get("active")),
                 "reason": away.get("reason"),
                 "expires_at": away.get("expires_at"),
+            },
+            "together": None if not isinstance(state.get("together"), dict) else {
+                "active": bool(state["together"].get("active")),
+                "since": state["together"].get("since"),
+                "until": state["together"].get("until"),
             },
             "sleep": sleep,
         }
@@ -650,6 +655,20 @@ class PanelService:
         elif action == "clear_away":
             umo = self._validate_umo(umo)
             self.store.pop(umo, "away")
+            self.store.save()
+        elif action == "clear_sleep":
+            umo = self._validate_umo(umo)
+            self.store.pop(umo, "sleep_state")
+            self.store.save()
+        elif action == "mark_together":
+            umo = self._validate_umo(umo)
+            runner = self._require_runner()
+            runner._touch_together(umo, time.time(), "面板手动")
+            self.store.pop(umo, "away")
+            self.store.save()
+        elif action == "clear_together":
+            umo = self._validate_umo(umo)
+            self.store.pop(umo, "together")
             self.store.save()
         else:
             raise PanelError("E_BAD_REQUEST", f"未知动作 {action}")
