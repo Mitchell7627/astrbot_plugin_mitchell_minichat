@@ -801,6 +801,18 @@
       ],
     },
     {
+      section: "friend_settings", title: "省 token",
+      note: "只影响主动消息，正常回复不走这里；保存后立即生效",
+      paths: [
+        "context_settings.include_history_images",
+        "context_settings.include_history_think",
+        "context_settings.enable_context_window",
+        "context_settings.context_window_count",
+        "context_settings.context_window_hours",
+        "context_settings.context_window_min_messages",
+      ],
+    },
+    {
       section: "friend_settings", title: "分段发送", note: "保存后立即生效",
       paths: [
         "segmented_reply_settings.enable", "segmented_reply_settings.enable_smart_split",

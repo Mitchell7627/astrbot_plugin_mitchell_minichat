@@ -285,18 +285,35 @@ class EventRuleStore:
             return True
         return False
 
+    # 将来时标记：命中词前 6 个字里出现这些词，就不算「正在做」。
+    FUTURE_MARKERS = (
+        "明天", "后天", "改天", "下次", "下周", "下个月", "回头",
+        "以后", "将来", "等会", "待会", "晚点",
+    )
+
+    def _is_future(self, text: str, idx: int) -> bool:
+        head = text[max(0, idx - 6): idx]
+        return any(marker in head for marker in self.FUTURE_MARKERS)
+
     def match(self, text: str):
-        """返回命中的规则；未命中返回 None。"""
+        """返回命中的规则；未命中返回 None。
+
+        取「命中关键词最长」的那条：洗衣服(3) 优先于 去洗(2)，
+        避免「去洗衣服」被认成在洗澡。同长度时按规则顺序。
+        """
         if not text:
             return None
-        for rule in self._rules:
+        best = None  # (长度, -顺序, rule)
+        for order, rule in enumerate(self._rules):
             for kw in rule.get("keywords") or []:
                 idx = text.find(kw)
                 while idx != -1:
-                    if not self._is_negated(text, idx):
-                        return rule
+                    if not self._is_negated(text, idx) and not self._is_future(text, idx):
+                        cand = (len(kw), -order, rule)
+                        if best is None or cand > best:
+                            best = cand
                     idx = text.find(kw, idx + 1)
-        return None
+        return best[2] if best else None
 
     def _match_list(self, text: str, keywords: list[str]):
         """在一组关键词里找第一个未被否定的命中词。"""

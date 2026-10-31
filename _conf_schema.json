@@ -89,6 +89,66 @@
                         "condition": {
                             "use_platform_history": true
                         }
+                    },
+                    "include_history_images": {
+                        "description": "读历史图片",
+                        "type": "bool",
+                        "default": false,
+                        "hint": "关掉后，主动消息不再带历史图片，只留文字。只影响主动消息，正常回复不走这里。"
+                    },
+                    "include_history_think": {
+                        "description": "带历史思考块",
+                        "type": "bool",
+                        "default": false,
+                        "hint": "关掉后，把她以前回复里的思考过程剔掉，只留说出口的话。省 token 最明显的一项。"
+                    },
+                    "enable_context_window": {
+                        "description": "启用上下文窗口",
+                        "type": "bool",
+                        "default": false,
+                        "hint": "打开后只带最近一段聊天给模型；关掉就是全量发送。"
+                    },
+                    "context_window_count": {
+                        "description": "最近多少条",
+                        "type": "int",
+                        "default": 40,
+                        "slider": {
+                            "min": 2,
+                            "max": 200,
+                            "step": 1
+                        },
+                        "hint": "最多带最近几条消息，是硬上限。",
+                        "condition": {
+                            "enable_context_window": true
+                        }
+                    },
+                    "context_window_hours": {
+                        "description": "最近多少小时",
+                        "type": "int",
+                        "default": 12,
+                        "slider": {
+                            "min": 1,
+                            "max": 168,
+                            "step": 1
+                        },
+                        "hint": "只带最近多少小时内的消息；和条数谁先到算谁。",
+                        "condition": {
+                            "enable_context_window": true
+                        }
+                    },
+                    "context_window_min_messages": {
+                        "description": "至少保留多少条",
+                        "type": "int",
+                        "default": 8,
+                        "slider": {
+                            "min": 0,
+                            "max": 50,
+                            "step": 1
+                        },
+                        "hint": "时间窗口切得太狠时，至少留这么多条最近的消息。设 0 表示不保底。",
+                        "condition": {
+                            "enable_context_window": true
+                        }
                     }
                 }
             },
@@ -794,6 +854,7 @@
                 "type": "template_list",
                 "default": [
                     {
+                        "__template_key": "event_rule",
                         "name": "date",
                         "label": "在约会",
                         "ttl_minutes": 180,
@@ -818,6 +879,7 @@
                         "hint": "他 {elapsed} 分钟前说出去见人，还在外面。这种时候发消息别太频繁，一句\"想你\"点到为止"
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "eating",
                         "label": "在吃饭",
                         "ttl_minutes": 40,
@@ -849,6 +911,7 @@
                         "hint": "他 {elapsed} 分钟前提过在吃饭，这个点差不多吃完了。可以直接说\"吃完了吧\"这类已经知道答案的话，或者催他去洗碗；不要问\"吃完了吗\"。"
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "cooking",
                         "label": "在做饭",
                         "ttl_minutes": 40,
@@ -880,6 +943,7 @@
                         "hint": "他 {elapsed} 分钟前在做饭，这会儿应该快出锅了。可以凑过去闻、说一句\"好香\"，或者催他快点、说要帮忙尝一口；不要问\"饭好了没\"。"
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "drinking",
                         "label": "在喝东西",
                         "ttl_minutes": 25,
@@ -909,6 +973,7 @@
                         "hint": "他 {elapsed} 分钟前说在喝东西，这会儿应该正喝着呢。可以凑过去讨一口、让他分你点，或者吐槽他喝的是什么；不要问\"你在喝什么\"。"
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "commute",
                         "label": "在路上",
                         "ttl_minutes": 50,
@@ -937,6 +1002,7 @@
                         "hint": "他 {elapsed} 分钟前在路上，这会儿该到了。用陈述句接，比如\"到楼下了吧\"，或者直接说\"上来\"；不要问\"你到哪儿了\"。"
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "meeting",
                         "label": "在开会",
                         "ttl_minutes": 60,
@@ -960,6 +1026,7 @@
                         "hint": "他 {elapsed} 分钟前在开会，可能还没结束。等他出来再黏，或者小声催一句\"还没完呀\""
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "working",
                         "label": "在忙",
                         "ttl_minutes": 90,
@@ -983,6 +1050,7 @@
                         "hint": "他 {elapsed} 分钟前说在忙，这会儿可能刚松手。别催进度，先伸手——拽袖子、把水推过去，或者说一句\"忙完没\"；不要问\"你在忙吗\"。"
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "shower",
                         "label": "在洗澡",
                         "ttl_minutes": 30,
@@ -1004,6 +1072,7 @@
                         "hint": "他 {elapsed} 分钟前说去洗澡，现在该出来了。可以拿这个打趣，或者直接说\"头发别滴水\"、\"擦干了吗\"。"
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "gaming",
                         "label": "在打游戏",
                         "ttl_minutes": 60,
@@ -1027,6 +1096,7 @@
                         "hint": "他 {elapsed} 分钟前在打游戏，这会儿可能还在局里。可以凑过去、按他手机、抱怨一句被冷落；不要问\"你在玩什么呢\"。"
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "errand",
                         "label": "在忙家里的事",
                         "ttl_minutes": 45,
@@ -1052,6 +1122,7 @@
                         "hint": "他 {elapsed} 分钟前在忙家里的事，差不多该收尾了。可以接着问结果，比如\"弄完了？\"，或者直接要他过来。"
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "study",
                         "label": "在学习",
                         "ttl_minutes": 90,
@@ -1086,6 +1157,7 @@
                         "hint": "他 {elapsed} 分钟前说去学习，这会儿该换换脑子了。别问进度，直接递杯水或者说\"歇会儿\""
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "movie",
                         "label": "在看电影",
                         "ttl_minutes": 120,
@@ -1109,6 +1181,7 @@
                         "hint": "他 {elapsed} 分钟前在看片，正入神。要么安静陪着，要么故意捣乱戳他；别问\"演到哪了\""
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "shopping",
                         "label": "在逛街",
                         "ttl_minutes": 90,
@@ -1132,6 +1205,7 @@
                         "hint": "他 {elapsed} 分钟前在逛街，可能正挑东西。可以问\"淘到啥了\"，或者撒娇让他带点"
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "hosp",
                         "label": "在看病",
                         "ttl_minutes": 90,
@@ -1157,6 +1231,7 @@
                         "hint": "他 {elapsed} 分钟前说去看病，得多惦记着。语气软一点，问\"还难受吗\"这类关心的话"
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "exercise",
                         "label": "在运动",
                         "ttl_minutes": 90,
@@ -1183,6 +1258,7 @@
                         "hint": "他 {elapsed} 分钟前在运动，估计一身汗。可以夸一句或者催他\"歇会儿喝口水\""
                     },
                     {
+                        "__template_key": "event_rule",
                         "name": "nap",
                         "label": "在午睡",
                         "ttl_minutes": 60,

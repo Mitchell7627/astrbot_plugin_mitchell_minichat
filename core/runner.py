@@ -7,7 +7,7 @@ import json
 import random
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from astrbot.api import logger
 from astrbot.core.message.components import Plain
@@ -1195,6 +1195,10 @@ class Runner:
                 logger.warning(f"{TAG} 没读到平台流水，已回退为会话历史")
                 history = await self._load_history(umo)
 
+        # 省 token：图片 / 思考块 / 上下文窗口（放在平台流水回退之后）
+        if history:
+            history = self._prepare_contexts(history, settings)
+
         system_prompt = await self._load_persona(umo)
 
         template = str(cfg.get("proactive_prompt") or "")
@@ -1259,7 +1263,155 @@ class Runner:
             ),
             "platform_history_prompt": str(conf.get("platform_history_prompt") or ""),
             "include_bot_messages": bool(conf.get("include_bot_messages", True)),
+            "include_images": bool(conf.get("include_history_images", False)),
+            "include_think": bool(conf.get("include_history_think", False)),
+            "window_enabled": bool(conf.get("enable_context_window", False)),
+            "window_count": max(2, _as_int(conf.get("context_window_count"), 40)),
+            "window_hours": max(1, _as_int(conf.get("context_window_hours"), 12)),
+            "window_min": max(0, _as_int(conf.get("context_window_min_messages"), 8)),
         }
+
+    # ------------------------------------------------------------------
+    # 省 token：主动消息的上下文裁剪（正常回复不经过这里）
+    # ------------------------------------------------------------------
+    _REMINDER_TS = re.compile(
+        r"Current datetime: ([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-9]{2}):([0-9]{2})"
+    )
+
+    @classmethod
+    def _message_time(cls, message):
+        """从消息正文里抠出 <system_reminder> 的时间；拿不到返回 None。"""
+        if not isinstance(message, dict):
+            return None
+        content = message.get("content")
+        if isinstance(content, str):
+            texts = [content]
+        elif isinstance(content, list):
+            texts = [
+                str(part.get("text") or "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ]
+        else:
+            return None
+        for text in texts:
+            match = cls._REMINDER_TS.search(text)
+            if not match:
+                continue
+            try:
+                return datetime.strptime(
+                    f"{match.group(1)} {match.group(2)}:{match.group(3)}",
+                    "%Y-%m-%d %H:%M",
+                )
+            except ValueError:
+                continue
+        return None
+
+    @classmethod
+    def _fill_times(cls, history: list) -> list:
+        """assistant 没有时间戳：向前继承最近一条，开头的用第一个已知时间回填。"""
+        times = [cls._message_time(message) for message in history]
+        last = None
+        for index, stamp in enumerate(times):
+            if stamp is not None:
+                last = stamp
+            elif last is not None:
+                times[index] = last
+        first = next((stamp for stamp in times if stamp is not None), None)
+        if first is not None:
+            for index, stamp in enumerate(times):
+                if stamp is not None:
+                    break
+                times[index] = first
+        return times
+
+    @staticmethod
+    def _trim_window(history: list, times: list, settings: dict) -> list:
+        total = len(history)
+        count = max(2, int(settings["window_count"]))
+        keep_from = max(0, total - count)
+
+        known = [stamp for stamp in times if stamp is not None]
+        if known:
+            cutoff = datetime.now() - timedelta(hours=int(settings["window_hours"]))
+            index = total
+            for i in range(total - 1, -1, -1):
+                stamp = times[i]
+                if stamp is not None and stamp >= cutoff:
+                    index = i
+                else:
+                    break
+            keep_from = max(keep_from, index)
+
+        result = history[keep_from:]
+        floor = min(max(0, int(settings["window_min"])), total, count)
+        if floor and len(result) < floor:
+            result = history[total - floor:]
+        if not result and history:
+            result = history[-1:]
+        return result
+
+    @staticmethod
+    def _strip_parts(message, drop_images: bool, drop_think: bool):
+        """剔除图片 / 思考块；被滤空的消息返回 None，str content 原样返回。"""
+        if not isinstance(message, dict):
+            return message
+        content = message.get("content")
+        if not isinstance(content, list):
+            return message
+
+        kept = []
+        for part in content:
+            if not isinstance(part, dict):
+                kept.append(part)
+                continue
+            kind = part.get("type")
+            if drop_images and kind in ("image_url", "audio_url"):
+                continue
+            if drop_think and kind == "think":
+                continue
+            kept.append(part)
+
+        meaningful = False
+        for part in kept:
+            if not isinstance(part, dict):
+                meaningful = True
+                break
+            if part.get("type") != "text":
+                meaningful = True
+                break
+            if str(part.get("text") or "").strip():
+                meaningful = True
+                break
+        if meaningful:
+            return {**message, "content": kept}
+        if set(message) <= {"role", "content"}:
+            return None
+        return {**message, "content": kept}
+
+    def _prepare_contexts(self, history: list, settings: dict) -> list:
+        before = len(history)
+        out = list(history)
+        drop_images = not settings["include_images"]
+        drop_think = not settings["include_think"]
+
+        if settings["window_enabled"]:
+            out = self._trim_window(out, self._fill_times(out), settings)
+        if drop_images or drop_think:
+            filtered = []
+            for message in out:
+                item = self._strip_parts(message, drop_images, drop_think)
+                if item is not None:
+                    filtered.append(item)
+            out = filtered
+        if len(out) != before:
+            logger.info(
+                f"{TAG} 上下文裁剪 {before} → {len(out)} 条"
+                f"（窗口={'开' if settings['window_enabled'] else '关'}，"
+                f"图片={'剔' if drop_images else '留'}，"
+                f"思考={'剔' if drop_think else '留'}）"
+            )
+        return out
 
     @staticmethod
     def _record_field(record, field, default=None):
