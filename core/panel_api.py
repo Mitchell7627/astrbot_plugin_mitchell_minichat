@@ -1027,6 +1027,9 @@ class PanelService:
                     "- 先看整句意思再看词：双重否定（「不是不想洗澡」）按真实意思算；引号里引用别人的话、反问夸张（「谁要洗澡啊」）都不算\n"
                     "- 用户常用昵称指代自己时，主语按用户本人理解\n"
                     "- 语义相近归到已有类别（炒菜/做饭→cooking，开会→meeting，复习/上课→study）\n"
+                    "- 宁可 none，不要硬塞：表里没有贴切的类别就 none\n"
+                    "- 说的是「这件事」不等于「正在做」：只是聊到、提一嘴、商量（「要不」「你觉得」「找个时间」「改天」）→ none\n"
+                    "- commute 只算通勤赶路（上下班路上、赶车、在车上）；出去玩、去公园、散步、遛弯都不算\n"
                     "- 只有明确做完才 done=true，且必须同时给出类别名\n\n"
                     "示例：\n"
                     '「我去洗澡了」→ {"event":"shower","done":false}\n'
@@ -1036,7 +1039,9 @@ class PanelService:
                     '「会开完了」→ {"event":"meeting","done":true}\n'
                     '「（上文在炒菜）做好咯」→ {"event":"cooking","done":false}\n'
                     '「开饭了，一起吃吧」→ {"event":"eating","done":false}\n'
-                    '「饭好了，快来吃」→ {"event":"eating","done":false}\n\n'
+                    '「饭好了，快来吃」→ {"event":"eating","done":false}\n'
+                    '「出公园去玩」→ {"event":"none","done":false}\n'
+                    '「要不找个时间出去走走」→ {"event":"none","done":false}\n\n'
                     '只输出 JSON，不要解释：{"event":"类别名或none","done":false}'
                 ),
                 "reminder_hint": (

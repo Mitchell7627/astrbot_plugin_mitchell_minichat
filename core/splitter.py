@@ -25,6 +25,22 @@ ALNUM_CHAR = re.compile(r"[a-zA-Z0-9]")
 ASCII_PUNCT = re.compile(r"^[ \t.?!,;:\-']+$")
 
 
+def normalize_escapes(text: str) -> str:
+    """把模型偶尔吐出来的**字面转义**还原成真字符。
+
+    有些模型会把换行写成两个字符（反斜杠 + n），直接发出去就会在聊天里看到
+    一个「\\n」。这里只处理最常见的三种，正常文本里不会出现反斜杠，不受影响。
+    """
+    if not isinstance(text, str) or "\\" not in text:
+        return text
+    return (
+        text.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n")
+        .replace("\\t", " ")
+    )
+
+
 def split_text(
     text,
     *,
@@ -41,6 +57,7 @@ def split_text(
     """把一段文本切成多条消息。返回字符串列表。"""
     if not text or not text.strip():
         return []
+    text = normalize_escapes(text)
     try:
         max_segments = max(1, int(max_segments))
     except (TypeError, ValueError):
