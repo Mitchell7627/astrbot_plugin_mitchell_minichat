@@ -972,6 +972,10 @@ class Runner:
             return {"skipped": "no_rules"}
         if not self._looks_active(text):
             return {"skipped": "prefilter"}
+        # 关键词那层已经滤过将来时，这里再兜一次：
+        # 「明早哥哥要上课」这种是在说日程，不是此刻在忙，别让模型把它落成事件。
+        if self.engine.is_future_text(text):
+            return {"skipped": "future"}
 
         dialogue = await self._recent_dialogue(umo)
 

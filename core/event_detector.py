@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from astrbot.api import logger
 BUILTIN_RULES = {
     "version": 1,
     "default_ttl_minutes": 45,
-    "negation_prefixes": ["不想", "不要", "还没", "没去", "待会", "晚点", "不打算", "不饿", "不去", "别去", "不去了"],
+    "negation_prefixes": ["不想", "不要", "不用", "不必", "还没", "没去", "待会", "晚点", "不打算", "不饿", "不去", "别去", "不去了"],
     "away_keywords": ["去上课", "上课去", "去上班", "上班去", "出门", "走了", "我走", "去公司",
                       "去学校", "出去", "下楼", "去一趟", "先走了", "去开个会"],
     "return_keywords": ["到家", "回来了", "我回来", "进家门", "进门", "我到了", "已经到家"],
@@ -288,15 +289,48 @@ class EventRuleStore:
             return True
         return False
 
-    # 将来时标记：命中词前 6 个字里出现这些词，就不算「正在做」。
+    # 将来时标记：命中词所在分句里出现这些词，就不算「正在做」。
+    # 以前只看命中词前 6 个字，两个漏网场景：
+    #   1) 词表里没有「明早/明晚/明儿」，「明早要上课」直接当成了现在去上课；
+    #   2) 6 字窗口太窄，「明天早上八点要上课」的「明天」正好被切在窗口外。
     FUTURE_MARKERS = (
-        "明天", "后天", "改天", "下次", "下周", "下个月", "回头",
-        "以后", "将来", "等会", "待会", "晚点",
+        "明天", "明日", "明早", "明晚", "明晨", "明儿", "明个",
+        "后天", "大后天", "改天", "下次", "下回", "下周", "下星期", "下礼拜",
+        "下个月", "下学期", "回头", "以后", "将来",
+        "等会", "等会儿", "待会", "待会儿", "晚点", "一会儿", "过会儿", "稍后",
     )
+    # 兜底正则：明/后/下次 + 时间单位（明天、明早、明晚、后天早上、下次…），
+    # 覆盖词表没枚举到的说法。
+    FUTURE_RE = re.compile(r"(?:明|后|大后|次)(?:天|日|早|晚|儿|个|晨)")
+    # 将来时只在同一分句内生效，跨分句（「今天…，明天…」）不算。
+    CLAUSE_BOUNDARY = "。！？；，、,.!?;~～…\n"
+    # 往回最多看这么多字，避免长句里串到很远的分句去。
+    FUTURE_WINDOW = 14
+
+    def _future_head(self, text: str, idx: int) -> str:
+        """取命中词前面、同一分句内的那一段文字。"""
+        start = max(0, idx - self.FUTURE_WINDOW)
+        for pos in range(idx - 1, start - 1, -1):
+            if text[pos] in self.CLAUSE_BOUNDARY:
+                start = pos + 1
+                break
+        return text[start:idx]
 
     def _is_future(self, text: str, idx: int) -> bool:
-        head = text[max(0, idx - 6): idx]
-        return any(marker in head for marker in self.FUTURE_MARKERS)
+        head = self._future_head(text, idx)
+        if not head:
+            return False
+        if any(marker in head for marker in self.FUTURE_MARKERS):
+            return True
+        return bool(self.FUTURE_RE.search(head))
+
+    def is_future_text(self, text: str) -> bool:
+        """整句是否在说「以后/明天」的事（供语义识别前置过滤用）。"""
+        if not text:
+            return False
+        if any(marker in text for marker in self.FUTURE_MARKERS):
+            return True
+        return bool(self.FUTURE_RE.search(text))
 
     def match(self, text: str):
         """返回命中的规则；未命中返回 None。
