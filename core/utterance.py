@@ -190,14 +190,15 @@ def _judge_cached(
     ):
         return hit("R3", VERDICT_REJECT)
 
+    # R5 要在 R4 前面：「没人喜欢上班」说的是别人/泛指，比「情绪词带宾语」更贴近真实原因
+    if "R5" in scope and head.startswith(_VAGUE_HEADS) and any(w in head for w in _EMOTION_TAILS):
+        return hit("R5", VERDICT_REJECT)
+
     if "R4" in scope and any(w in head for w in _EMOTION_TAILS):
         if any(w in clause for w in _TURN_WORDS):
             # 「讨厌上课但还是得去」：真有动作，但情绪词在前，判灰不判死
             return hit("G3", VERDICT_GRAY)
         return hit("R4", VERDICT_REJECT)
-
-    if "R5" in scope and head.startswith(_VAGUE_HEADS) and any(w in head for w in _EMOTION_TAILS):
-        return hit("R5", VERDICT_REJECT)
 
     if "R6" in scope and any(w in text for w in _RHETORIC):
         return hit("R6", VERDICT_REJECT)

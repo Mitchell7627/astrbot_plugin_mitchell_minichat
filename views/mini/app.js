@@ -884,7 +884,8 @@
     {
       section: "custom_engine", title: "识别判定", note: "改完立即生效",
       paths: ["enable_utterance_judge", "judge_strict", "enable_gray_review",
-              "gray_review_per_hour", "gray_review_per_day", "decision_log_size"],
+              "gray_review_per_hour", "gray_review_per_day", "decision_log_size",
+              "bot_nicknames"],
     },
     {
       section: "web_panel", title: "面板", note: "改动后需重载插件",
