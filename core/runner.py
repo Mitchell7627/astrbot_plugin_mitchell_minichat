@@ -785,23 +785,65 @@ class Runner:
     )
     # 「和/跟/与/同 + 非我」也是"一起"（和宝宝泡澡、跟你出门）。
     # 用结构判断，不写死任何名字，发布版对谁都能用。
-    _TOGETHER_RE = re.compile(r"[和跟与同](?!我)")
-    # 「帮/给/替/哄/喂/教 + 非我」→ 这件事是对方在做，不是用户在做
-    # （帮宝宝吹头发、给你擦药）。同样不依赖具体称呼。
-    _HER_RE = re.compile(r"(?:帮|给|替|哄|喂|教)(?!我)")
+    # 「和/跟/与/同 + 非我」以前是单字宽匹配，中文没有词边界，必然撞词：
+    # 「参与」「同样」「和好了」「跟朋友」「和同事」全会被当成"和机器人一起"，
+    # 于是第三方同行被误判、离开状态被吞。现在只认二人称（和你/跟您），
+    # 昵称场景交给 bot_nicknames 配置（默认「宝宝/宝贝」，与 v0.0.3 行为一致）。
+    _TOGETHER_RE = re.compile(r"[和跟与同]\s*[你您]")
+    # 同理：「帮/给/替/哄/喂/教 + 你」才是"对方在做"。
+    # 「给狗洗澡」「帮老板带饭」这类第三人称受事不再反转主体。
+    _HER_RE = re.compile(r"(?:帮|给|替|哄|喂|教)\s*[你您]")
+    DEFAULT_BOT_NICKNAMES = ("宝宝", "宝贝")
+
+    def _bot_nicknames(self) -> list:
+        """机器人昵称（逗号分隔配置）。未配置时用内置默认，配成空则视为不要昵称。"""
+        raw = self.engine_cfg.get("bot_nicknames")
+        if raw is None:
+            return list(self.DEFAULT_BOT_NICKNAMES)
+        if isinstance(raw, list):
+            items = [str(x).strip() for x in raw]
+        else:
+            items = [x.strip() for x in str(raw).replace("，", ",").replace("、", ",").split(",")]
+        return [x for x in items if x]
+
+    def _nick_re(self, verb_chars: str):
+        names = self._bot_nicknames()
+        if not names:
+            return None
+        joined = "|".join(re.escape(n) for n in names)
+        return re.compile(rf"[{verb_chars}]\s*(?:{joined})")
 
     def _is_together(self, text: str) -> bool:
         if any(k in text for k in self.TOGETHER_KEYWORDS):
             return True
-        return bool(self._TOGETHER_RE.search(text))
+        if self._TOGETHER_RE.search(text):
+            return True
+        nick = self._nick_re("和跟与同")
+        return bool(nick and nick.search(text))
+
+    def _is_her(self, text: str) -> bool:
+        """这件事是机器人在做（「给你擦药」「帮宝宝吹头发」）。"""
+        if self._HER_RE.search(text):
+            return True
+        nick = self._nick_re("帮给替哄喂教")
+        return bool(nick and nick.search(text))
 
     def _event_subject(self, text: str) -> str:
         """判断事件主体：self=用户在做 / together=两人一起 / her=对方在做。"""
         if self._is_together(text):
             return "together"
-        if self._HER_RE.search(text):
+        if self._is_her(text):
             return "her"
         return "self"
+
+    # 「帮我拿快递」「给你取外卖」：动口不动腿，别当成用户自己要出门
+    _REQUEST_RE = re.compile(r"(?:帮|给|替)[我你]")
+
+    def _is_request_to_someone(self, text: str, kw: str) -> bool:
+        idx = text.find(kw)
+        if idx <= 0:
+            return False
+        return bool(self._REQUEST_RE.search(text[max(0, idx - 4):idx]))
 
     # ------------------------------------------------------------------
     # 「在一起」状态：两人就在一块，主动消息不能写成「他不在你身边」
@@ -898,6 +940,9 @@ class Runner:
             return True
 
         away_kw = self.engine.match_away(text)
+        if away_kw and self._is_request_to_someone(text, away_kw):
+            # 「帮我拿快递」「给你取外卖」是支使别人去做，不是用户自己要出门
+            away_kw = None
         if away_kw:
             if self._is_together(text):
                 # 一起出门：不算「离开」，她就在你身边。直接清掉 away 记录，
@@ -916,9 +961,11 @@ class Runner:
                     "cleared_at": None,
                 })
                 logger.info(f"{TAG} 标记不在身边（命中“{away_kw}”）")
-        elif self._is_together(text):
+        elif self._is_together(text) and not self.engine.is_future_text(text) \
+                and not self.engine.is_far_past_text(text):
             # 没有离开词，但这句话明显是「我们在一起」（牵手/抱着/陪你…）：
             # 记一段「在一起」状态，主动消息才不会按「他不在」来写。
+            # 「改天一起看电影」「昨天一起吃了饭」是计划/过去，不该现在就记在一起。
             self._touch_together(umo, now)
 
         # 结束词

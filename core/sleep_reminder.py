@@ -17,6 +17,8 @@ import random
 import time
 from datetime import datetime
 
+from . import text_rules as rules
+
 # 睡眠状态键（session_data 里）
 SLEEP_KEY = "sleep_state"
 
@@ -27,7 +29,10 @@ STATE_REMINDED = "reminded"
 
 # 默认词表
 DEFAULT_SLEEP_KEYWORDS = ["睡了", "睡觉", "晚安", "要睡了", "去睡了", "睡觉了", "睡了哦"]
-DEFAULT_WAIT_KEYWORDS = ["待会睡", "稍后睡", "再看会手机", "再躺会", "一会睡", "等会睡", "再看一会"]
+DEFAULT_WAIT_KEYWORDS = [
+    "待会睡", "稍后睡", "再看会手机", "再看会儿手机", "再躺会", "一会睡", "等会睡", "再看一会",
+    "再玩会儿就睡", "再玩一会就睡", "玩会就睡", "打完这把就睡",
+]
 
 # 「确定要睡」的否定前缀：出现这些就别当成要睡
 SLEEP_NEGATIONS = ["不", "没", "别", "还没", "不想", "不要", "不困", "睡不着"]
@@ -39,9 +44,10 @@ WAIT_NEGATIONS = ["不", "没", "别", "还不", "不想", "不要"]
 _NAP_WORDS = ("午睡", "午觉", "补觉", "眯一会", "眯一会儿", "眯一下", "小睡", "打盹")
 
 # 第三人称主语：说的是别人睡了，不该静音自己
+# 「宝宝/宝贝」按本插件的语境多半指机器人自己，也不能把用户静音。
 _THIRD_PERSON = (
     "你", "他", "她", "孩子", "我妈", "我爸", "室友", "同事", "同学",
-    "朋友", "家里", "猫", "狗",
+    "朋友", "家里", "猫", "狗", "宝宝", "宝贝",
 )
 
 
@@ -57,11 +63,16 @@ def _iter_hits(text: str, keywords):
 
 
 def _is_negated_at(text: str, idx: int, negations) -> bool:
-    """否定词紧贴关键词前 4 个字才视为否定（如「还不困」「不想睡」）。"""
-    if idx <= 0:
-        return False
-    head = text[max(0, idx - 4):idx]
-    return any(neg in head for neg in negations)
+    """否定词紧贴关键词前 4 个字才视为否定（如「还不困」「不想睡」），且不跨分句。
+
+    「不困，再看会手机」：`再看会手机` 的分句头在逗号之后，不受前面的「不」影响。
+    """
+    return rules.negated_by_clause(text, idx, negations, window=4)
+
+
+def _is_past_at(text: str, kw: str, idx: int) -> bool:
+    """说的是已经睡过/吃过的事（「昨天睡了8小时」），别当成现在要睡。"""
+    return rules.is_past_clause(text, idx, kw_len=len(kw))
 
 
 def _is_question_at(text: str, kw: str, idx: int) -> bool:
@@ -243,10 +254,11 @@ def pick_weighted_offset(
 def match_sleep(text: str, keywords) -> str | None:
     """命中「确定要睡」返回命中的词，否则 None。
 
-    过滤四类误判：
+    过滤五类误判：
     - 否定（「不睡了」）；
     - 疑问（「睡了吗」「你睡了没」）；
     - 第三人称（「孩子睡了」「我妈睡了」）；
+    - 过去时（「昨天睡了8小时」「昨晚睡了一会儿」——说已经睡过，人其实醒着）；
     - 午睡/小睡（「我午睡了」）——这类交给 nap 事件，别开整夜免打扰。
     同一个词出现多次时逐个检查，前面那次被否定不影响后面那次。
     """
@@ -262,12 +274,14 @@ def match_sleep(text: str, keywords) -> str | None:
             continue
         if _has_third_person(text, idx):
             continue
+        if _is_past_at(text, kw, idx):
+            continue
         return kw
     return None
 
 
 def match_wait(text: str, keywords) -> str | None:
-    """命中「待会再睡」返回命中的词，否则 None。带否定/疑问/第三人称过滤。"""
+    """命中「待会再睡」返回命中的词，否则 None。带否定/疑问/第三人称/过去时过滤。"""
     text = str(text or "")
     if not text:
         return None
@@ -277,6 +291,8 @@ def match_wait(text: str, keywords) -> str | None:
         if _is_question_at(text, kw, idx):
             continue
         if _has_third_person(text, idx):
+            continue
+        if _is_past_at(text, kw, idx):
             continue
         return kw
     return None

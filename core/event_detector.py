@@ -10,16 +10,18 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from pathlib import Path
 
 from astrbot.api import logger
 
+from . import text_rules as rules
+
 BUILTIN_RULES = {
     "version": 1,
     "default_ttl_minutes": 45,
-    "negation_prefixes": ["不想", "不要", "不用", "不必", "还没", "没去", "待会", "晚点", "不打算", "不饿", "不去", "别去", "不去了"],
+    "negation_prefixes": ["不想", "不要", "不用", "不必", "没空", "没时间", "没心情", "没去成",
+                          "还没", "没去", "待会", "晚点", "不打算", "不饿", "不去", "别去", "不去了"],
     "away_keywords": ["去上课", "上课去", "去上班", "上班去", "出门", "走了", "我走", "去公司",
                       "去学校", "出去", "下楼", "去一趟", "先走了", "去开个会"],
     "return_keywords": ["到家", "回来了", "我回来", "进家门", "进门", "我到了", "已经到家"],
@@ -279,50 +281,48 @@ class EventRuleStore:
         return False
 
     def _is_negated(self, text: str, idx: int) -> bool:
-        # 命中词前 4 个字符里出现否定词，就当成否定。
-        # 4 个字能覆盖「不去」「别去」「不去了」这类紧贴否定，也能容纳「还没/待会/不打算」。
-        head = text[max(0, idx - 4): idx]
-        if any(p in head for p in self._negations):
-            return True
-        # 兜底：命中词紧跟着一个孤立的「不 / 别」，且再往前不是动词场景（避免「不错」「不要紧」误伤）
-        if head and head[-1] in ("不", "别"):
-            return True
-        return False
+        # 命中词前 4 个字里出现否定词，就当成否定；回看**不跨分句**——
+        # 「不困，再看会手机」里的「不」属于上一句，不该把「再看会手机」也否定掉。
+        return rules.negated_by_clause(text, idx, self._negations, window=4)
 
-    # 将来时标记：命中词所在分句里出现这些词，就不算「正在做」。
-    # 以前只看命中词前 6 个字，两个漏网场景：
-    #   1) 词表里没有「明早/明晚/明儿」，「明早要上课」直接当成了现在去上课；
-    #   2) 6 字窗口太窄，「明天早上八点要上课」的「明天」正好被切在窗口外。
-    FUTURE_MARKERS = (
-        "明天", "明日", "明早", "明晚", "明晨", "明儿", "明个",
-        "后天", "大后天", "改天", "下次", "下回", "下周", "下星期", "下礼拜",
-        "下个月", "下学期", "回头", "以后", "将来",
-        "等会", "等会儿", "待会", "待会儿", "晚点", "一会儿", "过会儿", "稍后",
-    )
-    # 兜底正则：明/后/下次 + 时间单位（明天、明早、明晚、后天早上、下次…），
-    # 覆盖词表没枚举到的说法。
-    FUTURE_RE = re.compile(r"(?:明|后|大后|次)(?:天|日|早|晚|儿|个|晨)")
-    # 将来时只在同一分句内生效，跨分句（「今天…，明天…」）不算。
-    CLAUSE_BOUNDARY = "。！？；，、,.!?;~～…\n"
+    # 将来时/过去时/疑问/人称的判定统一在 core/text_rules.py，这里只做转发，
+    # 保证事件、在场、睡眠三条链路口径一致。
+    FUTURE_MARKERS = rules.FUTURE_MARKERS
+    FUTURE_RE = rules.FUTURE_RE
+    CLAUSE_BOUNDARY = rules.CLAUSE_BOUNDARY
     # 往回最多看这么多字，避免长句里串到很远的分句去。
     FUTURE_WINDOW = 14
+    # 「明天，我去吃饭」：时间状语被逗号隔开时，并上看一眼紧邻的短分句（≤4 字）。
+    FUTURE_PREV_MAX = 4
 
     def _future_head(self, text: str, idx: int) -> str:
-        """取命中词前面、同一分句内的那一段文字。"""
-        start = max(0, idx - self.FUTURE_WINDOW)
-        for pos in range(idx - 1, start - 1, -1):
-            if text[pos] in self.CLAUSE_BOUNDARY:
-                start = pos + 1
-                break
-        return text[start:idx]
+        """取命中词前面、同一分句内的那一段文字（可并入紧邻的短时间状语分句）。"""
+        return rules.clause_head(
+            text, idx, window=self.FUTURE_WINDOW, prev_max=self.FUTURE_PREV_MAX
+        )
 
     def _is_future(self, text: str, idx: int) -> bool:
-        head = self._future_head(text, idx)
-        if not head:
-            return False
-        if any(marker in head for marker in self.FUTURE_MARKERS):
-            return True
-        return bool(self.FUTURE_RE.search(head))
+        return rules.is_future_clause(
+            text, idx, window=self.FUTURE_WINDOW, prev_max=self.FUTURE_PREV_MAX
+        )
+
+    def _is_past(self, text: str, idx: int, kw_len: int = 0) -> bool:
+        """是不是在说已经发生的事（刚才吃了饭 / 上周看完电影 / 洗漱完了）。"""
+        return rules.is_past_clause(
+            text, idx, kw_len=kw_len,
+            window=self.FUTURE_WINDOW, prev_max=self.FUTURE_PREV_MAX,
+        )
+
+    def _is_question(self, text: str, idx: int, kw_len: int) -> bool:
+        """是不是在问（吃了吗 / 在开会吗）。"""
+        return rules.is_question_clause(text, idx, kw_len=kw_len, window=self.FUTURE_WINDOW)
+
+    def _is_third_person(self, text: str, idx: int) -> bool:
+        """做事的是不是别人（我妈在做饭 / 他说他在洗澡）。"""
+        return rules.is_third_person_subject(text, idx)
+
+    def _is_reported(self, text: str, idx: int) -> bool:
+        return rules.is_reported_clause(text, idx)
 
     def is_future_text(self, text: str) -> bool:
         """整句是否在说「以后/明天」的事（供语义识别前置过滤用）。"""
@@ -331,6 +331,28 @@ class EventRuleStore:
         if any(marker in text for marker in self.FUTURE_MARKERS):
             return True
         return bool(self.FUTURE_RE.search(text))
+
+    def is_far_past_text(self, text: str) -> bool:
+        """整句是否在说以前的事（「昨天一起吃了饭」），供在场状态判断用。"""
+        if not text:
+            return False
+        return any(marker in text for marker in rules.PAST_FAR)
+
+    def _accept(self, text: str, idx: int, kw: str) -> bool:
+        """这次命中能不能当成「用户此刻正在做」。"""
+        if self._is_reported(text, idx):
+            return False
+        if self._is_negated(text, idx):
+            return False
+        if self._is_future(text, idx):
+            return False
+        if self._is_past(text, idx, len(kw)):
+            return False
+        if self._is_question(text, idx, len(kw)):
+            return False
+        if self._is_third_person(text, idx):
+            return False
+        return True
 
     def match(self, text: str):
         """返回命中的规则；未命中返回 None。
@@ -345,7 +367,7 @@ class EventRuleStore:
             for kw in rule.get("keywords") or []:
                 idx = text.find(kw)
                 while idx != -1:
-                    if not self._is_negated(text, idx) and not self._is_future(text, idx):
+                    if self._accept(text, idx, kw):
                         cand = (len(kw), -order, rule)
                         if best is None or cand > best:
                             best = cand
@@ -353,17 +375,29 @@ class EventRuleStore:
         return best[2] if best else None
 
     def _match_list(self, text: str, keywords: list[str]):
-        """在一组关键词里找第一个未被否定、也不是将来时的命中词。
+        """在一组关键词里找第一个「此刻成立」的命中。
 
-        离开/回归词同样要过将来时过滤：「明天要出门」不该现在就标记不在身边，
-        「明天就到家了」也不该现在就清掉在场状态。
+        过滤四类误判：
+        - 否定（「还没到家」，且不跨分句）；
+        - 将来时（「明天要出门」不该现在就标记不在身边）；
+        - 明确过去（「昨天出门了」是过去；但「刚才出门了」人还在外面，不算）；
+        - 疑问（「到家了吗」不是在报告自己到家）。
         """
         if not text:
             return None
         for kw in keywords:
             idx = text.find(kw)
             while idx != -1:
-                if not self._is_negated(text, idx) and not self._is_future(text, idx):
+                if (
+                    not self._is_reported(text, idx)
+                    and not self._is_negated(text, idx)
+                    and not self._is_future(text, idx)
+                    and not rules.is_far_past_clause(
+                        text, idx, kw_len=len(kw),
+                        window=self.FUTURE_WINDOW, prev_max=self.FUTURE_PREV_MAX,
+                    )
+                    and not self._is_question(text, idx, len(kw))
+                ):
                     return kw
                 idx = text.find(kw, idx + 1)
         return None
