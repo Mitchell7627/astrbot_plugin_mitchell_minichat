@@ -259,7 +259,9 @@ class PanelService:
         runner = self.runner
 
         next_at = _as_float(state.get("next_at"), 0.0)
-        alive = bool(runner and umo in getattr(runner, "timers", {}))
+        # 跑完但还没被替换的 task 不能再算「已排程」，否则暂停会话会显示成 due
+        timer = getattr(runner, "timers", {}).get(umo) if runner else None
+        alive = bool(timer is not None and not timer.done())
         if alive and next_at > now:
             phase = "scheduled"
         elif next_at > 0 and next_at <= now:
@@ -274,6 +276,14 @@ class PanelService:
             except Exception:
                 event = None
         away = state.get("away") if isinstance(state.get("away"), dict) else None
+        away_active = None
+        if isinstance(away, dict):
+            away_active = bool(away.get("active"))
+            # 和 event_hint 口径一致：过了 expires_at 就不再算「不在身边」
+            if away_active:
+                exp = _as_float(away.get("expires_at"), 0.0)
+                if exp and now >= exp:
+                    away_active = False
         sleep = None
         if runner is not None:
             try:
@@ -308,7 +318,7 @@ class PanelService:
                 "boost_budget": _as_int(event.get("boost_budget"), 1),
             },
             "away": None if not isinstance(away, dict) else {
-                "active": bool(away.get("active")),
+                "active": away_active,
                 "reason": away.get("reason"),
                 "expires_at": away.get("expires_at"),
             },

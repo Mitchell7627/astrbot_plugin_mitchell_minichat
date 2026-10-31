@@ -42,6 +42,10 @@ from .splitter import calc_delay, split_text
 
 TAG = "[Minichat]"
 
+# 主生成超时：provider 卡死时必须有人把这一轮掐掉，
+# 否则 _firing 永久占用该会话、finally 不执行、后续不再重排。
+GENERATE_TIMEOUT_SECONDS = 120
+
 
 def _as_int(value, default: int) -> int:
     """把配置值转成整数；只有 None 或非法值才用默认值，避免把显式的 0 吞掉。"""
@@ -300,17 +304,20 @@ class Runner:
                 if boost:
                     # 全局倍数 × 单条规则 boost / 基准值：
                     # 基准 3.0 时等价于直接用规则里的 boost，旧配置行为不变。
-                    base = float(eng.get("early_weight_event", 3.0) or 3.0)
-                    rule_boost = float(event.get("boost", EVENT_BOOST_BASELINE) or EVENT_BOOST_BASELINE)
+                    base = _as_float_safe(eng.get("early_weight_event"), 3.0)
+                    rule_boost = _as_float_safe(
+                        event.get("boost"), EVENT_BOOST_BASELINE
+                    )
                     event_weight = max(0.01, base * rule_boost / EVENT_BOOST_BASELINE)
 
+            # 全是 0 也是合法配置（比如只想让她在尾段开口），不能用 `or` 吞掉
             profile = {
-                "early_weight": float(eng.get("early_weight", 1.0) or 1.0),
-                "early_weight_event": float(eng.get("early_weight_event", 3.0) or 3.0),
-                "mid_weight": float(eng.get("mid_weight", 1.15) or 1.15),
-                "tail_head_weight": float(eng.get("tail_head_weight", 1.15) or 1.15),
-                "tail_floor_weight": float(eng.get("tail_floor_weight", 0.6) or 0.6),
-                "tail_decay_power": float(eng.get("tail_decay_power", 0.3) or 0.3),
+                "early_weight": _as_float_safe(eng.get("early_weight"), 1.0),
+                "early_weight_event": _as_float_safe(eng.get("early_weight_event"), 3.0),
+                "mid_weight": _as_float_safe(eng.get("mid_weight"), 1.15),
+                "tail_head_weight": _as_float_safe(eng.get("tail_head_weight"), 1.15),
+                "tail_floor_weight": _as_float_safe(eng.get("tail_floor_weight"), 0.6),
+                "tail_decay_power": _as_float_safe(eng.get("tail_decay_power"), 0.3),
             }
             seconds, mode = sample_interval_seconds(
                 lo,
@@ -385,9 +392,9 @@ class Runner:
     def _max_interval_minutes(self) -> float:
         schedule = self.cfg.get("schedule_settings", {}) or {}
         try:
-            return max(1.0, float(schedule.get("max_interval_minutes", 150) or 150))
+            return max(1.0, _as_float_safe(schedule.get("max_interval_minutes"), 240.0))
         except (TypeError, ValueError):
-            return 150.0
+            return 240.0
 
     def _sleep_windows(self, cfg: dict) -> list[dict]:
         """启用的提醒窗口：夜窗（受「晚睡提醒」控制）+ 午睡窗（独立开关）。"""
@@ -578,8 +585,8 @@ class Runner:
         return {
             "night_enabled": bool(eng.get("enable_sleep_reminder", True)),
             "nap_enabled": bool(eng.get("nap_remind_enabled", True)),
-            # 夜窗
-            "window_start": str(eng.get("remind_window_start") or "00:00"),
+            # 夜窗（兜底值与 schema/README 一致，避免配置缺字段时窗口错一小时）
+            "window_start": str(eng.get("remind_window_start") or "23:00"),
             "window_end": str(eng.get("remind_window_end") or "00:20"),
             "night_weights": (
                 _as_float_safe(eng.get("night_weight_early"), 1.5),
@@ -595,7 +602,7 @@ class Runner:
                 _as_float_safe(eng.get("nap_weight_tail"), 0.6),
             ),
             # 作息
-            "wake_time": str(eng.get("wake_time") or "07:00"),
+            "wake_time": str(eng.get("wake_time") or "08:00"),
             "night_start": str(eng.get("night_start_time") or "18:00"),
             "sleep_quiet_hours": float(eng.get("sleep_quiet_hours") or 8.0),
             # 词表
@@ -850,6 +857,14 @@ class Runner:
             store.pop(umo, "active_event")
             event = None
 
+        # 「快回来了」要先判：默认词表里「快到家」本身包含回归词「到家」，
+        # 若先走回归分支，「快到家了」会把出门事件直接清掉，加速永远不生效。
+        # _apply_return_soon 只在「有可叠加的出门事件」时才返回 True，
+        # 没有出门事件时照常落到下面的回归分支（真的到家了）。
+        soon_kw = self._return_soon_kw(text)
+        if soon_kw and self._apply_return_soon(umo, text):
+            return True
+
         # 回归优先
         return_kw = self.engine.match_return(text)
         if return_kw:
@@ -888,11 +903,6 @@ class Runner:
             # 没有离开词，但这句话明显是「我们在一起」（牵手/抱着/陪你…）：
             # 记一段「在一起」状态，主动消息才不会按「他不在」来写。
             self._touch_together(umo, now)
-
-        # 「快回来了」优先：给出门事件叠加更猛的加成 + 缩短有效期
-        soon_kw = self._return_soon_kw(text)
-        if self._apply_return_soon(umo, text):
-            return True
 
         # 结束词
         stopping = isinstance(event, dict) and self.engine.is_stop(event, text)
@@ -1019,11 +1029,13 @@ class Runner:
         raw = str(getattr(resp, "completion_text", "") or "")
         import re
 
-        matched = re.search(r"\{[^{}]*\}", raw)
-        if not matched:
+        # 取最后一个 {...}：模型常先写一段解释（里面也可能有花括号），
+        # 真正的结果一般在最后。只取第一个会被前面的括号带偏。
+        matches = re.findall(r"\{[^{}]*\}", raw)
+        if not matches:
             return {"error": "no_json", "raw": raw[:200]}
         try:
-            data = json.loads(matched.group(0))
+            data = json.loads(matches[-1])
         except Exception:
             return {"error": "bad_json", "raw": raw[:200]}
 
@@ -1083,6 +1095,14 @@ class Runner:
         away = self.store.get(umo, "away")
         if isinstance(away, dict):
             if away.get("active") and now < float(away.get("expires_at") or 0):
+                ev = self.store.get(umo, "active_event")
+                if (isinstance(ev, dict) and ev.get("return_soon")
+                        and now < float(ev.get("expires_at") or 0)):
+                    return (
+                        "他刚说快到家了，正在回来的路上，人还没进门。"
+                        "别提「想你」「等你回来」这种像人还在外地的说法，"
+                        "也别问「到哪了」；可以说去门口接、把拖鞋摆好、饭别凉了这类眼前的事。"
+                    )
                 mins = max(1, int((now - float(away.get("started_at") or now)) // 60))
                 return f"他 {mins} 分钟前说{away.get('reason') or '出门'}，现在还没回来，不在你这边。"
             cleared = float(away.get("cleared_at") or 0)
@@ -1221,11 +1241,20 @@ class Runner:
             logger.warning(f"{TAG} 没有可用的聊天模型")
             return ""
 
-        resp = await provider.text_chat(
-            prompt=prompt,
-            contexts=history,
-            system_prompt=system_prompt,
-        )
+        try:
+            resp = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=prompt,
+                    contexts=history,
+                    system_prompt=system_prompt,
+                ),
+                timeout=GENERATE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"{TAG} 生成超时（>{GENERATE_TIMEOUT_SECONDS}s），本轮放弃并重新排程"
+            )
+            return ""
         text = (getattr(resp, "completion_text", "") or "").strip()
         return text
 
@@ -1274,8 +1303,10 @@ class Runner:
     # ------------------------------------------------------------------
     # 省 token：主动消息的上下文裁剪（正常回复不经过这里）
     # ------------------------------------------------------------------
+    # 兼容 AstrBot 常见的几种写法：2026-10-31 14:07 / 2026/10/31 14:07 / 带秒
     _REMINDER_TS = re.compile(
-        r"Current datetime: ([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-9]{2}):([0-9]{2})"
+        r"Current datetime:\s*([0-9]{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})"
+        r"\s+([0-9]{1,2}):([0-9]{2})"
     )
 
     @classmethod
@@ -1300,7 +1331,8 @@ class Runner:
                 continue
             try:
                 return datetime.strptime(
-                    f"{match.group(1)} {match.group(2)}:{match.group(3)}",
+                    f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+                    f" {int(match.group(4)):02d}:{match.group(5)}",
                     "%Y-%m-%d %H:%M",
                 )
             except ValueError:
@@ -1385,9 +1417,11 @@ class Runner:
                 break
         if meaningful:
             return {**message, "content": kept}
-        if set(message) <= {"role", "content"}:
-            return None
-        return {**message, "content": kept}
+        # 只剩空壳：不论有没有额外字段，都不要把 content: [] 发给 provider
+        # （部分 provider 会直接 400）。带 tool_calls 的消息必须保留。
+        if message.get("tool_calls"):
+            return {**message, "content": ""}
+        return None
 
     def _prepare_contexts(self, history: list, settings: dict) -> list:
         before = len(history)

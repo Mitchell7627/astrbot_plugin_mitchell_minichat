@@ -231,28 +231,31 @@ class EventRuleStore:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8-sig"))
             rules = data.get("rules") or []
+            self._default_ttl = int(data.get("default_ttl_minutes") or 45)
+            # 文件模式和界面配置走同一套归一化：keywords 写成字符串时按逗号拆，
+            # 而不是被逐字符遍历（那会让单个汉字都能命中）。
             self._rules = [
-                r for r in rules if isinstance(r, dict) and r.get("name")
+                self._normalize_rule(r) for r in rules
+                if isinstance(r, dict) and r.get("name")
             ]
-            for r in self._rules:
-                builtin = self._builtin_by_name(r.get("name"))
-                if r.get("boost") is None:
-                    r["boost"] = builtin.get("boost", 3.0)
-                if r.get("boost_budget") is None:
-                    r["boost_budget"] = builtin.get("boost_budget", 1)
             self._negations = [str(p) for p in (data.get("negation_prefixes") or []) if p]
             self._away_keywords = [str(k) for k in (data.get("away_keywords") or []) if k]
             self._return_keywords = [str(k) for k in (data.get("return_keywords") or []) if k]
-            self._default_ttl = int(data.get("default_ttl_minutes") or 45)
             self._mtime = self.path.stat().st_mtime
             logger.info(f"[Minichat] 事件词表已加载，共 {len(self._rules)} 类喵。")
         except Exception as e:
             logger.warning(f"[Minichat] 读取事件词表失败，退回内置规则喵: {e}")
-            self._rules = [r for r in BUILTIN_RULES["rules"] if r.get("name")]
+            self._rules = [self._normalize_rule(r) for r in BUILTIN_RULES["rules"]
+                           if isinstance(r, dict) and r.get("name")]
             self._negations = list(BUILTIN_RULES["negation_prefixes"])
             self._away_keywords = list(BUILTIN_RULES["away_keywords"])
             self._return_keywords = list(BUILTIN_RULES["return_keywords"])
             self._default_ttl = BUILTIN_RULES["default_ttl_minutes"]
+            # 记下当前 mtime：文件坏着的时候别每 60 秒重试一次解析
+            try:
+                self._mtime = self.path.stat().st_mtime
+            except OSError:
+                self._mtime = 0
 
     def reload_if_changed(self) -> bool:
         """按 mtime 热加载，60 秒内最多检查一次。
@@ -316,13 +319,17 @@ class EventRuleStore:
         return best[2] if best else None
 
     def _match_list(self, text: str, keywords: list[str]):
-        """在一组关键词里找第一个未被否定的命中词。"""
+        """在一组关键词里找第一个未被否定、也不是将来时的命中词。
+
+        离开/回归词同样要过将来时过滤：「明天要出门」不该现在就标记不在身边，
+        「明天就到家了」也不该现在就清掉在场状态。
+        """
         if not text:
             return None
         for kw in keywords:
             idx = text.find(kw)
             while idx != -1:
-                if not self._is_negated(text, idx):
+                if not self._is_negated(text, idx) and not self._is_future(text, idx):
                     return kw
                 idx = text.find(kw, idx + 1)
         return None

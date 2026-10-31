@@ -21,21 +21,31 @@ BUCKET_PRESETS = {6: 36, 12: 48, 24: 48, 48: 48}
 QUANTILES = (0.10, 0.50, 0.90)
 
 
+def _num(value, default: float) -> float:
+    """None/非法才用默认值；0 是合法值，不能被 `or` 吞掉。"""
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def build_profile(eng: dict) -> dict:
     eng = eng or {}
     return {
-        "early_weight": float(eng.get("early_weight", 1.0) or 1.0),
-        "early_weight_event": float(eng.get("early_weight_event", 3.0) or 3.0),
-        "mid_weight": float(eng.get("mid_weight", 1.15) or 1.15),
-        "tail_head_weight": float(eng.get("tail_head_weight", 1.15) or 1.15),
-        "tail_floor_weight": float(eng.get("tail_floor_weight", 0.6) or 0.6),
-        "tail_decay_power": float(eng.get("tail_decay_power", 0.3) or 0.3),
+        "early_weight": _num(eng.get("early_weight"), 1.0),
+        "early_weight_event": _num(eng.get("early_weight_event"), 3.0),
+        "mid_weight": _num(eng.get("mid_weight"), 1.15),
+        "tail_head_weight": _num(eng.get("tail_head_weight"), 1.15),
+        "tail_floor_weight": _num(eng.get("tail_floor_weight"), 0.6),
+        "tail_decay_power": _num(eng.get("tail_decay_power"), 0.3),
     }
 
 
 def interval_bounds(schedule: dict) -> tuple[int, int]:
-    lo = max(1, int(schedule.get("min_interval_minutes") or 5))
-    hi = int(schedule.get("max_interval_minutes") or 240)
+    lo = max(1, int(_num(schedule.get("min_interval_minutes"), 5)))
+    hi = int(_num(schedule.get("max_interval_minutes"), 240))
     if hi < lo:
         hi = lo
     lo = min(lo, SUPPORT_MAX_MINUTES)
@@ -44,15 +54,20 @@ def interval_bounds(schedule: dict) -> tuple[int, int]:
 
 
 def event_state(engine_cfg: dict, active_event) -> tuple[bool, float | None]:
-    """返回 (加成是否生效, 合成后的早段权重)。"""
+    """返回 (加成是否生效, 合成后的早段权重)。
+
+    `boost_budget = 0` 表示不限次数（和 runner._sample_minutes 同款语义），
+    不能用 `x or 1` 把它当成 1 次，否则图上的加成会提前消失。
+    """
     if not isinstance(active_event, dict):
         return False, None
-    budget = int(active_event.get("boost_budget") or 1)
-    used = int(active_event.get("boost_used") or 0)
+    budget = int(_num(active_event.get("boost_budget"), 1))
+    used = int(_num(active_event.get("boost_used"), 0))
     if not (budget <= 0 or used < budget):
         return False, None
-    base = float((engine_cfg or {}).get("early_weight_event", 3.0) or 3.0)
-    rule_boost = float(active_event.get("boost") or EVENT_BOOST_BASELINE)
+    base = _num((engine_cfg or {}).get("early_weight_event"), 3.0)
+    rule_boost = _num(active_event.get("boost"), EVENT_BOOST_BASELINE)
+    # 保一个极小值：用户把事件权重拖到 0 时图不能整块塌成 0（会画不出来）
     return True, max(0.01, base * rule_boost / EVENT_BOOST_BASELINE)
 
 

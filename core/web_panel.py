@@ -112,6 +112,10 @@ class PanelHttpServer:
         now = time.time()
         bucket = [t for t in self._fails.get(ip, []) if now - t < LOGIN_WINDOW]
         self._fails[ip] = bucket
+        # 表不能无限长：大量伪造 IP 刷登录会把内存慢慢撑爆，超过上限就丢最早的一批
+        if len(self._fails) > 512:
+            for key in list(self._fails)[: len(self._fails) - 512]:
+                self._fails.pop(key, None)
         if len(bucket) >= LOGIN_MAX_FAILS:
             return int(LOGIN_WINDOW - (now - bucket[0]))
         return 0

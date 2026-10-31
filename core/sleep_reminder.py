@@ -35,6 +35,59 @@ SLEEP_NEGATIONS = ["不", "没", "别", "还没", "不想", "不要", "不困", 
 # 「待会再睡」的否定：出现这些其实是不想睡/还醒着，别当成等待
 WAIT_NEGATIONS = ["不", "没", "别", "还不", "不想", "不要"]
 
+# 午睡/小睡：交给事件识别（nap），不要开整夜免打扰
+_NAP_WORDS = ("午睡", "午觉", "补觉", "眯一会", "眯一会儿", "眯一下", "小睡", "打盹")
+
+# 第三人称主语：说的是别人睡了，不该静音自己
+_THIRD_PERSON = (
+    "你", "他", "她", "孩子", "我妈", "我爸", "室友", "同事", "同学",
+    "朋友", "家里", "猫", "狗",
+)
+
+
+def _iter_hits(text: str, keywords):
+    """逐个产出 (关键词, 出现位置)：同一个词出现多次也要全部看到。"""
+    for kw in _split_kw(keywords):
+        if not kw:
+            continue
+        idx = text.find(kw)
+        while idx != -1:
+            yield kw, idx
+            idx = text.find(kw, idx + 1)
+
+
+def _is_negated_at(text: str, idx: int, negations) -> bool:
+    """否定词紧贴关键词前 4 个字才视为否定（如「还不困」「不想睡」）。"""
+    if idx <= 0:
+        return False
+    head = text[max(0, idx - 4):idx]
+    return any(neg in head for neg in negations)
+
+
+def _is_question_at(text: str, kw: str, idx: int) -> bool:
+    """关键词所在的分句是不是疑问（「睡了吗」「你睡了没」）。
+
+    只看同一个分句：`我睡了，你呢` 里的「呢」属于下一句，不能把前半句也判成疑问。
+    """
+    tail = text[idx + len(kw):]
+    cut = len(tail)
+    for pos, char in enumerate(tail):
+        if char in "，。！？,.!?；;、\n":
+            if char in "？?":
+                return True
+            cut = pos
+            break
+    clause = tail[:cut]
+    if any(mark in clause for mark in ("吗", "呢", "么")):
+        return True
+    return clause[:1] == "没"
+
+
+def _has_third_person(text: str, idx: int) -> bool:
+    """关键词前 3 个字里出现第三人称主语（孩子/我妈/他/她…）。"""
+    head = text[max(0, idx - 3):idx]
+    return any(who in head for who in _THIRD_PERSON)
+
 
 def _split_kw(raw) -> list[str]:
     """把逗号/顿号分隔的词表拆成列表，去空、去重。"""
@@ -188,28 +241,44 @@ def pick_weighted_offset(
 
 
 def match_sleep(text: str, keywords) -> str | None:
-    """命中「确定要睡」返回命中的词，否则 None。带否定前缀过滤。"""
-    for kw in _split_kw(keywords):
-        if kw and kw in text:
-            for neg in SLEEP_NEGATIONS:
-                # 否定词紧贴关键词前才视为否定（如「还不困」「睡不着」）
-                idx = text.find(kw)
-                if idx > 0 and neg in text[max(0, idx - 4):idx]:
-                    return None
-            # 「不困/睡不着」整体已在上面的否定里处理；直接命中
-            return kw
+    """命中「确定要睡」返回命中的词，否则 None。
+
+    过滤四类误判：
+    - 否定（「不睡了」）；
+    - 疑问（「睡了吗」「你睡了没」）；
+    - 第三人称（「孩子睡了」「我妈睡了」）；
+    - 午睡/小睡（「我午睡了」）——这类交给 nap 事件，别开整夜免打扰。
+    同一个词出现多次时逐个检查，前面那次被否定不影响后面那次。
+    """
+    text = str(text or "")
+    if not text:
+        return None
+    if any(word in text for word in _NAP_WORDS):
+        return None
+    for kw, idx in _iter_hits(text, keywords):
+        if _is_negated_at(text, idx, SLEEP_NEGATIONS):
+            continue
+        if _is_question_at(text, kw, idx):
+            continue
+        if _has_third_person(text, idx):
+            continue
+        return kw
     return None
 
 
 def match_wait(text: str, keywords) -> str | None:
-    """命中「待会再睡」返回命中的词，否则 None。带否定前缀过滤。"""
-    for kw in _split_kw(keywords):
-        if kw and kw in text:
-            idx = text.find(kw)
-            for neg in WAIT_NEGATIONS:
-                if idx > 0 and neg in text[max(0, idx - 4):idx]:
-                    return None
-            return kw
+    """命中「待会再睡」返回命中的词，否则 None。带否定/疑问/第三人称过滤。"""
+    text = str(text or "")
+    if not text:
+        return None
+    for kw, idx in _iter_hits(text, keywords):
+        if _is_negated_at(text, idx, WAIT_NEGATIONS):
+            continue
+        if _is_question_at(text, kw, idx):
+            continue
+        if _has_third_person(text, idx):
+            continue
+        return kw
     return None
 
 
@@ -232,8 +301,8 @@ def build_reminder_hint(state: dict, now: datetime | None = None) -> str:
 def next_remind_delay(lo_minutes: int, hi_minutes: int, rng=None) -> int:
     """在 [lo, hi] 分钟内均匀抽一个「下次提醒」延时（分钟）。窗口驱动下，实际只在窗口内生效。"""
     source = rng or random
-    lo = max(1, int(lo))
-    hi = max(lo, int(hi))
+    lo = max(1, int(lo_minutes))
+    hi = max(lo, int(hi_minutes))
     return source.randint(lo, hi)
 
 
@@ -321,7 +390,9 @@ def sleep_forecast(engine_cfg: dict, now_ts: float | None = None) -> dict:
     所以图不是装饰，改了权重真会照着抽。
     """
     cfg = engine_cfg or {}
-    wake_time = str(cfg.get("wake_time") or "07:00")
+    # 兜底值与 schema / README 保持一致（08:00 起床、23:00 开夜窗），
+    # 否则配置缺字段时图上的窗口和真机催睡窗口对不上。
+    wake_time = str(cfg.get("wake_time") or "08:00")
 
     def _window(start_key: str, end_key: str, w_early, w_mid, w_tail, fallback):
         start = str(cfg.get(start_key) or fallback[0])
@@ -336,7 +407,7 @@ def sleep_forecast(engine_cfg: dict, now_ts: float | None = None) -> dict:
         cfg.get("night_weight_early", 1.5),
         cfg.get("night_weight_mid", 1.0),
         cfg.get("night_weight_tail", 0.6),
-        ("23:50", "00:20"),
+        ("23:00", "00:20"),
     )
     nap_start, nap_end, nap_span, nap_bucket, nap_count, nap_bars = _window(
         "nap_window_start", "nap_window_end",

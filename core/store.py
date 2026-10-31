@@ -61,9 +61,17 @@ class Store:
         self.set(umo, "unanswered", 0)
 
     def bump_unanswered(self, umo: str) -> int:
-        current = int(self.get(umo, "unanswered", 0) or 0) + 1
+        current = self._as_int(self.get(umo, "unanswered", 0), 0) + 1
         self.set(umo, "unanswered", current)
         return current
+
+    @staticmethod
+    def _as_int(value, default: int = 0) -> int:
+        """损坏的存储值（手改 JSON 留下的 "abc"）不该让发送流程崩掉。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     def touch_message(self, umo: str) -> None:
         self.set(umo, "last_message_at", time.time())

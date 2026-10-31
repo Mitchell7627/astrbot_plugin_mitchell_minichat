@@ -21,7 +21,7 @@ from .core.store import Store
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.0.2beta1"
+VERSION = "v0.0.3"
 
 
 class ProactiveMiniPlugin(star.Star):
@@ -47,6 +47,8 @@ class ProactiveMiniPlugin(star.Star):
             logger.error(f"{TAG} 事件规则初始化失败: {e}")
 
         self.runner = None
+        # 后台任务的强引用：asyncio 只保留弱引用，长时间 LLM 调用可能被 GC 掉
+        self._bg_tasks: set = set()
 
         self.plugin_dir = Path(__file__).resolve().parent
         self.version = VERSION
@@ -195,6 +197,8 @@ class ProactiveMiniPlugin(star.Star):
 
         if pending:
             try:
-                asyncio.create_task(self.runner.classify_with_llm(umo, pending))
+                task = asyncio.create_task(self.runner.classify_with_llm(umo, pending))
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
             except Exception as e:
                 logger.debug(f"{TAG} 语义识别任务创建失败: {e}")
