@@ -492,7 +492,7 @@ class Runner:
             return None
         return event
 
-    def _set_event(self, umo: str, rule: dict, keyword: str) -> None:
+    def _set_event(self, umo: str, rule: dict, keyword: str, source_text: str = "") -> None:
         now = time.time()
         ttl = self.engine.ttl_for(rule)
         # 记下事件介入前的原排程：事件结束后用它判断「恢复原计划」还是「重抽」
@@ -509,6 +509,7 @@ class Runner:
             "name": rule.get("name"),
             "label": rule.get("label") or rule.get("name"),
             "keyword": keyword,
+            "subject": self._event_subject(source_text or keyword),
             "boost": boost,
             "boost_budget": budget,
             "boost_used": 0,
@@ -782,9 +783,25 @@ class Runner:
         "牵手", "牵着", "手牵手", "牵着你", "抱着你", "搂着你", "靠着你",
         "在你旁边", "在你身边", "你旁边", "你身边",
     )
+    # 「和/跟/与/同 + 非我」也是"一起"（和宝宝泡澡、跟你出门）。
+    # 用结构判断，不写死任何名字，发布版对谁都能用。
+    _TOGETHER_RE = re.compile(r"[和跟与同](?!我)")
+    # 「帮/给/替/哄/喂/教 + 非我」→ 这件事是对方在做，不是用户在做
+    # （帮宝宝吹头发、给你擦药）。同样不依赖具体称呼。
+    _HER_RE = re.compile(r"(?:帮|给|替|哄|喂|教)(?!我)")
 
     def _is_together(self, text: str) -> bool:
-        return any(k in text for k in self.TOGETHER_KEYWORDS)
+        if any(k in text for k in self.TOGETHER_KEYWORDS):
+            return True
+        return bool(self._TOGETHER_RE.search(text))
+
+    def _event_subject(self, text: str) -> str:
+        """判断事件主体：self=用户在做 / together=两人一起 / her=对方在做。"""
+        if self._is_together(text):
+            return "together"
+        if self._HER_RE.search(text):
+            return "her"
+        return "self"
 
     # ------------------------------------------------------------------
     # 「在一起」状态：两人就在一块，主动消息不能写成「他不在你身边」
@@ -931,7 +948,7 @@ class Runner:
             logger.info(f"{TAG} 事件续期：{event.get('label')}")
             return True
 
-        self._set_event(umo, rule, text[:20])
+        self._set_event(umo, rule, text[:20], source_text=text)
         logger.info(f"{TAG} 识别到事件：{rule.get('label')}")
         return True
 
@@ -1076,7 +1093,7 @@ class Runner:
         rule = self.engine.get_rule(name) if name != "none" else None
         if rule is None:
             return
-        self._set_event(umo, rule, "语义:" + name)
+        self._set_event(umo, rule, "语义:" + name, source_text=text)
         self.store.save()
         logger.info(f"{TAG} 语义识别：{text[:16]} → {rule.get('label')}")
         # 语义识别是异步的，消息入口那次采样还没带上事件加成，这里按新状态重排一次。
@@ -1134,6 +1151,17 @@ class Runner:
         if now >= float(event.get("expires_at") or 0):
             return fallback
         elapsed = max(1, int((now - float(event.get("started_at") or now)) // 60))
+
+        # 主体是「她」：这件事是对方在做，别写成"他在做"
+        if str(event.get("subject") or "") == "her":
+            label = str(event.get("label") or "").strip()
+            if label:
+                return (
+                    f"你现在{label}（已经 {elapsed} 分钟），他就在旁边陪着你、帮你弄。"
+                    f"这件事是你自己在做，不是他在做——别提「你先去」「你快点」这种把他当主角的说法；"
+                    "可以说说自己的感受，让他帮你搭把手，语气黏一点。"
+                )
+
         try:
             hint = self.engine.build_hint(event, elapsed)
         except Exception:
