@@ -314,6 +314,33 @@ class Runner:
             return
         self.reschedule(umo)
 
+    def note_bot_reply(self, umo: str) -> None:
+        """她刚把一句话说完（常常以表情收尾）：这一轮结束了，别隔一两分钟又自己开口。
+
+        排程只认「上次用户说话」的时间点，她回完话不会影响它。而事件快结束时
+        采样会被压到 1 分钟——于是她刚回完一轮，一分钟后又是一条，看起来像自问自答。
+        这里把下一次主动开口推到「最短间隔」之后；本来就更远的安排不往回拉。
+        """
+        if not self.started or umo not in self.sessions():
+            return
+        schedule = self.cfg.get("schedule_settings", {}) or {}
+        gap = max(1, _as_int(schedule.get("min_interval_minutes"), 5)) * 60.0
+        now = time.time()
+        # 有约定在更近的地方要到点：让路给约定，别把它推到 5 分钟后
+        aligned = self._appointment_next_delay(umo, gap / 60.0)
+        if aligned is not None:
+            gap = max(60.0, aligned * 60.0)
+        next_at = float(self.store.get(umo, "next_at", 0) or 0)
+        if next_at >= now + gap - 5:
+            return
+        self.store.set(umo, "next_at", now + gap)
+        self.store.save()
+        old = self.timers.pop(umo, None)
+        if old is not None:
+            old.cancel()
+        self.timers[umo] = asyncio.create_task(self._wait_and_fire(umo, gap))
+        logger.info(f"{TAG} 她刚回过话，下次主动开口推到 {int(gap // 60)} 分钟后")
+
     def _finish_cycle(self, umo: str) -> None:
         """一次发送结束后的收尾。"""
         if self.store.get(umo, "pre_event_next_at"):

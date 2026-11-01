@@ -22,7 +22,7 @@ from .core.store import Store
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.1.9"
+VERSION = "v0.2.0"
 
 
 class ProactiveMiniPlugin(star.Star):
@@ -238,3 +238,18 @@ class ProactiveMiniPlugin(star.Star):
                 task.add_done_callback(self._bg_tasks.discard)
             except Exception as e:
                 logger.debug(f"{TAG} 约定灰度任务创建失败: {e}")
+
+    @filter.after_message_sent()
+    async def on_after_message_sent(self, event: AstrMessageEvent):
+        """她（AstrBot）刚把回复发出去：把下一次主动开口往后挪。
+
+        不这么做的话，用户说完话→她回完（常常以表情收尾）→ 一分钟后插件又发
+        一条，看起来像她在自问自答。这里只在她自己就是那条消息的发送方时生效，
+        插件自己发的主动消息走 context.send_message，不会触发这个钩子。
+        """
+        if self.runner is None:
+            return
+        try:
+            self.runner.note_bot_reply(event.unified_msg_origin)
+        except Exception as e:
+            logger.debug(f"{TAG} 回复后重排失败: {e}")
