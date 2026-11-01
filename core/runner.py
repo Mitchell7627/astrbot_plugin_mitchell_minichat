@@ -1919,6 +1919,26 @@ class Runner:
             )
             return True
 
+        # 做完饭就该吃了：他说「好吃 / 开吃 / 动筷子」时，做饭直接换成吃饭。
+        # 不换的话「在做饭」会挂满 40 分钟，提示词一直让她凑过去闻、尝第一口——
+        # 人都已经吃上了，她还在说锅里。
+        if isinstance(event, dict) and event.get("name") == "cooking":
+            meal = next((w for w in self.MEAL_HANDOFF if w in text), None)
+            if meal:
+                store.pop(umo, "active_event")
+                self._note("event", {"hit": {
+                    "kw": meal, "verdict": "accept",
+                    "gate_rule": "H1", "reason": "已经吃上了，做饭结束",
+                }})
+                eating = self.engine.get_rule("eating")
+                eaten = any(w in text for w in ("吃完", "吃好", "吃不下", "吃撑"))
+                if eating and not eaten:
+                    self._set_event(umo, eating, meal, source_text=text)
+                    logger.info(f"{TAG} 事件交接：做饭 → 吃饭（「{meal}」）")
+                else:
+                    logger.info(f"{TAG} 事件结束：做饭（「{meal}」）")
+                return True
+
         if stopping:
             store.pop(umo, "active_event")
             logger.info(f"{TAG} 事件结束：{event.get('label')}")
@@ -1944,6 +1964,9 @@ class Runner:
 
     # 句子里出现这些词，说明在描述“正在做/要去做”，可以直接问模型。
     ACTIVE_HINTS = ("去", "在", "要", "正", "准备", "得", "该", "出门", "开始")
+    # 做饭→吃饭的交接信号：出现这些词就不用等「做好了」这类结束词，
+    # 人已经动筷子了，「在做饭」再挂着只会让她继续说锅里。
+    MEAL_HANDOFF = ("开吃", "吃上了", "吃起来了", "动筷子", "好吃", "开饭", "吃完了", "吃好了")
     # 完成/进行语气收尾：允许“做好咯”“洗完了”这类短句进入判断。
     TAIL_HINTS = ("了", "咯", "啦", "喽", "着呢", "中")
 

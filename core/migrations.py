@@ -36,6 +36,16 @@ LEGACY_PROACTIVE_PROMPTS = (
 # 他会照着编出碗筷和收拾的动作（他其实只是啃了个布丁）。
 LEGACY_EATING_HINT = '他 {elapsed} 分钟前提过在吃饭，这个点差不多吃完了。可以直接说"吃完了吧"这类已经知道答案的话，或者催他去洗碗；不要问"吃完了吗"。'
 
+# v0.1.10 出厂默认的「在做饭」提示：写死了「凑过去闻」「帮忙尝一口」。
+# 40 分钟的 TTL 里人早就吃上了，她却还在说锅里、第一口。
+LEGACY_COOKING_HINT = '他 {elapsed} 分钟前在做饭，这会儿应该快出锅了。可以凑过去闻、说一句"好香"，或者催他快点、说要帮忙尝一口；不要问"饭好了没"。'
+
+# 上面两条旧提示，按事件名索引
+LEGACY_RULE_HINTS = {
+    "eating": LEGACY_EATING_HINT,
+    "cooking": LEGACY_COOKING_HINT,
+}
+
 # v0.1.2 出厂默认离开词表（32 条）
 LEGACY_AWAY_KEYWORDS = [
     "出门",
@@ -115,18 +125,22 @@ def migrate_config(config) -> list[str]:
         rules = eng.get("event_rules")
         if isinstance(rules, list) and rules:
             new_rules = _default_of(schema, "custom_engine", "event_rules") or []
-            new_hint = ""
-            for r in new_rules:
-                if isinstance(r, dict) and r.get("name") == "eating":
-                    new_hint = str(r.get("hint") or "")
-                    break
-            if new_hint:
-                for r in rules:
-                    if not isinstance(r, dict) or r.get("name") != "eating":
-                        continue
-                    old = str(r.get("hint") or "").strip()
-                    if old and old == LEGACY_EATING_HINT.strip() and old != new_hint.strip():
-                        r["hint"] = new_hint
-                        changed.append("event_rules.eating.hint")
+            new_hints = {
+                r.get("name"): str(r.get("hint") or "")
+                for r in new_rules
+                if isinstance(r, dict) and r.get("name")
+            }
+            for r in rules:
+                if not isinstance(r, dict):
+                    continue
+                name = r.get("name")
+                legacy = LEGACY_RULE_HINTS.get(name)
+                if not legacy:
+                    continue
+                old = str(r.get("hint") or "").strip()
+                new = new_hints.get(name, "")
+                if old and new and old == legacy.strip() and old != new.strip():
+                    r["hint"] = new
+                    changed.append(f"event_rules.{name}.hint")
 
     return changed
