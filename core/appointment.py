@@ -385,6 +385,19 @@ def next_delay(ap, now: float, current_minutes: float, cfg: dict):
 
 
 # ---------------------------------------------------------------- 提示词
+# 到点那一拍按约定类型分口径：以前一律「当成已经结束」，
+# 「十二点开会」到点就说「会开完了」，跟事实正好相反。
+DUE_HINTS_BY_KIND = {
+    "start": (
+        "现在 {hhmm}，{label}的点到了。他之前说「{raw}」。"
+        "按这件事**刚**开始来接：别说结束、别问进行到哪一步，可以说开始了、让他安心去忙。"
+    ),
+    "arrive": (
+        "现在 {hhmm}，按他说的该{label}了。他之前说「{raw}」。"
+        "当人已经到门口或者正在进门来接，别问「到哪了」「到了没」。"
+    ),
+}
+
 DEFAULT_HINTS = {
     "lead": (
         "现在 {hhmm}，还有 {n} 分钟到 {time_text}。他之前说「{raw}」。"
@@ -408,7 +421,9 @@ def build_hint(ap: dict, shot: str, now: datetime, template: str = "") -> str:
     at = float(ap.get("at") or 0)
     moment = datetime.fromtimestamp(at) if at > 0 else now
     minutes_left = max(1, int(round((at - now.timestamp()) / 60))) if at > 0 else 0
-    body = template or DEFAULT_HINTS.get(shot) or ""
+    kind = str(ap.get("kind") or "end")
+    body = template or (DUE_HINTS_BY_KIND.get(kind, "") if shot == "due" else "") \
+        or DEFAULT_HINTS.get(shot) or ""
     try:
         return body.format(
             hhmm=now.strftime("%H:%M"),

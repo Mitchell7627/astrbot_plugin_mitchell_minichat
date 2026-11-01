@@ -1,6 +1,6 @@
 # 主动私聊Mini（astrbot_plugin_mitchell_minichat）
 
-> 版本 **v0.2.4** ｜ 仅支持 **aiocqhttp（QQ）私聊** ｜ MIT
+> 版本 **v0.2.5** ｜ 仅支持 **aiocqhttp（QQ）私聊** ｜ MIT
 
 > **反馈**：遇到问题请到 [GitHub Issues](https://github.com/Mitchell7627/astrbot_plugin_mitchell_minichat/issues) 提交，并附上 AstrBot 版本、插件版本和相关日志。
 

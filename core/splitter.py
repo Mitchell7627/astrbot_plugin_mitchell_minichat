@@ -17,8 +17,10 @@ import re
 PAIR_MAP = {
     "《": "》", "（": "）", "(": ")", "[": "]", "{": "}",
     "【": "】", "「": "」", "『": "』", "<": ">",
+    "“": "”", "‘": "’",
 }
 QUOTE_CHARS = {'"', "'", "`"}
+DEFAULT_PATTERN = r"[。.？！?!\n…～]+"
 SECONDARY = re.compile(r"[，,、；;]+")
 CJK_CHAR = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 ALNUM_CHAR = re.compile(r"[a-zA-Z0-9]")
@@ -70,7 +72,12 @@ def split_text(
     try:
         compiled = re.compile(pattern)
     except re.error:
-        compiled = re.compile(r"[。.？！?!\n…～]+")
+        compiled = re.compile(DEFAULT_PATTERN)
+    # 能空匹配的正则（`\s*`、`[。]?`…）会让分段循环原地打转：命中、len(delim)=0、i 不动。
+    # 一旦写进配置就是死循环，直接挡在门口，回退默认正则。
+    empty = compiled.match("")
+    if empty is not None and empty.group() == "":
+        compiled = re.compile(DEFAULT_PATTERN)
 
     if smart:
         segments = _smart_split(text, compiled, ideal, balanced, ratio_min, ratio_max, protected)
@@ -116,6 +123,11 @@ def _blocked_by_protected(parts, idx, protected):
     return False
 
 
+def _has_closer(text: str, i: int, closer: str) -> bool:
+    """i 之后还有没有配对的右符号。没有就不压栈，避免一个孤零零的开符号锁死整段。"""
+    return text.find(closer, i + 1) != -1
+
+
 def _smart_split(text, compiled, ideal, balanced, ratio_min, ratio_max, protected):
     segments = []
     stack = []
@@ -137,6 +149,12 @@ def _smart_split(text, compiled, ideal, balanced, ratio_min, ratio_max, protecte
         match = compiled.match(text, pos=i)
         if match:
             delim = match.group()
+            if not delim:
+                # 兜底：万一上游漏了可空正则（比如直接调用 _smart_split），按单字符推进
+                chunk += text[i]
+                weight += 1
+                i += 1
+                continue
             should = not stack
             if should and balanced and weight < ideal * ratio_min:
                 should = False
@@ -186,10 +204,11 @@ def _smart_split(text, compiled, ideal, balanced, ratio_min, ratio_max, protecte
         if char in QUOTE_CHARS:
             if stack and stack[-1] == char:
                 stack.pop()
-            elif not stack:
+            elif _has_closer(text, i, char):
                 stack.append(char)
-        elif not stack and char in PAIR_MAP:
-            stack.append(char)
+        elif char in PAIR_MAP:
+            if _has_closer(text, i, PAIR_MAP[char]):
+                stack.append(char)
         elif stack and char == PAIR_MAP.get(stack[-1]):
             stack.pop()
 

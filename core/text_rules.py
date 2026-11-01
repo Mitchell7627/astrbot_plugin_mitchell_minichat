@@ -60,11 +60,18 @@ THIRD_PERSON_SUBJECTS = (
     "朋友", "老婆", "老公", "家里", "猫", "狗",
 )
 # 第三人称后面常见的谓语开头（「他在」「我妈在」「他说」「室友又」…）
-PREDICATE_LEADS = ("在", "正", "还", "又", "刚", "已", "说", "要", "去", "想", "准备", "忙", "做", "睡", "吃", "玩")
+PREDICATE_LEADS = ("在", "正", "还", "又", "刚", "已", "说", "要", "去", "想", "准备", "忙", "做", "睡", "吃", "玩", "觉得", "嫌", "夸")
 
 # 转述/引用：这句话是在复述别人说的，不是用户自己正在做
 _REPORTED_WORDS = ("他说", "她说", "听说", "据说", "别人说", "转述")
-_QUOTE_CHARS = "「」『』“”"
+# 成对引号：只有「命中词落在引号内部」才算转述。以前只要句子里出现引号就整句判转述，
+# 「他说“我去洗澡了”，我在吃饭」把自己的动作也一起挡掉了。
+_QUOTE_PAIRS = {"「": "」", "『": "』", "“": "”"}
+
+# 取消/作废：和否定分开一套。「取消去开会」里否定词离「开会」太远，
+# 4 字窗口照不到；而「开会取消了」的取消在词后面。两头都要看。
+CANCEL_WORDS = ("取消", "不开了", "不去了", "不上了", "改期", "延期", "不去了", "不办了")
+
 
 
 def clause_start(text: str, idx: int, window: int | None = None) -> int:
@@ -195,23 +202,86 @@ def is_third_person_subject(text: str, idx: int, extra_names=()) -> bool:
     return False
 
 
-def is_reported_speech(text: str) -> bool:
-    """整句是不是在复述/引用别人的话（「他说他在洗澡」「『我洗澡了』这是他发的」）。"""
-    if not text:
-        return False
-    if any(q in text for q in _QUOTE_CHARS):
-        return True
-    return any(w in text for w in _REPORTED_WORDS)
+def _quote_spans(text: str) -> list[tuple[int, int]]:
+    """成对引号覆盖的区间（左引号位置, 右引号位置）。没闭合的算到句尾。"""
+    spans: list[tuple[int, int]] = []
+    start = -1
+    opener = ""
+    for i, ch in enumerate(text):
+        if start < 0 and ch in _QUOTE_PAIRS:
+            start, opener = i, ch
+        elif start >= 0 and ch == _QUOTE_PAIRS.get(opener):
+            spans.append((start, i))
+            start, opener = -1, ""
+    if start >= 0:
+        spans.append((start, len(text)))
+    return spans
 
 
 def is_reported_clause(text: str, idx: int) -> bool:
-    """命中词所在的这句是不是转述（只看本分句前的「他说/听说」，引号则整句算）。"""
+    """命中词是不是在引号里、或者本分句前有「他说/听说」。
+
+    只看「命中词是否落在引号区间内」，不再因为句子里出现了引号就整句判转述——
+    「他说“我去洗澡了”，我在吃饭」的后半句是用户自己的动作，要照常识别。
+    """
     if not text:
         return False
-    if any(q in text for q in _QUOTE_CHARS):
-        return True
+    for begin, end in _quote_spans(text):
+        if begin < idx < end:
+            return True
     head = clause_head(text, idx, window=len(text))
     return any(w in head for w in _REPORTED_WORDS)
+
+
+def is_cancelled_clause(text: str, idx: int, kw_len: int = 0, window: int = 6) -> bool:
+    """命中词所在分句是不是在说「这件事取消了」。
+
+    「取消去开会」「会不开了」「开会取消了」都算；「取消」和事件词隔得远近不论，
+    但只看本分句，不跨逗号。
+    """
+    if not text or not CANCEL_WORDS:
+        return False
+    head = clause_head(text, idx, window=window)
+    if any(w in head for w in CANCEL_WORDS):
+        return True
+    tail = text[idx + kw_len: clause_end(text, idx + kw_len)][:window]
+    return any(w in tail for w in CANCEL_WORDS)
+
+
+def drop_keyword(text: str, idx: int, kw_len: int) -> str:
+    """摘掉命中的词，保留其余文字（用于「回归词处理完，剩下的话继续走事件判定」）。"""
+    if not text:
+        return ""
+    rest = text[:max(0, idx)] + text[idx + kw_len:]
+    return rest.strip(" ，,。！!？?、~～…\n")
+
+
+# 判断「这是用户本人在做」时用的否定词表。比事件词表窄：只要紧贴的否定就够，
+# 太长的词（「不打算」）交给 is_future_clause 处理。
+SELF_NEGATIONS = ("不想", "不要", "不用", "不必", "没空", "没时间", "没心情", "还没", "没在")
+
+
+def is_self_action_clause(text: str, idx: int, kw_len: int = 0) -> bool:
+    """这句话是不是「用户本人此刻正在做」——六道闸门的公共封装。
+
+    依次排除：转述/引用、否定、取消、将来、疑问、第三人称。
+    各条链路（唤醒、做饭交接、事件匹配）都该走这一套，避免各写各的 `in text`。
+    """
+    if not text:
+        return False
+    if is_reported_clause(text, idx):
+        return False
+    if negated_by_clause(text, idx, SELF_NEGATIONS):
+        return False
+    if is_cancelled_clause(text, idx, kw_len):
+        return False
+    if is_future_clause(text, idx):
+        return False
+    if is_question_clause(text, idx, kw_len):
+        return False
+    if is_third_person_subject(text, idx):
+        return False
+    return True
 
 
 def negated_by_clause(text: str, idx: int, negations, window: int = 4) -> bool:

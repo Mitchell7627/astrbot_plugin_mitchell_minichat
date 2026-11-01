@@ -211,15 +211,18 @@ def dual_forecast(*, schedule: dict, engine_cfg: dict, active_event,
         remaining = max(1.0, (expires - now_ts) / 60.0)
         ttl = max(1, int(round((expires - started) / 60.0)))
 
+        # 事件只剩 10 分钟时，实际采样上限被压到 10 分钟（runner._sample_minutes 同款），
+        # 但这里以前仍按 5–240 算分布，面板预测均值 117 分钟，跟真实行为对不上。
         window = int(min(hi, max(1, round(remaining))))
+        ev_lo = min(lo, window)
         bucket = max(1, int(round(window / 8)))
         count = max(1, int(math.ceil(window / bucket)))
 
         ev_pmf = minute_pmf(
-            lo, hi, profile=profile, event_active=True, event_weight=eweight,
+            ev_lo, window, profile=profile, event_active=True, event_weight=eweight,
             now_ts=now_ts, weighted=weighted,
         )
-        ev_bars, _ = bucketize(ev_pmf, bucket, count, start=lo)
+        ev_bars, _ = bucketize(ev_pmf, bucket, count, start=ev_lo)
         ev = {
             "label": active_event.get("label") or active_event.get("name") or "事件",
             "name": active_event.get("name") or "",

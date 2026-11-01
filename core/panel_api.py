@@ -75,6 +75,8 @@ _LIMITS: dict[tuple[str, str], tuple[float, float, type]] = {
     ("custom_engine", "appointment_max_per_day"): (0, 20, int),
     ("custom_engine", "appointment_gray_per_hour"): (0, 20, int),
     ("custom_engine", "appointment_gray_per_day"): (0, 100, int),
+    # 「在一起」有效期：代码里每次现读，可热改
+    ("custom_engine", "together_ttl_minutes"): (10, 1440, int),
 }
 
 # 这些键只影响面板显示，不参与 need_reload 判定
@@ -102,6 +104,8 @@ _HOT_PATHS = tuple("custom_engine." + k for k in (
     "appointment_followup_minutes", "appointment_max_followups",
     "appointment_max_hours", "appointment_max_per_day", "appointment_keywords",
     "appointment_gray_per_hour", "appointment_gray_per_day",
+    # 「在一起」有效期：runner._together_ttl 每次现读
+    "together_ttl_minutes",
 ))
 
 
@@ -527,10 +531,31 @@ class PanelService:
             and c not in _HOT_PATHS
             for c in changed
         )
+
+        # 插件以禁用状态启动时根本没有 Runner：面板里把 enable 打开并保存，
+        # 以前只回一句「无需重载」，实际什么都没起来，用户以为开了。
+        enable_changed = any(c == "friend_settings.enable" for c in changed)
+        started_now = False
+        runner = getattr(self.plugin, "runner", None)
+        if enable_changed and runner is None and bool(self.cfg.get("enable")):
+            try:
+                from .runner import Runner
+
+                runner = Runner(self.plugin)
+                self.plugin.runner = runner
+                await runner.start()
+                started_now = True
+                logger.info(f"{TAG} 配置里刚启用，已在面板保存后启动运行器")
+            except Exception as e:
+                logger.error(f"{TAG} 启用后启动运行器失败: {e}")
+        if enable_changed:
+            need_reload = True
+
         return {
             "saved": True,
             "changed": changed,
             "need_reload": need_reload,
+            "started": started_now,
             "clamped": clamped,
             "reasons": [
                 c for c in changed
@@ -631,35 +656,41 @@ class PanelService:
         runner = self._require_runner()
         text = str(payload.get("text") or "").strip()
 
-        with _Busy(self, umo, "send"):
-            if not text:
-                try:
-                    text = await asyncio.wait_for(runner._generate(umo), timeout=90)
-                except asyncio.TimeoutError:
-                    raise PanelError("E_UPSTREAM", "生成超时（90 秒）")
-                if not text:
-                    raise PanelError("E_UPSTREAM", "生成为空，未发送")
-            try:
-                sent_text = await runner._send_split(umo, text)
-                ok = bool(sent_text)
-            except Exception as e:
-                raise PanelError("E_UPSTREAM", f"发送失败: {e}")
+        # 与定时器共用同一把会话锁：否则自动发送正在分段时，手动发送会插进去交错
+        lock = runner.session_lock(umo)
+        if lock.locked():
+            raise PanelError("E_BUSY", "该会话正在发送，请稍后再试")
 
-        state = self.store.data.get(umo, {}) or {}
-        if ok:
-            count = self.store.bump_unanswered(umo)
-            self.store.save()
-            # 手动发送的主动消息同样写回历史，保持上下文连续
-            try:
-                await runner._append_assistant_history(umo, text)
-            except Exception:
-                pass
-        else:
-            count = _as_int(state.get("unanswered"), 0)
+        with _Busy(self, umo, "send"):
+            async with lock:
+                if not text:
+                    try:
+                        text = await asyncio.wait_for(runner._generate(umo), timeout=90)
+                    except asyncio.TimeoutError:
+                        raise PanelError("E_UPSTREAM", "生成超时（90 秒）")
+                    if not text:
+                        raise PanelError("E_UPSTREAM", "生成为空，未发送")
+                try:
+                    sent_text = await runner._send_split(umo, text)
+                    ok = bool(sent_text)
+                except Exception as e:
+                    raise PanelError("E_UPSTREAM", f"发送失败: {e}")
+
+                state = self.store.data.get(umo, {}) or {}
+                if ok:
+                    count = self.store.bump_unanswered(umo)
+                    self.store.save()
+                    # 只写真正送达的内容：分段中途失败时，没送到的不该被当成「她已经说过」
+                    try:
+                        await runner._append_assistant_history(umo, sent_text)
+                    except Exception:
+                        pass
+                else:
+                    count = _as_int(state.get("unanswered"), 0)
 
         if ok and payload.get("reschedule"):
             runner.reschedule(umo)
-            state = self.store.data.get(umo, {}) or {}
+        state = self.store.data.get(umo, {}) or {}
 
         return {
             "sent": bool(ok),
@@ -672,6 +703,9 @@ class PanelService:
         umo = self._validate_umo((payload or {}).get("umo"))
         runner = self._require_runner()
         before = _as_int((self.store.data.get(umo, {}) or {}).get("unanswered"), 0)
+        # _fire 自己会加锁；这里先看一眼，避免用户点了按钮却静默什么都没发生
+        if runner.session_lock(umo).locked():
+            raise PanelError("E_BUSY", "该会话正在发送，请稍后再试")
         with _Busy(self, umo, "fire"):
             try:
                 await asyncio.wait_for(runner._fire(umo), timeout=120)
@@ -731,6 +765,14 @@ class PanelService:
             umo = self._validate_umo(umo)
             self.store.reset_unanswered(umo)
             self.store.save()
+            # 达上限后是「不再排程」而不是某个标志位：只清计数，会话会一直停在 paused。
+            runner = getattr(self.plugin, "runner", None)
+            if runner is not None and getattr(runner, "started", False):
+                try:
+                    runner.reschedule(umo)
+                    logger.info(f"{TAG} 重置未回复计数后已恢复排程")
+                except Exception as e:
+                    logger.warning(f"{TAG} 重置后恢复排程失败: {e}")
         elif action == "clear_event":
             umo = self._validate_umo(umo)
             self.store.pop(umo, "active_event")

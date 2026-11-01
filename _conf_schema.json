@@ -1,4 +1,4 @@
-﻿{
+{
     "friend_settings": {
         "description": "私聊全局配置",
         "type": "object",
@@ -921,6 +921,27 @@
                     "min": 0,
                     "max": 120,
                     "step": 1
+                }
+            },
+            "negation_prefixes": {
+                "description": "否定词表（事件识别用）",
+                "hint": "命中词前面 4 个字内出现这些词，就不算「正在做」。留空用内置表。",
+                "type": "list",
+                "default": [
+                    "不想", "不要", "不用", "不必", "没空", "没时间", "没心情", "没去成",
+                    "还没", "没去", "待会", "晚点", "不打算", "不饿", "不去", "别去",
+                    "不去了", "取消", "不开了", "不上了"
+                ]
+            },
+            "together_ttl_minutes": {
+                "description": "「在一起」有效期（分钟）",
+                "type": "int",
+                "default": 150,
+                "hint": "说了「我们一起/陪你」之后，这段时间内她当你就在身边。",
+                "slider": {
+                    "min": 10,
+                    "max": 1440,
+                    "step": 10
                 }
             },
             "away_keywords": {

@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from astrbot.api import logger
+from astrbot.core.message.components import Plain
 
 from . import text_rules as rules
 from . import utterance
@@ -23,7 +24,8 @@ BUILTIN_RULES = {
     "version": 1,
     "default_ttl_minutes": 45,
     "negation_prefixes": ["不想", "不要", "不用", "不必", "没空", "没时间", "没心情", "没去成",
-                          "还没", "没去", "待会", "晚点", "不打算", "不饿", "不去", "别去", "不去了"],
+                          "还没", "没去", "待会", "晚点", "不打算", "不饿", "不去", "别去", "不去了",
+                          "取消", "不开了", "不上了"],
     "away_keywords": ["去上课", "上课去", "去上班", "上班去", "出门", "走了", "我走", "去公司",
                       "去学校", "出去", "下楼", "去一趟", "先走了", "去开个会"],
     "return_keywords": ["到家", "回来了", "我回来", "进家门", "进门", "我到了", "已经到家"],
@@ -142,6 +144,10 @@ def extract_message_text(event) -> str:
     parts = []
     try:
         for comp in event.get_messages() or []:
+            # 只认 Plain。Reply.text 是废弃字段，但现行适配器仍在往里填引用消息的原文，
+            # 全收进来会把「被引用的那条」当成用户此刻说的话（「我到家了吗」式误判）。
+            if not isinstance(comp, Plain):
+                continue
             text = getattr(comp, "text", None)
             if text:
                 parts.append(str(text))
@@ -407,6 +413,9 @@ class EventRuleStore:
             return self._filtered()
         if self._is_negated(text, idx):
             return self._filtered()
+        # 「取消去开会」「开会取消了」：否定词离得远，4 字窗口照不到，单独判
+        if rules.is_cancelled_clause(text, idx, kw_len=len(kw)):
+            return self._filtered()
         if self._is_future(text, idx):
             return self._filtered()
         if kind in ("away", "return", "end"):
@@ -601,6 +610,10 @@ class EventRuleStore:
                 continue
             for kw, idx in self._candidates(text, rule.get("stop_keywords") or []):
                 if self._is_negated(text, idx):
+                    continue
+                # 结束词同样要看时态/是否取消：「明天开饭再说」「开饭取消了」
+                # 不是「这顿饭现在结束了」——以前这里只过滤否定，会把做饭直接结束掉。
+                if self._is_future(text, idx) or rules.is_cancelled_clause(text, idx, len(kw)):
                     continue
                 d = self._gate(text, idx, kw, "stop")
                 if d["verdict"] == utterance.VERDICT_REJECT:

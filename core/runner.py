@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import random
 import re
@@ -42,6 +43,7 @@ from .sleep_reminder import (
     window_position,
     _parse_hhmm,
 )
+from . import text_rules as rules
 from .splitter import calc_delay, normalize_escapes, split_text
 from .decisions import DecisionLog, clip_text
 from .appointment import (
@@ -67,6 +69,7 @@ GENERATE_TIMEOUT_SECONDS = 120
 # 灰区复核超时：输入多了最近两句上下文，给慢一点的 provider 留点余量；
 # 输出仍是 YES / NO 两个字母，不需要长。
 GRAY_REVIEW_TIMEOUT_SECONDS = 4.0
+
 
 
 def _as_int(value, default: int) -> int:
@@ -114,6 +117,10 @@ class Runner:
         self.started = False
         # 正在发送中的会话，避免定时器与面板重复触发导致双发
         self._firing: set[str] = set()
+        # 每会话一把发送锁：定时器与面板「手动发送」共用，避免两条消息交错
+        self._send_locks: dict[str, asyncio.Lock] = {}
+        # 后台任务强引用（asyncio 只持弱引用，写历史这种短任务会被 GC 掉）
+        self._bg_tasks: set = set()
         # 事件过期巡检（30 秒一次），到点清事件并按规则决定要不要重排
         self._expiry_task: asyncio.Task | None = None
         # 判定记录：「为什么记 / 为什么没记」+ 一键撤销
@@ -352,16 +359,23 @@ class Runner:
         logger.info(f"{TAG} 她刚回过话，下次主动开口推到 {int(gap // 60)} 分钟后")
 
     def _next_wake_minutes(self, umo: str) -> float | None:
-        """暂停普通聊天后，下一次「必须开口」还有多久（约定 / 催睡）。没有就返回 None。"""
+        """暂停普通聊天后，下一次「必须开口」还有多久（约定 / 催睡）。没有就返回 None。
+
+        这里**不能**跟着「最长间隔」（默认 240 分钟）走：18:00 达上限暂停、
+        23:00 才该催睡，用 240 分钟去问，两边都会回答「太远，不干预」，
+        结果整晚都不会醒。所以按约定自己的视界（默认 14 小时）来算。
+        """
+        horizon = max(float(self._max_interval_minutes()),
+                      float(self._appointment_cfg().get("max_hours") or 14) * 60.0)
         candidates = []
         try:
-            appt = self._appointment_next_delay(umo, self._max_interval_minutes())
+            appt = self._appointment_next_delay(umo, horizon)
         except Exception:
             appt = None
         if appt is not None:
             candidates.append(float(appt))
         try:
-            sleep_delay = self._sleep_reminder_delay_minutes(umo)
+            sleep_delay = self._sleep_reminder_delay_minutes(umo, hi_minutes=horizon)
         except Exception:
             sleep_delay = None
         if sleep_delay is not None:
@@ -789,21 +803,29 @@ class Runner:
         self.store.set(umo, APPOINTMENT_KEY, items)
         self.store.save()
 
-    def _next_appointment(self, umo: str, now: float) -> dict | None:
-        """队列里最近一个还没完成的约定。"""
-        grace = APPOINTMENT_GRACE_MINUTES * 60
-        best = None
+    def _appointment_alive(self, item: dict, now: float, cfg: dict) -> bool:
+        """这条约定还在有效期内、没被放弃。"""
+        if str(item.get("stage") or "") == "done":
+            return False
+        at = _as_float_safe(item.get("at"))
+        if at <= 0 or now > at + APPOINTMENT_GRACE_MINUTES * 60:
+            return False
+        return _as_int(item.get("fails"), 0) < 2
+
+    def _next_appointment(self, umo: str, now: float, *, executable: bool = False) -> dict | None:
+        """队列里最近一条约定。
+
+        executable=True 时只返回「这一拍真的能发」的那条：以前固定取最早的一条，
+        12:00 的 due 发完、follow 还没到时，12:05 的约定会被它堵在队列里发不出去。
+        """
+        cfg = self._appointment_cfg()
         for item in self._appointments(umo):
-            if str(item.get("stage") or "") == "done":
+            if not self._appointment_alive(item, now, cfg):
                 continue
-            at = _as_float_safe(item.get("at"))
-            if at <= 0 or now > at + grace:
+            if executable and appointment_stage(item, now, cfg) is None:
                 continue
-            if _as_int(item.get("fails"), 0) >= 2:
-                continue
-            if best is None or at < _as_float_safe(best.get("at")):
-                best = item
-        return best
+            return item
+        return None
 
     def _set_appointment(self, umo: str, hit: dict) -> bool:
         now = time.time()
@@ -854,14 +876,25 @@ class Runner:
         self.store.pop(umo, APPOINTMENT_KEY)
         self.store.save()
 
-    def _advance_appointment(self, umo: str, shot: str) -> None:
+    def _pick_appointment(self, items: list, shot: str, now: float, cfg: dict,
+                          at: float | None) -> dict | None:
+        """定位要推进的那条：优先按时刻，其次按「当前这一拍」。"""
+        if at:
+            for item in items:
+                if abs(_as_float_safe(item.get("at")) - float(at)) < 1:
+                    return item
+        for item in items:
+            if appointment_stage(item, now, cfg) == shot:
+                return item
+        return None
+
+    def _advance_appointment(self, umo: str, shot: str, at: float | None = None) -> None:
         """一拍发出去之后推进状态。"""
         now = time.time()
         cfg = self._appointment_cfg()
         items = self._appointments(umo)
-        for item in items:
-            if appointment_stage(item, now, cfg) != shot:
-                continue
+        item = self._pick_appointment(items, shot, now, cfg, at)
+        if item is not None:
             if shot == "lead":
                 item["stage"] = "lead"
                 item["lead_sent_at"] = now
@@ -871,30 +904,30 @@ class Runner:
                 if cfg["followup_enabled"] and cfg["max_followups"] > 0:
                     item["follow_up_at"] = now + cfg["followup_minutes"] * 60
                 else:
+                    # 不补发就没有下一拍了：直接收尾，否则这条永远是队首、永远发不了也退不出，
+                    # 把后面的约定一起堵到 grace 结束。
                     item["follow_up_at"] = 0
+                    item["stage"] = "done"
             elif shot == "follow":
                 item["follow_ups"] = _as_int(item.get("follow_ups"), 0) + 1
                 item["follow_up_at"] = 0
                 if item["follow_ups"] >= cfg["max_followups"]:
                     item["stage"] = "done"
-            break
         self._save_appointments(umo, items)
 
-    def _appointment_fail(self, umo: str, shot: str) -> None:
+    def _appointment_fail(self, umo: str, shot: str, at: float | None = None) -> None:
         """生成或发送失败：记一次，连续两次就放弃，别每分钟重试烧钱。"""
         now = time.time()
         cfg = self._appointment_cfg()
         items = self._appointments(umo)
-        for item in items:
-            if appointment_stage(item, now, cfg) != shot:
-                continue
+        item = self._pick_appointment(items, shot, now, cfg, at)
+        if item is not None:
             item["fails"] = _as_int(item.get("fails"), 0) + 1
             if item["fails"] >= 2:
                 item["stage"] = "done"
                 logger.warning(
                     f"{TAG} 约定连续失败，放弃：{item.get('time_text')} {item.get('label')}"
                 )
-            break
         self._save_appointments(umo, items)
 
     def _appointment_on_user_reply(self, umo: str) -> None:
@@ -942,26 +975,52 @@ class Runner:
             )
         return delay
 
-    def appointment_shot(self, umo: str):
-        """这次该按哪一拍走：lead / due / follow / None。"""
+    def appointment_shot_item(self, umo: str) -> dict | None:
+        """这次真正要发的那条约定：返回 {"item", "shot", "at"}；没有就 None。"""
         cfg = self._appointment_cfg()
         if not cfg["enable"]:
             return None
-        item = self._next_appointment(umo, time.time())
-        if not item:
-            return None
-        return appointment_stage(item, time.time(), cfg)
+        now = time.time()
+        for item in self._appointments(umo):
+            if not self._appointment_alive(item, now, cfg):
+                continue
+            shot = appointment_stage(item, now, cfg)
+            if shot:
+                return {"item": item, "shot": shot, "at": _as_float_safe(item.get("at"))}
+        return None
 
-    def appointment_hint(self, umo: str, shot: str) -> str:
+    def appointment_shot(self, umo: str):
+        """这次该按哪一拍走：lead / due / follow / None。"""
+        hit = self.appointment_shot_item(umo)
+        return hit["shot"] if hit else None
+
+    def _appointment_item_for(self, umo: str, at: float | None) -> dict | None:
+        """按约定时刻定位条目（同一时刻只会有一条）。"""
+        if not at:
+            return None
+        for item in self._appointments(umo):
+            if abs(_as_float_safe(item.get("at")) - float(at)) < 1:
+                return item
+        return None
+
+    def appointment_hint(self, umo: str, shot: str, at: float | None = None) -> str:
         """约定描述 + 原有场景描述。
 
         必须追加而不是替换：event_hint 里带着「他在不在你这边」，
         换掉会让他在外面时生成「过来抱抱」这种矛盾的话。
+        唯一例外是「到家」这条：那时 event_hint 可能还在说「他出门了没回来」，
+        两句拼在一起自相矛盾，改用固定场景。
         """
-        item = self._next_appointment(umo, time.time()) or {}
+        now = time.time()
+        item = self._appointment_item_for(umo, at)
+        if item is None:
+            item = self._next_appointment(umo, now, executable=True) or {}
         cfg = self._appointment_cfg()
         template = cfg["hint"] if shot == "due" else ""
         body = build_appointment_hint(item, shot, datetime.now(), template)
+        if shot == "due" and str(item.get("kind") or "") == "arrive":
+            scene = "他已经按说好的时间到家了，人就在你旁边。"
+            return f"{body}\n{scene}" if body else scene
         scene = self.event_hint(umo)
         if body and scene:
             return f"{body}\n{scene}"
@@ -1226,10 +1285,45 @@ class Runner:
             return list(self.WAKE_KEYWORDS_DEFAULT)
         return [k.strip() for k in str(raw).replace("，", ",").split(",") if k.strip()]
 
+    @staticmethod
+    def _first_action_hit(text: str, words):
+        """在一组词里找第一个「用户本人在做」的命中（否定/疑问/第三人称/时态/转述都过滤）。
+
+        交接词、唤醒词这类短词以前都是裸 `in text`，误判率很高：
+        「不好吃」「还没开饭」「他觉得好吃」「明天开饭再说」全会被当成已经吃上了。
+        """
+        if not text:
+            return None
+        for word in words:
+            if not word:
+                continue
+            idx = text.find(word)
+            while idx != -1:
+                if rules.is_self_action_clause(text, idx, len(word)):
+                    return word
+                idx = text.find(word, idx + 1)
+        return None
+
     def _match_wake(self, text: str):
+        """命中「醒了」类的词，但要排除别人的、疑问的、否定的、将来和转述。
+
+        以前是裸 `kw in text`：「我妈醒了」「你醒了吗」「我还没起床」「明天起床再说」
+        「他说我醒了」都会把免打扰关掉，用户半夜被叫醒。
+        """
+        if not text:
+            return None
         for kw in self._wake_keywords():
-            if kw and kw in text:
-                return kw
+            if not kw:
+                continue
+            idx = text.find(kw)
+            while idx != -1:
+                head = rules.clause_head(text, idx, window=14)
+                # 主语是「你/您」时是问对方，不是自己醒了
+                if not head.startswith(("你", "您")) and rules.is_self_action_clause(
+                    text, idx, len(kw)
+                ):
+                    return kw
+                idx = text.find(kw, idx + 1)
         return None
 
     # 说这些词表示「一起/同行」：此时命中「出门/出去」等离开词，也不该标记「不在身边」。
@@ -1842,7 +1936,16 @@ class Runner:
             store.pop(umo, "active_event")
             self._clear_together(umo)
             logger.info(f"{TAG} 回到身边（命中“{return_kw}”）")
-            return True
+            # 同一句里可能还有别的事：「我到家了，我去洗澡了」——
+            # 以前这里整体 return True，后半句的洗澡就被吞了。
+            hit_idx = ret["hit"].get("idx")
+            rest = rules.drop_keyword(
+                text, hit_idx if hit_idx is not None else text.find(return_kw), len(return_kw)
+            )
+            if not rest:
+                return True
+            text = rest
+            event = None  # 上面刚 pop 掉，后面的分支别再拿旧 dict 判 stop
 
         # 阶段性结束词（下课 / 放学 / 下班 / 散会 / 收工 / 考完）：
         # 只解除「离开」，不碰事件、不碰「在一起」。
@@ -1971,7 +2074,7 @@ class Runner:
         # 不换的话「在做饭」会挂满 40 分钟，提示词一直让她凑过去闻、尝第一口——
         # 人都已经吃上了，她还在说锅里。
         if isinstance(event, dict) and event.get("name") == "cooking":
-            meal = next((w for w in self.MEAL_HANDOFF if w in text), None)
+            meal = self._first_action_hit(text, self.MEAL_HANDOFF)
             if meal:
                 store.pop(umo, "active_event")
                 self._note("event", {"hit": {
@@ -1979,7 +2082,9 @@ class Runner:
                     "gate_rule": "H1", "reason": "已经吃上了，做饭结束",
                 }})
                 eating = self.engine.get_rule("eating")
-                eaten = any(w in text for w in ("吃完", "吃好", "吃不下", "吃撑", "吃饱"))
+                eaten = bool(self._first_action_hit(
+                    text, ("吃完", "吃好", "吃不下", "吃撑", "吃饱")
+                ))
                 if eating and not eaten:
                     self._set_event(umo, eating, meal, source_text=text)
                     logger.info(f"{TAG} 事件交接：做饭 → 吃饭（「{meal}」）")
@@ -2137,11 +2242,15 @@ class Runner:
             "model": str(getattr(provider, "get_model", lambda: "")() or ""),
         }
 
-    async def classify_with_llm(self, umo: str, text: str) -> None:
-        """关键词没认出时，让模型判断属于哪一类。"""
+    async def classify_with_llm(self, umo: str, text: str, seq: int | None = None) -> None:
+        """关键词没认出时，让模型判断属于哪一类。
+
+        seq 由调用方在**收到消息时**捕获：任务排队期间可能已经来了新消息，
+        到任务体里再读序号就变成「新消息的序号」，过期判断会失效。
+        """
         # 记下这句属于第几条消息：模型慢的时候，后面的消息可能已经更新了状态，
         # 旧结果回来不能把它盖掉（「准备冲个凉」的结果晚于「我在吃饭」，就是这种）。
-        start_seq = _as_int(self.store.get(umo, "turn_seq"), 0)
+        start_seq = int(seq) if seq is not None else _as_int(self.store.get(umo, "turn_seq"), 0)
         result = await self.classify_text(umo, text)
         now_seq = _as_int(self.store.get(umo, "turn_seq"), 0)
         if now_seq != start_seq:
@@ -2253,13 +2362,38 @@ class Runner:
     # ------------------------------------------------------------------
     # 生成与发送
     # ------------------------------------------------------------------
+    def session_lock(self, umo: str) -> asyncio.Lock:
+        """每会话一把发送锁：定时器与面板「手动发送」共用。"""
+        lock = self._send_locks.get(umo)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._send_locks[umo] = lock
+        return lock
+
+    def _spawn_bg(self, coro) -> None:
+        """起一个后台任务并持强引用（取消路径下写历史用）。"""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
     async def _fire(self, umo: str) -> None:
         if umo in self._firing:
             logger.info(f"{TAG} 该会话正在发送中，忽略重复触发")
             return
+        lock = self.session_lock(umo)
+        if lock.locked():
+            # 面板正在手动发：这条让路，但要照常排下一次，不能就此停摆
+            logger.info(f"{TAG} 该会话正在手动发送，跳过本次触发")
+            if self.started:
+                self._finish_cycle(umo)
+            return
         self._firing.add(umo)
+        await lock.acquire()
+        held = True
         # 默认结束后重新排程；只有"触发上限"那种需要暂停的分支才关掉。
         reschedule_needed = True
+        # 已送达的分段：被取消时靠它补写历史（取消异常不会走到下面的写历史）
+        delivered: list[str] = []
         try:
             if not self.cfg.get("enable", False):
                 return
@@ -2273,7 +2407,9 @@ class Runner:
             # 否则你整晚没回消息时，最该催睡觉的那条反而被拦掉。
             reminding = self.should_remind_sleep(umo)
             # 约定优先：同一时刻只发一条，别和催睡抢
-            shot = self.appointment_shot(umo)
+            appt = self.appointment_shot_item(umo)
+            shot = appt["shot"] if appt else None
+            appt_at = appt["at"] if appt else None
             if shot:
                 reminding = False
 
@@ -2289,6 +2425,8 @@ class Runner:
                 if wake is None:
                     logger.info(f"{TAG} 连续 {unanswered} 条未回复，暂停直到你说话")
                     return
+                # wake 是分钟、这里换秒；1 分钟地板 = 最迟 1 分钟内补发，
+                # 不是「1 小时」（外部报告把单位看成了分钟）。
                 delay = max(60.0, wake * 60.0)
                 self.store.set(umo, "next_at", time.time() + delay)
                 self.store.save()
@@ -2300,19 +2438,30 @@ class Runner:
                 return
 
             # 待睡提醒：这次触发是「该睡了」的提醒，不是普通主动消息
-            text = await self._generate(umo, reminder=reminding, appointment=shot)
+            text = await self._generate(
+                umo, reminder=reminding, appointment=shot, appointment_at=appt_at
+            )
             if not text:
                 logger.info(f"{TAG} 生成为空，重新排程")
                 if shot:
                     # 别让它每分钟重试：连续两次失败就放弃这条约定
-                    self._appointment_fail(umo, shot)
+                    self._appointment_fail(umo, shot, appt_at)
                 return
 
-            sent_text = await self._send_split(umo, text)
+            try:
+                sent_text = await self._send_split(umo, text, sent_out=delivered)
+            except asyncio.CancelledError:
+                # 用户开口会取消定时器，CancelledError 会从这里穿出去、写历史的代码根本到不了。
+                # 已经发出去的那几段不能白丢，另起一个任务补写，然后把取消继续往上抛。
+                reschedule_needed = False
+                if delivered:
+                    logger.info(f"{TAG} 发送被取消，已送达 {len(delivered)} 段，补写历史")
+                    self._spawn_bg(self._append_assistant_history(umo, "\n".join(delivered)))
+                raise
             ok = bool(sent_text)
             if ok:
                 if shot:
-                    self._advance_appointment(umo, shot)
+                    self._advance_appointment(umo, shot, appt_at)
                     count = self.store.bump_unanswered(umo)
                     logger.info(
                         f"{TAG} 已发送约定（{shot}），当前未回复计数 {count}"
@@ -2330,15 +2479,20 @@ class Runner:
                 # 只把真正送达的内容写回历史：分段中途失败时，剩下的不能当成「她已经说过」
                 await self._append_assistant_history(umo, sent_text)
             elif shot:
-                self._appointment_fail(umo, shot)
+                self._appointment_fail(umo, shot, appt_at)
         except Exception as e:
             logger.error(f"{TAG} 发送流程异常: {e}")
         finally:
+            if held and lock.locked():
+                lock.release()
             self._firing.discard(umo)
             if self.started and reschedule_needed:
                 self._finish_cycle(umo)
 
-    async def _generate(self, umo: str, reminder: bool = False, appointment: str | None = None) -> str:
+    async def _generate(
+        self, umo: str, reminder: bool = False,
+        appointment: str | None = None, appointment_at: float | None = None,
+    ) -> str:
         cfg = self.cfg
         settings = self._context_settings()
         mode = settings["source_mode"]
@@ -2372,7 +2526,7 @@ class Runner:
 
         unanswered = int(self.store.get(umo, "unanswered", 0) or 0)
         if appointment:
-            hint = self.appointment_hint(umo, appointment)
+            hint = self.appointment_hint(umo, appointment, appointment_at)
         elif reminder:
             hint = self.reminder_hint(umo)
         else:
@@ -2510,6 +2664,20 @@ class Runner:
         return times
 
     @staticmethod
+    def _tool_safe_start(history: list, start: int) -> int:
+        """把裁剪边界往前挪到工具调用组的开头。
+
+        按条切片会把 assistant(tool_calls) 和它的 tool 结果切开：留下孤立的 role=tool，
+        OpenAI 兼容接口会直接 400，整轮主动消息发不出去。往回退到发起调用的那条 assistant。
+        """
+        i = max(0, int(start))
+        if i >= len(history):
+            return len(history)
+        while i > 0 and str(history[i].get("role") or "") == "tool":
+            i -= 1
+        return i
+
+    @staticmethod
     def _trim_window(history: list, times: list, settings: dict) -> list:
         total = len(history)
         count = max(2, int(settings["window_count"]))
@@ -2527,6 +2695,7 @@ class Runner:
                     break
             keep_from = max(keep_from, index)
 
+        keep_from = Runner._tool_safe_start(history, keep_from)
         result = history[keep_from:]
         floor = min(max(0, int(settings["window_min"])), total, count)
         if floor and len(result) < floor:
@@ -2690,7 +2859,7 @@ class Runner:
         # 会把上限顶穿，那样这个上限就不硬了。
         cap = max(0, _as_int(settings.get("history_cap"), 0))
         if cap and len(out) > cap:
-            out = out[-cap:]
+            out = out[Runner._tool_safe_start(out, len(out) - cap):]
         if settings["window_enabled"]:
             out = self._trim_window(out, self._fill_times(out), settings)
         if drop_images or drop_think:
@@ -2702,6 +2871,9 @@ class Runner:
             out = filtered
         # 时间戳只在窗口裁剪时有用（_fill_times 在上面），发出去之前一律剥掉。
         # 放在 _strip_parts 之后：这里不看图片/思考开关，永远执行。
+        # 兜底：万一还剩下队首的孤立 tool（前面的 assistant 早就不在本窗口里），直接丢掉
+        while out and str(out[0].get("role") or "") == "tool":
+            out.pop(0)
         out, ts_hits = self._strip_time_blocks(out)
         if len(out) != before or ts_hits:
             logger.info(
@@ -2902,17 +3074,59 @@ class Runner:
             logger.debug(f"{TAG} 读取会话历史失败: {e}")
             return []
 
+    @staticmethod
+    def _persona_text(persona) -> str:
+        if persona is None:
+            return ""
+        if isinstance(persona, dict):
+            return str(persona.get("prompt") or "")
+        return str(getattr(persona, "system_prompt", "") or "")
+
+    async def _session_persona(self, persona_mgr, umo: str):
+        """会话里单独选过的人格。
+
+        `get_default_persona_v3()` 只认全局/UMO 默认，不认会话里 `/persona` 选的 B，
+        所以主动消息会用 A、正常回复用 B。这里按 AstrBot 的会话人格优先解析，
+        取不到就返回 None 交给调用方回退默认。
+        """
+        persona_id = ""
+        try:
+            conv_mgr = getattr(self.context, "conversation_manager", None)
+            if conv_mgr is not None:
+                conv_id = await conv_mgr.get_curr_conversation_id(umo)
+                if conv_id:
+                    conv = await conv_mgr.get_conversation(umo, conv_id)
+                    persona_id = str(getattr(conv, "persona_id", "") or "") if conv else ""
+        except Exception:
+            persona_id = ""
+        if not persona_id:
+            return None
+        for name in ("resolve_selected_persona", "get_persona_v3_by_id", "get_persona"):
+            fn = getattr(persona_mgr, name, None)
+            if fn is None:
+                continue
+            try:
+                if name == "resolve_selected_persona":
+                    result = fn(conversation_persona_id=persona_id)
+                else:
+                    result = fn(persona_id)
+                if inspect.isawaitable(result):
+                    result = await result
+                if result is not None:
+                    return result
+            except Exception:
+                continue
+        return None
+
     async def _load_persona(self, umo: str) -> str:
         try:
             persona_mgr = getattr(self.context, "persona_manager", None)
             if persona_mgr is None:
                 return ""
-            persona = await persona_mgr.get_default_persona_v3(umo)
-            if persona is None:
-                return ""
-            if isinstance(persona, dict):
-                return str(persona.get("prompt") or "")
-            return str(getattr(persona, "system_prompt", "") or "")
+            text = self._persona_text(await self._session_persona(persona_mgr, umo))
+            if text:
+                return text
+            return self._persona_text(await persona_mgr.get_default_persona_v3(umo))
         except Exception as e:
             logger.debug(f"{TAG} 读取人格失败: {e}")
             return ""
@@ -2934,7 +3148,7 @@ class Runner:
                 cleaned.append(text)
         return cleaned
 
-    async def _send_split(self, umo: str, text: str) -> str:
+    async def _send_split(self, umo: str, text: str, sent_out: list | None = None) -> str:
         """分段发送。返回**实际送达**的文本（空串表示一段都没发出去）。
 
         以前返回 bool，只要第一段成功就为 True，调用方随后把整段原文写进历史——
@@ -2964,6 +3178,8 @@ class Runner:
         if not segments:
             return ""
 
+        # 取消可能发生在任意两次分段之间：把已发出的段落同步回填给调用方，
+        # 它才能在 CancelledError 里补写历史（返回值到不了那一步）。
         sent: list[str] = []
         for index, segment in enumerate(segments):
             try:
@@ -2974,6 +3190,8 @@ class Runner:
                     logger.warning(f"{TAG} 分段 {index + 1} 未送达")
                     break
                 sent.append(segment)
+                if sent_out is not None:
+                    sent_out.append(segment)
             except Exception as e:
                 logger.error(f"{TAG} 发送第 {index + 1} 段失败: {e}")
                 break

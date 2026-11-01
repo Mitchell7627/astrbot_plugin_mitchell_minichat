@@ -22,7 +22,7 @@ from .core.store import Store
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.2.4"
+VERSION = "v0.2.5"
 
 
 class ProactiveMiniPlugin(star.Star):
@@ -197,8 +197,12 @@ class ProactiveMiniPlugin(star.Star):
         self.store.reset_unanswered(umo)
 
         pending = ""
+        turn_seq = None
         try:
             handled = self.runner.update_from_message(umo, text)
+            # 在这里同步读一次：update_from_message 刚把序号 +1，中间没有 await，
+            # 拿到的必然是这条消息的序号。留给任务体里再读，排队期间来新消息就被顶掉了。
+            turn_seq = int(self.store.get(umo, "turn_seq") or 0)
             if not handled and text:
                 pending = text
         except Exception as e:
@@ -210,7 +214,9 @@ class ProactiveMiniPlugin(star.Star):
 
         if pending:
             try:
-                task = asyncio.create_task(self.runner.classify_with_llm(umo, pending))
+                task = asyncio.create_task(
+                    self.runner.classify_with_llm(umo, pending, turn_seq)
+                )
                 self._bg_tasks.add(task)
                 task.add_done_callback(self._bg_tasks.discard)
             except Exception as e:
