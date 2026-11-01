@@ -913,6 +913,16 @@ class Runner:
             "until": until,
             "keyword": keyword or (prev or {}).get("keyword") or "",
         })
+        # 「在一起」和「不在身边」是互斥的：人都说你旁边了，
+        # 就别再留着"他出门了"的记录，否则提示词会同时给出两个矛盾的场景。
+        if isinstance(self.store.get(umo, "away"), dict):
+            self.store.pop(umo, "away")
+
+    def _together_alive(self, umo: str, now: float) -> bool:
+        tg = self.store.get(umo, "together")
+        return bool(
+            isinstance(tg, dict) and tg.get("active") and now < float(tg.get("until") or 0)
+        )
 
     def _clear_together(self, umo: str) -> None:
         if isinstance(self.store.get(umo, "together"), dict):
@@ -1235,12 +1245,22 @@ class Runner:
             # 「帮我拿快递」「给你取外卖」是支使别人去做，不是用户自己要出门
             away_kw = None
         if away_kw:
-            if self._is_together(text):
+            # 刚说好「一起」时，接下来省略主语的「出门吧 / 走吧 / 出门了」算一起出门，
+            # 不切成"他一个人走了"。带「我」的才算他自己走（「我先出门了」）。
+            carried = (
+                not self._is_together(text)
+                and "我" not in text
+                and self._together_alive(umo, now)
+            )
+            if self._is_together(text) or carried:
                 # 一起出门：不算「离开」，她就在你身边。直接清掉 away 记录，
                 # 不写 cleared_at，这样 event_hint 会落到「在一起」，而不是「刚回来」。
                 store.pop(umo, "away")
                 self._touch_together(umo, now, away_kw)
-                logger.info(f"{TAG} 一起出门（命中「{away_kw}」+ 同行词），视为在身边")
+                if carried:
+                    logger.info(f"{TAG} 刚才说好一起，这句「{away_kw}」按一起出门算，不标记离开")
+                else:
+                    logger.info(f"{TAG} 一起出门（命中「{away_kw}」+ 同行词），视为在身边")
             else:
                 self._clear_together(umo)
                 store.set(umo, "away", {

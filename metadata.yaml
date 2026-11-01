@@ -1,7 +1,7 @@
 name: "astrbot_plugin_mitchell_minichat"
 display_name: "主动私聊Mini"
 author: "Mitchell7627"
-version: "v0.1.0"
+version: "v0.1.1"
 desc: "仅支持 aiocqhttp（QQ）私聊。轻量主动消息插件：加权触发 + 16 类事件感知 + 在场状态（离开/回来/在一起）+ 加速事件 + 晚睡/午睡提醒 + 智能分段发送；自带可实时预览的 Web 管理面板。遇到问题请到 GitHub Issues 反馈。"
 repo: "https://github.com/Mitchell7627/astrbot_plugin_mitchell_minichat"
 astrbot_version: ">=4.29.0"
