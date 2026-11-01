@@ -1778,14 +1778,19 @@ class Runner:
             end_ex = self.engine.match_period_end_ex(text)
             self._note("end", {"hit": end_ex["hit"], "dropped": end_ex["dropped"]})
             if end_ex["hit"]:
+                end_kw = end_ex["hit"]["kw"]
                 store.set(umo, "away", {
                     "active": False,
                     "reason": away_state.get("reason") or "",
-                    "keyword": end_ex["hit"]["kw"],
+                    "keyword": end_kw,
                     "cleared_at": now,
                 })
-                logger.info(f"{TAG} 阶段性结束（命中「{end_ex['hit']['kw']}」），解除离开")
-                return True
+                logger.info(f"{TAG} 阶段性结束（命中「{end_kw}」），解除离开")
+                # 「下班了，出门买菜」：旧的解除之后，同句里如果还跟着一件
+                # 新的离开，就该继续往下走，别拿 return 把它吞掉。
+                # 不按位置挑：离开词在前（「出门在外，刚下班」）也是他现在的状态。
+                if not self.engine.match_away_ex(text)["hit"]:
+                    return True
 
         away_ex = self.engine.match_away_ex(text)
         self._note("away", {"hit": away_ex["hit"], "dropped": away_ex["dropped"]})

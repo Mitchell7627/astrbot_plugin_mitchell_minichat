@@ -27,6 +27,8 @@ FUTURE_MARKERS = (
     "后天", "大后天", "改天", "下次", "下回", "下周", "下星期", "下礼拜",
     "下个月", "下学期", "回头", "以后", "将来",
     "等会", "等会儿", "待会", "待会儿", "晚点", "一会儿", "过会儿", "稍后",
+    # 「打算去健身房」是计划，不是此刻（「准备」不算：准备…了=正要做）
+    "打算",
 )
 # 兜底正则：明/后/下次 + 时间单位（明天、明早、明晚、后天早上、下次…）
 FUTURE_RE = re.compile(r"(?:明|后|大后|次)(?:天|日|早|晚|儿|个|晨)")
@@ -47,6 +49,8 @@ _RECENT_GUARD = ("刚好", "刚巧", "刚想")
 # 事件路径只认「吗/嘛/问号」：中文里「我在吃饭呢」的「呢」是陈述语气，
 # 不能当疑问（睡眠路径另有一套更严格的规则）。
 QUESTION_MARKS = ("吗", "嘛", "？", "?")
+# 谓语后面的特殊疑问词：「开会开到几点」「下课要多久」——没有问号也是在问
+_INTERROGATIVE_RE = re.compile(r"(几|多少|多久|多长时间|啥|什么|哪|怎么)")
 
 # ---------------------------------------------------------------- 人称
 # 第三人称主语（只在这些词出现在**分句开头**、且后面跟谓语时才认）
@@ -159,14 +163,17 @@ def is_far_past_clause(text: str, idx: int, kw_len: int = 0, window: int = 14, p
 
 
 def is_question_clause(text: str, idx: int, kw_len: int = 0, window: int = 14) -> bool:
-    """命中词所在分句是不是疑问句（「吃了吗」「在开会吗」）。"""
+    """命中词所在分句是不是疑问句（「吃了吗」「开会开到几点」）。"""
     start = clause_start(text, idx, window)
     end = clause_end(text, idx + kw_len)
     clause = text[start:end]
     if any(m in clause for m in QUESTION_MARKS):
         return True
     tail = text[idx + kw_len:end].strip()
-    return tail[:1] == "没"
+    if tail[:1] == "没":
+        return True
+    # 特殊疑问词跟在谓语后面：「开会开到几点」「下课要多久」
+    return bool(_INTERROGATIVE_RE.search(tail))
 
 
 def is_third_person_subject(text: str, idx: int, extra_names=()) -> bool:
@@ -219,4 +226,8 @@ def negated_by_clause(text: str, idx: int, negations, window: int = 4) -> bool:
         return False
     if any(n in head for n in negations):
         return True
-    return head[-1] in ("不", "别")
+    if head[-1] in ("不", "别", "没"):
+        return True
+    # 「没在开会」「不在洗澡」：否定词被「在/正」隔开一个字（「没」不在否定词表里，
+    # 单字否定太容易误伤，只在紧贴「在/正」时才认）
+    return len(head) >= 2 and head[-1] in ("在", "正") and head[-2] in ("没", "不", "别")

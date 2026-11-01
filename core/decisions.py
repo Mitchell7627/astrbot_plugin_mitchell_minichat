@@ -77,10 +77,33 @@ class DecisionLog:
         if len(self._items) > self.limit:
             del self._items[: len(self._items) - self.limit]
 
+    def _unique_id(self, value) -> float:
+        """同一毫秒内的两条记录会撞 id（id 原本就是 time.time()）。
+
+        id 是撤销时的唯一抓手：撞了就会撤错那一条。这里在入库时统一兜底，
+        给撞上的那条让出 1ms，既不改调用方也不用 uuid（面板还要按数字找）。
+        """
+        try:
+            base = float(value)
+        except (TypeError, ValueError):
+            base = round(time.time(), 3)
+        used = set()
+        for r in self._items:
+            try:
+                used.add(float(r.get("id")))
+            except (TypeError, ValueError):
+                continue
+        n = 0
+        while base in used and n < 1000:
+            n += 1
+            base = round(base + 0.001, 3)
+        return base
+
     def add(self, record: dict) -> dict | None:
         """写入一条记录；decision_log_size=0 时直接丢弃。"""
         if self.limit <= 0 or not isinstance(record, dict):
             return None
+        record["id"] = self._unique_id(record.get("id"))
         self._items.append(record)
         self._trim()
         self._dirty = True

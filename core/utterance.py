@@ -50,6 +50,22 @@ _NOUN_SUFFIXES = (
 # R2b：后面是「的+名词」
 _DE_NOUNS = ("的视频", "的课", "的录音", "的直播", "的照片", "的帖子")
 
+# R2c：「的+名词」的通用形态——「洗澡的水太烫了」「开会的内容我忘了」。
+# 句尾的「的呀 / 的哦」是语气（「我去洗澡的」），不算名词短语。
+_DE_PARTICLES = "呀啊哦呢嘛啦咯喽哈吧"
+_DE_STRIP = _DE_PARTICLES + "。！？!?…~～，, "
+
+
+def _de_noun_tail(tail: str) -> bool:
+    if not tail.startswith("的"):
+        return False
+    return bool(tail[1:].strip(_DE_STRIP))
+
+
+# R7：「会去洗澡的」是承诺，不是此刻（「会」在谓语前、「的」收尾）
+# R8：连动「洗完澡去看电影」——A 完了才做 B，B 现在还没发生
+_SEQ_RE = re.compile(r"完[^，。！？,.!?;；]{0,4}(?:去|再|就|才|然后|之后)")
+
 # R4：情绪动词带宾语。「讨厌上课」里的「上课」是宾语，不是他在上课
 _EMOTION_TAILS = (
     "讨厌", "不喜欢", "喜欢", "烦", "最怕", "好怕", "怕",
@@ -60,6 +76,10 @@ _TURN_WORDS = ("但还是", "但是", "可是", "不过", "还是", "得去", "�
 
 # R5：泛指 / 说的是别人
 _VAGUE_HEADS = ("没人", "没有", "没有人", "谁也不", "大家", "别人", "人家")
+# R5b：主语本身就是泛指或疑问（「大家都在开会」「谁在洗澡」）。
+# 不含光秃秃的「都」——「都说了在开会」是他自己，不是泛指。
+_VAGUE_SUBJECTS = ("大家", "人人", "谁", "别人", "人家", "没人")
+_VAGUE_ADVERBS = ("都在", "全在", "全都", "都正", "都还")
 
 # R6：反问
 _RHETORIC = ("谁要", "谁想", "难道", "哪有", "谁会")
@@ -105,11 +125,11 @@ _EVAL_RE = re.compile(r"^(?:真|太|好|挺|很|最|超)(?:无聊|好玩|舒服|
 
 # 各 kind 启用哪些规则（没列出的规则不参与判定）
 _SCOPE: dict[str, frozenset[str]] = {
-    "event": frozenset(("R1", "R2", "R2b", "R3", "R4", "R5", "R6", "A1", "A2", "A3", "A4", "A5", "A8")),
-    "away": frozenset(("R1", "R2", "R2b", "R3", "R4", "R5", "R6", "A1", "A2", "A3", "A4", "A5", "A8")),
-    "return": frozenset(("R1", "R2", "R2b", "R3", "A1", "A2", "A5", "A8")),
-    "sleep": frozenset(("R1", "R2", "R2b", "R3", "R4", "R5", "R6", "A1", "A2", "A3", "A4", "A5", "A6", "A8")),
-    "wait": frozenset(("R1", "R2", "R2b", "R3", "R4", "R5", "R6", "A1", "A2", "A3", "A4", "A5", "A7", "A8")),
+    "event": frozenset(("R1", "R2", "R2b", "R2c", "R3", "R4", "R5", "R5b", "R6", "R7", "R8", "A1", "A2", "A3", "A4", "A5", "A8")),
+    "away": frozenset(("R1", "R2", "R2b", "R2c", "R3", "R4", "R5", "R5b", "R6", "R7", "R8", "A1", "A2", "A3", "A4", "A5", "A8")),
+    "return": frozenset(("R1", "R2", "R2b", "R2c", "R3", "A1", "A2", "A5", "A8")),
+    "sleep": frozenset(("R1", "R2", "R2b", "R2c", "R3", "R4", "R5", "R5b", "R6", "A1", "A2", "A3", "A4", "A5", "A6", "A8")),
+    "wait": frozenset(("R1", "R2", "R2b", "R2c", "R3", "R4", "R5", "R6", "A1", "A2", "A3", "A4", "A5", "A7", "A8")),
     # 结束词只做最窄的判断：名词化 / 定语链 / 情绪宾语 / 体标记
     "stop": frozenset(("R1", "R2", "R2b", "R4", "A2", "A5")),
     # 阶段结束词（下课/下班）：同 stop 口径。不带 A1，否则「快下课」「马上放学」
@@ -121,10 +141,14 @@ _REASONS = {
     "R1": "只是在提这个话题",
     "R2": "后面接名词，说的是这件事",
     "R2b": "是「…的视频/的课」里的定语",
+    "R2c": "「的」后面跟名词，说的是这件事",
     "R3": "前面是「…的」定语",
     "R4": "「讨厌/喜欢」后面是宾语",
     "R5": "说的是别人或泛指",
+    "R5b": "主语是泛指或疑问代词",
     "R6": "反问句，不是在报告",
+    "R7": "说的是以后会做",
+    "R8": "前面还有件事没做完",
     "A1": "前面有「去/在/要」，是谓语",
     "A2": "后面带「了/中」，是谓语",
     "A3": "「一起/陪你」这类同行说法",
@@ -184,6 +208,9 @@ def _judge_cached(
     ):
         return hit("R2b", VERDICT_REJECT)
 
+    if "R2c" in scope and _de_noun_tail(tail):
+        return hit("R2c", VERDICT_REJECT)
+
     if (
         "R3" in scope
         and len(head) >= 3
@@ -205,6 +232,24 @@ def _judge_cached(
 
     if "R6" in scope and any(w in text for w in _RHETORIC):
         return hit("R6", VERDICT_REJECT)
+
+    # R5b 放在 R5/R6 之后：这两条更贴近真实原因（「没人喜欢上班」是泛指+情绪，
+    # 「谁要洗澡」是反问），R5b 只兜住「都在开会」「谁在洗澡」这种剩下的
+    if "R5b" in scope and (
+        head.startswith(_VAGUE_SUBJECTS) or head.startswith(_VAGUE_ADVERBS)
+    ):
+        return hit("R5b", VERDICT_REJECT)
+
+    # 「会去洗澡的」有两种切法：命中的可能是「洗澡」，也可能是更靠前的「去洗」，
+    # 所以句尾的「的」也要认（「澡的」这种尾巴短，不会误伤长句）
+    if "R7" in scope and "会" in head and (
+        tail.startswith("的")
+        or (len(tail) <= 4 and tail.rstrip("。！？!?～~ ").endswith("的"))
+    ):
+        return hit("R7", VERDICT_REJECT)
+
+    if "R8" in scope and _SEQ_RE.search(head):
+        return hit("R8", VERDICT_REJECT)
 
     # G1 必须在 ACCEPT 之前：「读书很重要」「上课真无聊」不是动作
     if tail.startswith(_EVAL_TAILS) or _EVAL_RE.match(tail):
