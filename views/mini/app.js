@@ -277,7 +277,7 @@
       })();
       // 最近判定：判错了能看见原因，也能一键撤回来
       const logs = (state.decisions || {})[it.umo] || [];
-      const kindName = { event: "事件", away: "离开", return: "回来", sleep: "睡觉", wait: "待睡", stop: "结束" };
+      const kindName = { event: "事件", away: "离开", return: "回来", end: "解除", sleep: "睡觉", wait: "待睡", stop: "结束" };
       const logRows = logs.length
         ? logs.map((d) => {
             const badge = d.action === "llm_yes" ? ["模型确认", "ok"]
@@ -896,7 +896,7 @@
       section: "custom_engine", title: "识别判定", note: "改完立即生效",
       paths: ["enable_utterance_judge", "judge_strict", "enable_gray_review",
               "gray_review_per_hour", "gray_review_per_day", "decision_log_size",
-              "bot_nicknames"],
+              "bot_nicknames", "period_end_keywords"],
     },
     {
       section: "web_panel", title: "面板", note: "改动后需重载插件",

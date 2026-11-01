@@ -110,6 +110,21 @@ BUILTIN_RULES = {
     ],
 }
 
+# 「阶段性结束」：下课 / 放学 / 下班 / 散会 / 收工 / 考完。
+# 命中的意思是「这件事结束了，人该回到你身边了」，和「回到家」不是一回事：
+# 到家要清掉正在做的事，而这个只解除「离开」，别把吃饭/洗澡这类事件一起抹掉。
+PERIOD_END_DEFAULT = ("下课", "放学", "下班", "散会", "收工", "考完")
+# 前面出现这些，说明「还没到点」，不是已经结束。
+END_BLOCKERS = (
+    "快", "马上", "立刻", "立即", "就快", "快要", "就要", "要", "该",
+    "准备", "才", "还有", "还差", "差", "不到", "等", "等到",
+    "再过", "一会儿", "差不多", "赶紧",
+)
+# 后面跟这些才算「已经结束」，否则分不清是结束了还是要结束。
+END_DONE_MARKS = ("了", "啦", "咯", "喽", "哦", "呀", "噢", "噜")
+# 前面有这些也能确认已经结束（「已经下班」「终于考完」）。
+END_DONE_HEADS = ("已经", "终于", "总算", "可算")
+
 
 def extract_message_text(event) -> str:
     """从 AstrBot 事件里提取纯文本。"""
@@ -383,7 +398,7 @@ class EventRuleStore:
             return self._filtered()
         if self._is_future(text, idx):
             return self._filtered()
-        if kind in ("away", "return"):
+        if kind in ("away", "return", "end"):
             if rules.is_far_past_clause(
                 text, idx, kw_len=len(kw),
                 window=self.FUTURE_WINDOW, prev_max=self.FUTURE_PREV_MAX,
@@ -403,7 +418,9 @@ class EventRuleStore:
         elif verdict == utterance.VERDICT_GRAY:
             # 「宁可漏，不要错」：灰区默认不放行；但结束事件例外——
             # 事件一直挂着比误结束更糟，所以 stop 的灰区按放行处理。
-            ok = (not self._judge_strict()) or kind == "stop"
+            # 阶段结束同理：E1/E2 已经挡掉「快/还有/才」这类没到点的说法，
+            # 能走到灰区的基本是「刚下课」这种完成态，放行才符合「解除离开」的意图。
+            ok = (not self._judge_strict()) or kind in ("stop", "end")
         else:
             ok = False
         return {"ok": ok, "verdict": verdict, "rule": d.get("rule", ""), "reason": d.get("reason", "")}
@@ -498,6 +515,63 @@ class EventRuleStore:
     def match_return(self, text: str):
         hit = self.match_return_ex(text)["hit"]
         return hit["kw"] if hit else None
+
+    # ---------------------------------------------------------------- 阶段结束
+    def period_end_keywords(self) -> list[str]:
+        """阶段结束词表。缺键用内置默认；显式配成空列表 = 关闭这个功能。"""
+        raw = self._engine.get("period_end_keywords")
+        if raw is None:
+            return list(PERIOD_END_DEFAULT)
+        return self._split_kw(raw)
+
+    @staticmethod
+    def _end_shape_reject(text: str, idx: int, kw: str):
+        """两道形状检查：这句话像不像「已经结束了」。返回 (rule, reason) 或 None。"""
+        head = rules.clause_head(text, idx, window=14)
+        blocked = next((w for w in END_BLOCKERS if w in head), None)
+        if blocked:
+            return "E1", f"前面是「{blocked}」，说明还没到点"
+        tail_start = idx + len(kw)
+        tail = text[tail_start:rules.clause_end(text, tail_start)]
+        if not tail.strip():
+            return None                                  # 「下课」单独成句
+        if tail[:1] in END_DONE_MARKS:
+            return None                                  # 「下课了」「收工啦」
+        if any(h in head for h in END_DONE_HEADS):
+            return None                                  # 「已经下班」「终于考完」
+        return "E2", "没有「了」，分不出是已经结束还是还没到"
+
+    def match_period_end_ex(self, text: str) -> dict:
+        """判断这句话是不是在说「某件事已经结束了」。
+
+        只作用于「解除离开」这一条链路，所以不复用 _scan_list：
+        这里要先过 E1/E2，否则「快下课」「50 分才下课」都会被放行。
+        """
+        self.reload_if_changed()
+        dropped: list[dict] = []
+        if not text:
+            return {"hit": None, "dropped": dropped}
+        for kw, idx in self._candidates(text, self.period_end_keywords()):
+            shape = self._end_shape_reject(text, idx, kw)
+            if shape:
+                rule, reason = shape
+                dropped.append({
+                    "kind": "end", "kw": kw, "idx": idx,
+                    "verdict": "reject", "rule": rule, "reason": reason,
+                })
+                continue
+            ev = self._evaluate(text, idx, kw, "end")
+            if ev["ok"]:
+                return {
+                    "hit": {
+                        "kw": kw, "idx": idx, "verdict": ev["verdict"],
+                        "gate_rule": ev["rule"], "reason": "阶段结束，解除「离开」",
+                    },
+                    "dropped": dropped,
+                }
+            if ev["verdict"] in ("reject", "gray"):
+                dropped.append(self._drop("end", kw, idx, ev))
+        return {"hit": None, "dropped": dropped}
 
     def stop_detail(self, event: dict, text: str) -> dict:
         """文本是否表示当前事件已结束（带闸门，挡住「吃完了的时候」这类名词化）。"""

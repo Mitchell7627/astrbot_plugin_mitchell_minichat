@@ -85,6 +85,8 @@ _HOT_PATHS = tuple("custom_engine." + k for k in (
     # 谓语闸门：都在 runner 里每次现读，改完立即生效
     "enable_utterance_judge", "judge_strict", "enable_gray_review",
     "gray_review_per_hour", "gray_review_per_day", "decision_log_size",
+    # 阶段结束词：每次判定现读，改完立即生效
+    "period_end_keywords",
 ))
 
 

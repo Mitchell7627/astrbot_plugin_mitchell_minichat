@@ -1324,6 +1324,24 @@ class Runner:
             logger.info(f"{TAG} 回到身边（命中“{return_kw}”）")
             return True
 
+        # 阶段性结束词（下课 / 放学 / 下班 / 散会 / 收工 / 考完）：
+        # 只解除「离开」，不碰事件、不碰「在一起」。
+        # 放回归之后：说「下课了，我回来了」仍按回到身边处理（会清事件）。
+        # 放离开之前：否则「下班了，我先走了」会被 away 词抢先建新的离开状态。
+        away_state = store.get(umo, "away")
+        if isinstance(away_state, dict) and away_state.get("active"):
+            end_ex = self.engine.match_period_end_ex(text)
+            self._note("end", {"hit": end_ex["hit"], "dropped": end_ex["dropped"]})
+            if end_ex["hit"]:
+                store.set(umo, "away", {
+                    "active": False,
+                    "reason": away_state.get("reason") or "",
+                    "keyword": end_ex["hit"]["kw"],
+                    "cleared_at": now,
+                })
+                logger.info(f"{TAG} 阶段性结束（命中「{end_ex['hit']['kw']}」），解除离开")
+                return True
+
         away_ex = self.engine.match_away_ex(text)
         self._note("away", {"hit": away_ex["hit"], "dropped": away_ex["dropped"]})
         away_kw = away_ex["hit"]["kw"] if away_ex["hit"] else None
