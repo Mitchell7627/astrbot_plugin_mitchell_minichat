@@ -408,6 +408,10 @@ class Runner:
                 cand = float(pos["minutes_to_start"]) + float(off)
             else:
                 continue
+            if cand > float(limit) + 1e-6:
+                # 为了对准提醒窗口而把间隔拉到超过「最长间隔」，等于违背用户设定。
+                # 这种情况不干预，交给普通采样（它本身就 ≤ 上限）。
+                continue
             if best is None or cand < best:
                 best = cand
         return best
@@ -821,6 +825,21 @@ class Runner:
         "陪你", "带你", "跟我", "跟我来", "陪我", "带我", "跟你", "结伴",
         "牵手", "牵着", "手牵手", "牵着你", "抱着你", "搂着你", "靠着你",
         "在你旁边", "在你身边", "你旁边", "你身边",
+    )
+    # 这些事只能各进各的门（教室 / 工位 / 诊室），说好「一起」也一起不了。
+    # 命中它们时不再沿用"刚才说好一起"，而要按分开处理。
+    SOLO_SCENES = (
+        "上课", "上学", "上班", "去学校", "去公司", "到学校", "到公司",
+        "开会", "考试", "值班", "面试", "去医院", "去诊所", "看医生", "出差",
+    )
+    # 明确的分离说法：谁先去 / 一个人 / 各走各的。
+    SPLIT_MARKS = (
+        "先去", "先进", "先走", "先回", "自己", "一个人", "单独", "各走", "分头",
+    )
+    # 只报站不说去做什么（「到学校咯」）：一到地方，「在一起」就该断。
+    # 不含「到家」——到家是回到身边，不是离开。
+    ARRIVE_PLACES = (
+        "到学校", "到公司", "到单位", "到教室", "到办公室", "到厂里", "到店里", "到宿舍",
     )
     # 「和/跟/与/同 + 非我」也是"一起"（和宝宝泡澡、跟你出门）。
     # 用结构判断，不写死任何名字，发布版对谁都能用。
@@ -1247,8 +1266,13 @@ class Runner:
         if away_kw:
             # 刚说好「一起」时，接下来省略主语的「出门吧 / 走吧 / 出门了」算一起出门，
             # 不切成"他一个人走了"。带「我」的才算他自己走（「我先出门了」）。
+            # 但「先上课 / 去上班 / 各走各的」这类只能各进各的门，不能沿用"一起"。
+            solo = any(k in text for k in self.SOLO_SCENES) or any(
+                m in text for m in self.SPLIT_MARKS
+            )
             carried = (
-                not self._is_together(text)
+                not solo
+                and not self._is_together(text)
                 and "我" not in text
                 and self._together_alive(umo, now)
             )
@@ -1272,6 +1296,21 @@ class Runner:
                     "cleared_at": None,
                 })
                 logger.info(f"{TAG} 标记不在身边（命中“{away_kw}”）")
+        elif self._together_alive(umo, now) and (
+            arrived := next((p for p in self.ARRIVE_PLACES if p in text), None)
+        ):
+            # 「到学校咯」这种只报站、不说去做什么的句子：人已经在那边了，
+            # 「在一起」必须断掉，否则会一路挂到过期，她还在按"就在你旁边"说话。
+            self._clear_together(umo)
+            store.set(umo, "away", {
+                "active": True,
+                "reason": arrived,
+                "keyword": arrived,
+                "started_at": now,
+                "expires_at": now + float(self.engine_cfg.get("away_ttl_hours", 8.0) or 8.0) * 3600,
+                "cleared_at": None,
+            })
+            logger.info(f"{TAG} 到地方了（「{arrived}」），不再按在身边算")
         elif self._is_together(text) and not self.engine.is_future_text(text) \
                 and not self.engine.is_far_past_text(text):
             # 没有离开词，但这句话明显是「我们在一起」（牵手/抱着/陪你…）：

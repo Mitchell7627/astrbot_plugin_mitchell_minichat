@@ -248,6 +248,7 @@
       // 在场：没记录时默认就是「在身边」（离开要靠关键词命中才会记）
       const awayKw = (((state.config || {}).custom_engine || {}).away_keywords) || [];
       const togetherOn = !!(it.together && it.together.active);
+      const awayOn = !!(it.away && it.away.active);
       const away = it.away
         ? (it.away.active ? "离开：" + (it.away.reason || "—") : (togetherOn ? "在一起" : "在身边"))
         : (togetherOn ? "在一起" : "在身边");
@@ -316,8 +317,12 @@
           <button class="btn sm ghost" data-act="task" data-op="clear-event" data-umo="${esc(it.umo)}">清除事件</button>
           <button class="btn sm ghost" data-act="task" data-op="clear-sleep" data-umo="${esc(it.umo)}">清除睡眠</button>
           ${togetherOn
-            ? `<button class="btn sm ghost" data-act="task" data-op="clear-together" data-umo="${esc(it.umo)}">取消在一起</button>`
+            ? `<button class="btn sm ghost" data-act="task" data-op="clear-together" data-umo="${esc(it.umo)}">取消在一起</button>
+               <button class="btn sm ghost" data-act="task" data-op="away" data-umo="${esc(it.umo)}">设为不在身边</button>`
             : `<button class="btn sm ghost" data-act="task" data-op="together" data-umo="${esc(it.umo)}">设为在一起</button>`}
+          ${!togetherOn && awayOn
+            ? `<button class="btn sm ghost" data-act="task" data-op="clear-away" data-umo="${esc(it.umo)}">回到身边</button>`
+            : ""}
         </div>
         ${logBlock}
       </div>`;
@@ -1243,6 +1248,12 @@
       } else if (op === "clear-together") {
         state.tasks = await api("POST", "tasks/action", { action: "clear_together", umo });
         toast("已取消在一起", "ok");
+      } else if (op === "away") {
+        state.tasks = await api("POST", "tasks/action", { action: "mark_away", umo });
+        toast("已设为不在身边：她不会再说「就在你旁边」", "ok");
+      } else if (op === "clear-away") {
+        state.tasks = await api("POST", "tasks/action", { action: "clear_away", umo });
+        toast("已回到身边", "ok");
       } else if (op === "undo") {
         const id = Number(btn && btn.dataset ? btn.dataset.id : 0);
         state.tasks = await api("POST", "tasks/action", { action: "undo_decision", id });

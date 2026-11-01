@@ -717,6 +717,20 @@ class PanelService:
             runner._touch_together(umo, time.time(), "面板手动")
             self.store.pop(umo, "away")
             self.store.save()
+        elif action == "mark_away":
+            # 手动校正：人确实不在身边（和「设为在一起」对称，方便判错时一键纠正）
+            umo = self._validate_umo(umo)
+            now = time.time()
+            self.store.pop(umo, "together")
+            self.store.set(umo, "away", {
+                "active": True,
+                "reason": str(payload.get("reason") or "面板手动"),
+                "keyword": "",
+                "started_at": now,
+                "expires_at": now + 8.0 * 3600,
+                "cleared_at": None,
+            })
+            self.store.save()
         elif action == "clear_together":
             umo = self._validate_umo(umo)
             self.store.pop(umo, "together")
