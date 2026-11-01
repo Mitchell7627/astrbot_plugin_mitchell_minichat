@@ -44,8 +44,21 @@ from .sleep_reminder import (
 )
 from .splitter import calc_delay, normalize_escapes, split_text
 from .decisions import DecisionLog, clip_text
+from .appointment import (
+    DEFAULT_EVENTS,
+    build_hint as build_appointment_hint,
+    next_delay as appointment_next_delay,
+    parse as parse_appointment,
+    stage_of as appointment_stage,
+)
 
 TAG = "[Minichat]"
+
+APPOINTMENT_KEY = "appointments"
+# 到点后多久还没发出去就放弃（重启/睡眠错过的约定不该在半夜补发）
+APPOINTMENT_GRACE_MINUTES = 20
+# 队列上限：一天说三个时间点够用了，再多就是噪音
+APPOINTMENT_MAX_SLOTS = 3
 
 # 主生成超时：provider 卡死时必须有人把这一轮掐掉，
 # 否则 _firing 永久占用该会话、finally 不执行、后续不再重排。
@@ -109,6 +122,10 @@ class Runner:
             limit=_as_int((plugin.engine_cfg or {}).get("decision_log_size"), 50),
         )
         self._dec_buffer: list[dict] = []
+        # 约定灰度的候选（与事件灰区分开，配额也分开）
+        self._appt_candidate: dict | None = None
+        # 约定灰度独立配额，不吃事件灰度的额度
+        self._appt_gray_calls: list[float] = []
         # 灰区复核（默认开：只对判不准的句子问一次，有小时/日上限兜着，
         # 配置里关掉就退回纯关键词，一句都不问）
         self._gray_candidate: dict | None = None
@@ -177,6 +194,11 @@ class Runner:
             if sleep_delay is not None:
                 delay_minutes = sleep_delay
 
+        # 约定必须无条件压过上面算出来的一切：采样、待睡、重启沿用的旧 next_at
+        appt_delay = self._appointment_next_delay(umo, delay_minutes)
+        if appt_delay is not None:
+            delay_minutes = appt_delay
+
         delay_seconds = max(60.0, float(delay_minutes) * 60.0)
         self.store.set(umo, "next_at", time.time() + delay_seconds)
         self.store.save()
@@ -209,10 +231,40 @@ class Runner:
             except Exception as e:  # 巡检失败不能影响正常发送
                 logger.warning(f"{TAG} 事件过期检查失败: {e}")
 
+    def _sweep_appointments(self, umo: str, now: float) -> bool:
+        """清掉过期和已完成的约定。返回是否有变化。"""
+        items = self._appointments(umo)
+        if not items:
+            return False
+        grace = APPOINTMENT_GRACE_MINUTES * 60
+        kept = []
+        changed = False
+        for item in items:
+            at = _as_float_safe(item.get("at"))
+            stage = str(item.get("stage") or "pending")
+            if stage == "done":
+                if now > at + 2 * 3600:
+                    changed = True
+                    continue
+            elif now > at + grace:
+                logger.info(
+                    f"{TAG} 约定已过期，丢弃：{item.get('time_text')} {item.get('label')}"
+                )
+                changed = True
+                continue
+            kept.append(item)
+        if changed:
+            self._save_appointments(umo, kept)
+        return changed
+
     def _sweep_expired_events(self) -> None:
         now = time.time()
         changed = False
         for umo in self.sessions():
+            if self._sweep_appointments(umo, now):
+                changed = True
+                if self.started:
+                    self.reschedule(umo)
             event = self.store.get(umo, "active_event")
             if not isinstance(event, dict):
                 # 事件已经不在了：留下的事件前快照作废，免得之后误用来"恢复原时间"
@@ -253,6 +305,8 @@ class Runner:
 
     def reschedule_after_message(self, umo: str) -> None:
         """用户说话后的重排：这条消息刚把事件结束掉时，按事件规则决定。"""
+        # 他说话了：到点那一拍算完成，别再补发
+        self._appointment_on_user_reply(umo)
         pre = self.store.get(umo, "pre_event_next_at")
         event = self.store.get(umo, "active_event")
         if pre and not isinstance(event, dict):
@@ -276,6 +330,10 @@ class Runner:
         if base and base - anchor > self.RESTORE_GAP_MINUTES * 60:
             # 原计划还远：插队那一条发完就回到原时间，不重新随机
             delay = max(60.0, base - now)
+            # 这条旁路直接写 next_at，不走 reschedule，约定要在这里单独压一次
+            appt = self._appointment_next_delay(umo, delay / 60.0)
+            if appt is not None:
+                delay = max(60.0, appt * 60.0)
             self.store.set(umo, "next_at", now + delay)
             self.store.save()
             old = self.timers.pop(umo, None)
@@ -615,6 +673,260 @@ class Runner:
             f"{TAG} 加速事件：叠加到 {event.get('label')}，加成 ×{mult}（上限 10），"
             f"有效期缩短至 {int(remaining * shrink / 60)} 分钟"
         )
+        return True
+
+    # ------------------------------------------------------------------
+    # 约定时间点（「我上到十二点」→ 12:00 该开口）
+    # ------------------------------------------------------------------
+    def _appointment_cfg(self) -> dict:
+        eng = self.engine_cfg
+        events = {k: list(v) for k, v in DEFAULT_EVENTS.items()}
+        extra = eng.get("appointment_keywords") or []
+        if isinstance(extra, list):
+            for word in extra:
+                word = str(word).strip()
+                if word and word not in events["end"]:
+                    events["end"].append(word)
+        override = ""
+        if hasattr(self.plugin, "web_override"):
+            override = str(self.plugin.web_override("appointment_hint") or "")
+        return {
+            "enable": bool(eng.get("enable_appointment", True)),
+            "lead_enabled": bool(eng.get("appointment_lead_enabled", True)),
+            "lead_minutes": max(0, _as_int(eng.get("appointment_lead_minutes"), 2)),
+            "merge_minutes": max(0, _as_int(eng.get("appointment_merge_minutes"), 15)),
+            "followup_enabled": bool(eng.get("appointment_followup_enabled", True)),
+            "followup_minutes": max(1, _as_int(eng.get("appointment_followup_minutes"), 8)),
+            "max_followups": max(0, _as_int(eng.get("appointment_max_followups"), 1)),
+            "max_hours": max(1, _as_int(eng.get("appointment_max_hours"), 14)),
+            "max_per_day": max(0, _as_int(eng.get("appointment_max_per_day"), 6)),
+            "grace_minutes": APPOINTMENT_GRACE_MINUTES,
+            "events": events,
+            "hint": override,
+        }
+
+    def _appointments(self, umo: str) -> list:
+        raw = self.store.get(umo, APPOINTMENT_KEY)
+        if not isinstance(raw, list):
+            return []
+        return [dict(x) for x in raw if isinstance(x, dict)]
+
+    def _save_appointments(self, umo: str, items: list) -> None:
+        items = sorted(items, key=lambda x: _as_float_safe(x.get("at")))
+        self.store.set(umo, APPOINTMENT_KEY, items)
+        self.store.save()
+
+    def _next_appointment(self, umo: str, now: float) -> dict | None:
+        """队列里最近一个还没完成的约定。"""
+        grace = APPOINTMENT_GRACE_MINUTES * 60
+        best = None
+        for item in self._appointments(umo):
+            if str(item.get("stage") or "") == "done":
+                continue
+            at = _as_float_safe(item.get("at"))
+            if at <= 0 or now > at + grace:
+                continue
+            if _as_int(item.get("fails"), 0) >= 2:
+                continue
+            if best is None or at < _as_float_safe(best.get("at")):
+                best = item
+        return best
+
+    def _set_appointment(self, umo: str, hit: dict) -> bool:
+        now = time.time()
+        at = _as_float_safe(hit.get("at"))
+        if at <= 0:
+            return False
+        items = [x for x in self._appointments(umo) if str(x.get("stage")) != "done"]
+        for item in items:
+            if abs(_as_float_safe(item.get("at")) - at) < 60:
+                # 同一时刻只留一条：不然一分钟里会开口两次
+                logger.info(f"{TAG} 这个点已经有约定了，跳过：{item.get('time_text')} {item.get('label')}")
+                return False
+        record = {
+            "at": at,
+            "label": str(hit.get("label") or ""),
+            "kind": str(hit.get("kind") or "end"),
+            "time_text": str(hit.get("time_text") or ""),
+            "raw": str(hit.get("raw") or ""),
+            "created_at": now,
+            "stage": "pending",
+            "lead_sent_at": 0,
+            "due_sent_at": 0,
+            "follow_up_at": 0,
+            "follow_ups": 0,
+            "fails": 0,
+            "source": str(hit.get("source") or "kw"),
+        }
+        items.append(record)
+        # 先入队再淘汰：保留离得最近的几条，新来的太远也会被弹掉
+        items.sort(key=lambda x: _as_float_safe(x.get("at")))
+        while len(items) > APPOINTMENT_MAX_SLOTS:
+            dropped = items.pop()
+            logger.info(
+                f"{TAG} 约定队列满了，挤掉最远的一条：{dropped.get('time_text')} {dropped.get('label')}"
+            )
+        self._save_appointments(umo, items)
+        if not any(abs(_as_float_safe(x.get("at")) - at) < 1 for x in items):
+            logger.info(f"{TAG} 新约定比队列里三条都远，没记：{record['time_text']} {record['label']}")
+            return False
+        logger.info(
+            f"{TAG} 记下约定：{record['time_text']} {record['label']}（原话「{record['raw']}」）"
+        )
+        return True
+
+    def _clear_appointment(self, umo: str) -> None:
+        if self.store.get(umo, APPOINTMENT_KEY) is None:
+            return
+        self.store.pop(umo, APPOINTMENT_KEY)
+        self.store.save()
+
+    def _advance_appointment(self, umo: str, shot: str) -> None:
+        """一拍发出去之后推进状态。"""
+        now = time.time()
+        cfg = self._appointment_cfg()
+        items = self._appointments(umo)
+        for item in items:
+            if appointment_stage(item, now, cfg) != shot:
+                continue
+            if shot == "lead":
+                item["stage"] = "lead"
+                item["lead_sent_at"] = now
+            elif shot == "due":
+                item["stage"] = "due"
+                item["due_sent_at"] = now
+                if cfg["followup_enabled"] and cfg["max_followups"] > 0:
+                    item["follow_up_at"] = now + cfg["followup_minutes"] * 60
+                else:
+                    item["follow_up_at"] = 0
+            elif shot == "follow":
+                item["follow_ups"] = _as_int(item.get("follow_ups"), 0) + 1
+                item["follow_up_at"] = 0
+                if item["follow_ups"] >= cfg["max_followups"]:
+                    item["stage"] = "done"
+            break
+        self._save_appointments(umo, items)
+
+    def _appointment_fail(self, umo: str, shot: str) -> None:
+        """生成或发送失败：记一次，连续两次就放弃，别每分钟重试烧钱。"""
+        now = time.time()
+        cfg = self._appointment_cfg()
+        items = self._appointments(umo)
+        for item in items:
+            if appointment_stage(item, now, cfg) != shot:
+                continue
+            item["fails"] = _as_int(item.get("fails"), 0) + 1
+            if item["fails"] >= 2:
+                item["stage"] = "done"
+                logger.warning(
+                    f"{TAG} 约定连续失败，放弃：{item.get('time_text')} {item.get('label')}"
+                )
+            break
+        self._save_appointments(umo, items)
+
+    def _appointment_on_user_reply(self, umo: str) -> None:
+        """他说话了：到点那一拍就算完成，别再补发。"""
+        items = self._appointments(umo)
+        changed = False
+        for item in items:
+            if str(item.get("stage")) == "due":
+                item["stage"] = "done"
+                item["follow_up_at"] = 0
+                changed = True
+        if changed:
+            self._save_appointments(umo, items)
+
+    def _appointment_next_delay(self, umo: str, current_minutes: float):
+        """把下一次触发往约定上靠；None 表示不干预。"""
+        cfg = self._appointment_cfg()
+        if not cfg["enable"]:
+            return None
+        now = time.time()
+        item = self._next_appointment(umo, now)
+        if not item:
+            return None
+        delay = appointment_next_delay(item, now, current_minutes, cfg)
+        if delay is not None and abs(delay - current_minutes) > 0.5:
+            logger.debug(
+                f"{TAG} 约定对准：原排程 {current_minutes:.0f} 分钟 → {delay:.0f} 分钟"
+                f"（{item.get('time_text')} {item.get('label')}）"
+            )
+        return delay
+
+    def appointment_shot(self, umo: str):
+        """这次该按哪一拍走：lead / due / follow / None。"""
+        cfg = self._appointment_cfg()
+        if not cfg["enable"]:
+            return None
+        item = self._next_appointment(umo, time.time())
+        if not item:
+            return None
+        return appointment_stage(item, time.time(), cfg)
+
+    def appointment_hint(self, umo: str, shot: str) -> str:
+        """约定描述 + 原有场景描述。
+
+        必须追加而不是替换：event_hint 里带着「他在不在你这边」，
+        换掉会让他在外面时生成「过来抱抱」这种矛盾的话。
+        """
+        item = self._next_appointment(umo, time.time()) or {}
+        cfg = self._appointment_cfg()
+        template = cfg["hint"] if shot == "due" else ""
+        body = build_appointment_hint(item, shot, datetime.now(), template)
+        scene = self.event_hint(umo)
+        if body and scene:
+            return f"{body}\n{scene}"
+        return body or scene
+
+    def _handle_appointment_words(self, umo: str, text: str) -> bool:
+        """识别约定。返回 True 表示这句话已经处理过，不必再走语义识别。"""
+        cfg = self._appointment_cfg()
+        if not cfg["enable"] or not text or not text.strip():
+            return False
+
+        counter = self.store.get(umo, "appointment_counter") or {}
+        today = datetime.now().strftime("%Y-%m-%d")
+        used = _as_int(counter.get("n"), 0) if counter.get("date") == today else 0
+        if cfg["max_per_day"] and used >= cfg["max_per_day"]:
+            return False
+
+        result = parse_appointment(text, datetime.now(), cfg)
+        for item in result["dropped"]:
+            self._dec_buffer.append({
+                "kind": "appointment",
+                "kw": (result.get("hit") or {}).get("time_text") or text.strip()[:12],
+                "verdict": "reject",
+                "rule": item.get("rule") or "",
+                "reason": item.get("reason") or "",
+            })
+        if result["gray"]:
+            self._dec_buffer.append({
+                "kind": "appointment",
+                "kw": text.strip()[:12],
+                "verdict": "gray",
+                "rule": "A1",
+                "reason": result["gray"].get("reason") or "判不准",
+            })
+            self._appt_candidate = {
+                "text": text.strip(),
+                "snapshot": copy.deepcopy(self.store.get(umo, APPOINTMENT_KEY)),
+            }
+            return False
+
+        hit = result["hit"]
+        if not hit:
+            return False
+        if not self._set_appointment(umo, hit):
+            return False
+        self.store.set(umo, "appointment_counter", {"date": today, "n": used + 1})
+        self._dec_buffer.append({
+            "kind": "appointment",
+            "kw": hit["time_text"],
+            "verdict": "accept",
+            "rule": "A1",
+            "reason": f"约定 {hit['label']}",
+        })
+        self.reschedule(umo)
         return True
 
     # ------------------------------------------------------------------
@@ -974,7 +1286,8 @@ class Runner:
     # ------------------------------------------------------------------
     # 判定记录（面板「最近判定」+ 一键撤销）
     # ------------------------------------------------------------------
-    WATCH_KEYS = ("away", "together", "active_event", "pre_event_next_at", "sleep_state")
+    WATCH_KEYS = ("away", "together", "active_event", "pre_event_next_at",
+                  "sleep_state", "appointments")
 
     def _dec_limit(self) -> int:
         return max(0, _as_int(self.engine_cfg.get("decision_log_size"), 50))
@@ -1267,9 +1580,115 @@ class Runner:
         except Exception as e:
             logger.debug(f"{TAG} 灰区复核后重排失败: {e}")
 
+    # ------------------------------------------------------------------
+    # 约定灰度：判不准的句子问一次模型（独立配额，别和事件灰度抢）
+    # ------------------------------------------------------------------
+    APPOINT_SYS_PROMPT = (
+        "只回答 YES 或 NO，不要解释。\n"
+        "判断这句话里，说话的人是否给出了自己某件事的明确钟点。\n"
+        "YES：他说自己几点会怎样（11:50 下课 / 我上到十二点 / 十点开会）。\n"
+        "NO：问句（你几点下课）、别人的事（他十点下班）、只是提到时间（太晚了）、"
+        "已经过去的事、假设（要是十二点下课）。"
+    )
+
+    def _appt_gray_check(self) -> bool:
+        now = time.time()
+        eng = self.engine_cfg
+        per_hour = _as_int(eng.get("appointment_gray_per_hour"), 4)
+        per_day = _as_int(eng.get("appointment_gray_per_day"), 10)
+        if per_hour <= 0 or per_day <= 0:
+            return False
+        self._appt_gray_calls = [t for t in self._appt_gray_calls if now - t < 86400]
+        if sum(1 for t in self._appt_gray_calls if now - t < 3600) >= per_hour:
+            return False
+        if len(self._appt_gray_calls) >= per_day:
+            return False
+        return True
+
+    def take_appointment_review(self) -> dict | None:
+        """取走约定灰区候选；开关关着或超配额返回 None。"""
+        cand = self._appt_candidate
+        self._appt_candidate = None
+        if not cand or not cand.get("text"):
+            return None
+        if not self._appointment_cfg()["enable"]:
+            return None
+        if not self._appt_gray_check():
+            return None
+        return cand
+
+    async def review_appointment_gray(self, umo: str, cand: dict) -> None:
+        """问一次 YES/NO：说是才落约定，其余一律不记。"""
+        text = str(cand.get("text") or "")
+        if not text or not self._appt_gray_check():
+            return
+        provider = await self._resolve_provider(umo)
+        if provider is None:
+            logger.info(f"{TAG} 约定灰度跳过：没有可用的模型")
+            return
+        self._appt_gray_calls.append(time.time())
+        now = datetime.now()
+        user_prompt = (
+            f"句：{text}\n"
+            f"现在：{now.strftime('%H:%M')} 周{'一二三四五六日'[now.weekday()]}"
+        )
+        try:
+            resp = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=user_prompt, contexts=[], system_prompt=self.APPOINT_SYS_PROMPT
+                ),
+                timeout=GRAY_REVIEW_TIMEOUT_SECONDS,
+            )
+        except Exception as e:
+            logger.debug(f"{TAG} 约定灰度失败: {e!r}")
+            return
+        raw = str(getattr(resp, "completion_text", "") or "").strip().upper()
+        if not raw.startswith("YES"):
+            logger.info(f"{TAG} 约定灰度未采信（{raw[:4] or 'empty'}）：「{text[:16]}」")
+            return
+        if cand.get("snapshot") != self.store.get(umo, APPOINTMENT_KEY):
+            logger.info(f"{TAG} 约定灰度放弃：等模型期间约定已经变了")
+            return
+        result = parse_appointment(text, datetime.now(), self._appointment_cfg(), force=True)
+        hit = result.get("hit")
+        if not hit:
+            logger.info(f"{TAG} 约定灰度答 YES 但落不出时刻：「{text[:16]}」")
+            return
+        before = self._snapshot(umo)
+        if not self._set_appointment(umo, hit):
+            return
+        after = self._snapshot(umo)
+        touched = [
+            {"key": k, "before": before.get(k), "after": after.get(k)}
+            for k in self.WATCH_KEYS if before.get(k) != after.get(k)
+        ]
+        rec = {
+            "id": round(time.time(), 3),
+            "ts": time.time(),
+            "umo": umo,
+            "kind": "appointment",
+            "kw": hit["time_text"],
+            "verdict": "gray",
+            "rule": "A1",
+            "reason": "拿不准，模型说是",
+            "action": "llm_yes",
+            "source": "gray_llm",
+            "text": clip_text(text),
+            "text_len": len(text),
+            "touched": touched,
+            "undo_state": "available" if touched else "none",
+        }
+        self.decisions.limit = self._dec_limit()
+        self.decisions.add(rec)
+        self.decisions.maybe_save(0)
+        logger.info(f"{TAG} 约定灰区采信：「{text[:16]}」→ {hit['time_text']} {hit['label']}")
+        try:
+            self.reschedule(umo)
+        except Exception as e:
+            logger.debug(f"{TAG} 约定灰度后重排失败: {e}")
+
     def update_from_message(self, umo: str, text: str) -> bool:
         """根据消息更新事件与在场状态。返回 False 表示什么都没认出。
-
         外层只做两件事：进门前拍快照、出门后落判定记录（含一键撤销要用的 before/after）。
         真正的判定顺序在 `_update_inner`，一行没动。
         """
@@ -1296,6 +1715,9 @@ class Runner:
 
         # 用户说话了：若之前处于 sleeping，只有明确说「醒了」才解除免打扰
         self._wake_if_sleeping(umo, text)
+
+        # 约定时间点：独立于事件开关（说了「上到十二点」就该记住）
+        appt_hit = self._handle_appointment_words(umo, text)
 
         if not bool(self.engine_cfg.get("enable_event", True)):
             return True
@@ -1458,7 +1880,8 @@ class Runner:
         self._note("event", {"hit": md if md.get("rule") else None, "dropped": md.get("dropped") or []})
         rule = md["rule"]
         if rule is None:
-            return False
+            # 约定命中过就不必再问模型了
+            return bool(appt_hit)
 
         if isinstance(event, dict) and event.get("name") == rule.get("name"):
             ttl = self.engine.ttl_for(rule)
@@ -1719,23 +2142,38 @@ class Runner:
             # 待睡提醒先判定：它每晚最多一条，不受「连续未回复」上限影响，
             # 否则你整晚没回消息时，最该催睡觉的那条反而被拦掉。
             reminding = self.should_remind_sleep(umo)
+            # 约定优先：同一时刻只发一条，别和催睡抢
+            shot = self.appointment_shot(umo)
+            if shot:
+                reminding = False
 
             limit = int(schedule.get("max_unanswered_times", 3) or 0)
             unanswered = int(self.store.get(umo, "unanswered", 0) or 0)
-            if limit > 0 and unanswered >= limit and not reminding:
+            # 到点和补发必须绕过上限：它们是"说好的事"，被拦掉就失去意义
+            bypass = reminding or shot in ("due", "follow")
+            if limit > 0 and unanswered >= limit and not bypass:
                 logger.info(f"{TAG} 连续 {unanswered} 条未回复，暂停直到你说话")
                 reschedule_needed = False
                 return
 
             # 待睡提醒：这次触发是「该睡了」的提醒，不是普通主动消息
-            text = await self._generate(umo, reminder=reminding)
+            text = await self._generate(umo, reminder=reminding, appointment=shot)
             if not text:
                 logger.info(f"{TAG} 生成为空，重新排程")
+                if shot:
+                    # 别让它每分钟重试：连续两次失败就放弃这条约定
+                    self._appointment_fail(umo, shot)
                 return
 
             ok = await self._send_split(umo, text)
             if ok:
-                if reminding:
+                if shot:
+                    self._advance_appointment(umo, shot)
+                    count = self.store.bump_unanswered(umo)
+                    logger.info(
+                        f"{TAG} 已发送约定（{shot}），当前未回复计数 {count}"
+                    )
+                elif reminding:
                     self.mark_sleep_reminded(umo)
                     logger.info(f"{TAG} 已发送睡眠提醒")
                 else:
@@ -1744,6 +2182,8 @@ class Runner:
                 self.store.save()
                 # 把主动消息写回会话历史，避免她下一条「接更早的话」而不是接你的回复
                 await self._append_assistant_history(umo, text)
+            elif shot:
+                self._appointment_fail(umo, shot)
         except Exception as e:
             logger.error(f"{TAG} 发送流程异常: {e}")
         finally:
@@ -1751,7 +2191,7 @@ class Runner:
             if self.started and reschedule_needed:
                 self._finish_cycle(umo)
 
-    async def _generate(self, umo: str, reminder: bool = False) -> str:
+    async def _generate(self, umo: str, reminder: bool = False, appointment: str | None = None) -> str:
         cfg = self.cfg
         settings = self._context_settings()
         mode = settings["source_mode"]
@@ -1784,7 +2224,12 @@ class Runner:
             return ""
 
         unanswered = int(self.store.get(umo, "unanswered", 0) or 0)
-        hint = self.reminder_hint(umo) if reminder else self.event_hint(umo)
+        if appointment:
+            hint = self.appointment_hint(umo, appointment)
+        elif reminder:
+            hint = self.reminder_hint(umo)
+        else:
+            hint = self.event_hint(umo)
         prompt = (
             template.replace("{{current_time}}", time_text())
             .replace("{{unanswered_count}}", str(unanswered))

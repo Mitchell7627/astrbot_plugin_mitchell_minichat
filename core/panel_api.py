@@ -66,6 +66,15 @@ _LIMITS: dict[tuple[str, str], tuple[float, float, type]] = {
     ("custom_engine", "gray_review_per_hour"): (0, 60, int),
     ("custom_engine", "gray_review_per_day"): (0, 300, int),
     ("custom_engine", "decision_log_size"): (0, 200, int),
+    # 约定到点提醒
+    ("custom_engine", "appointment_lead_minutes"): (0, 15, int),
+    ("custom_engine", "appointment_merge_minutes"): (5, 60, int),
+    ("custom_engine", "appointment_followup_minutes"): (3, 30, int),
+    ("custom_engine", "appointment_max_followups"): (0, 2, int),
+    ("custom_engine", "appointment_max_hours"): (1, 24, int),
+    ("custom_engine", "appointment_max_per_day"): (0, 20, int),
+    ("custom_engine", "appointment_gray_per_hour"): (0, 20, int),
+    ("custom_engine", "appointment_gray_per_day"): (0, 100, int),
 }
 
 # 这些键只影响面板显示，不参与 need_reload 判定
@@ -87,6 +96,12 @@ _HOT_PATHS = tuple("custom_engine." + k for k in (
     "gray_review_per_hour", "gray_review_per_day", "decision_log_size",
     # 阶段结束词：每次判定现读，改完立即生效
     "period_end_keywords",
+    # 约定到点提醒：调度每轮现读
+    "enable_appointment", "appointment_lead_enabled", "appointment_lead_minutes",
+    "appointment_merge_minutes", "appointment_followup_enabled",
+    "appointment_followup_minutes", "appointment_max_followups",
+    "appointment_max_hours", "appointment_max_per_day", "appointment_keywords",
+    "appointment_gray_per_hour", "appointment_gray_per_day",
 ))
 
 
@@ -265,6 +280,31 @@ class PanelService:
     # ------------------------------------------------------------------
     # 状态与任务
     # ------------------------------------------------------------------
+    def _appointment_view(self, runner, umo: str):
+        """任务卡上的「约定」那一格：最近一条未完成的。"""
+        if runner is None:
+            return None
+        try:
+            item = runner._next_appointment(umo, time.time())
+            if not isinstance(item, dict) or not item.get("at"):
+                return None
+            cfg = runner._appointment_cfg()
+            return {
+                "at": item.get("at"),
+                "label": item.get("label"),
+                "time_text": item.get("time_text"),
+                "kind": item.get("kind"),
+                "stage": item.get("stage"),
+                "raw": item.get("raw"),
+                "lead_at": float(item["at"]) - cfg["lead_minutes"] * 60,
+                "follow_up_at": item.get("follow_up_at") or None,
+                "follow_ups": _as_int(item.get("follow_ups"), 0),
+                "source": item.get("source"),
+                "pending": len(runner._appointments(umo)),
+            }
+        except Exception:
+            return None
+
     def _task_item(self, umo: str) -> dict:
         now = time.time()
         state = self.store.data.get(umo, {}) or {}
@@ -340,6 +380,7 @@ class PanelService:
                 "until": state["together"].get("until"),
             },
             "sleep": sleep,
+            "appointment": self._appointment_view(runner, umo),
         }
 
     def status(self) -> dict:
@@ -377,6 +418,7 @@ class PanelService:
                 "events": sum(1 for t in tasks if t["event"]),
                 "away": sum(1 for t in tasks if t["away"] and t["away"].get("active")),
                 "unanswered": sum(t["unanswered"] for t in tasks),
+                "appointments": sum(1 for t in tasks if t.get("appointment")),
             },
             "inflight": sorted(self._inflight.keys()),
             "last_reload": dict(self._last_reload),
@@ -714,6 +756,14 @@ class PanelService:
             umo = self._validate_umo(umo)
             self.store.pop(umo, "sleep_state")
             self.store.save()
+        elif action == "clear_appointment":
+            umo = self._validate_umo(umo)
+            self.store.pop(umo, "appointments")
+            self.store.pop(umo, "appointment_counter")
+            self.store.save()
+            runner = getattr(self.plugin, "runner", None)
+            if runner is not None and runner.started:
+                runner.reschedule(umo)
         elif action == "mark_together":
             umo = self._validate_umo(umo)
             runner = self._require_runner()
@@ -1066,6 +1116,11 @@ class PanelService:
                     "催他一句该睡了，语气要像在意的黏人，别冷冰冰地下命令；"
                     "可以提一下时间晚了、明天还要早起之类的由头。"
                 ),
+                "appointment_hint": (
+                    "现在 {{time}}，到 {{time_text}} 了。他之前说「{{raw}}」。"
+                    "按这件事已经发生来接话——别问「{{label}}了吗」，"
+                    "直接当成已经结束，说眼前的事。"
+                ),
             },
         }
 
@@ -1075,7 +1130,7 @@ class PanelService:
         if not isinstance(patch, dict):
             raise PanelError("E_BAD_REQUEST", "缺少 overrides")
         # 只允许写入已知的两个键，避免塞进任意东西
-        allowed = {"classify_sys_prompt", "reminder_hint"}
+        allowed = {"classify_sys_prompt", "reminder_hint", "appointment_hint"}
         cleaned = {k: str(v) for k, v in patch.items() if k in allowed and isinstance(v, str)}
         self.plugin.set_web_overrides(cleaned)
         return {"saved": True, "overrides": self.plugin.web_overrides_all()}

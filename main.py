@@ -22,7 +22,7 @@ from .core.store import Store
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.1.6"
+VERSION = "v0.1.7"
 
 
 class ProactiveMiniPlugin(star.Star):
@@ -226,3 +226,15 @@ class ProactiveMiniPlugin(star.Star):
                     task.add_done_callback(self._bg_tasks.discard)
                 except Exception as e:
                     logger.debug(f"{TAG} 灰区复核任务创建失败: {e}")
+
+        # 约定灰度与上面两条并列：模糊句（「快十二点下课」「还有十分钟」）才走到这里
+        appt_gray = self.runner.take_appointment_review()
+        if appt_gray:
+            try:
+                task = asyncio.create_task(
+                    self.runner.review_appointment_gray(umo, appt_gray)
+                )
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+            except Exception as e:
+                logger.debug(f"{TAG} 约定灰度任务创建失败: {e}")

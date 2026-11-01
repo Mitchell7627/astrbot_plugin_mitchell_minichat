@@ -275,9 +275,25 @@
         }
         return "—";
       })();
+      const appointment = (() => {
+        const a = it.appointment;
+        if (!a || !a.at) return "—";
+        const time = a.time_text || L.fmtClock(a.at);
+        const name = a.label || "";
+        const more = a.pending > 1 ? ` · 另有 ${a.pending - 1} 个` : "";
+        if (a.stage === "due" && a.follow_up_at) {
+          return `${time} ${name} · 到点了，${L.fmtClock(a.follow_up_at)} 没回就补一句${more}`;
+        }
+        if (a.stage === "lead") return `${time} ${name} · 已提前说过${more}`;
+        if (a.stage === "due") return `${time} ${name} · 已到点${more}`;
+        return `${time} ${name} · 还有 ${L.fmtDuration(a.at - Date.now() / 1000)}${more}`;
+      })();
+      const appointmentTitle = it.appointment && it.appointment.raw
+        ? `从「${it.appointment.raw}」认出来的；点下面的「清除约定」可以删掉`
+        : "他说了「我上到十二点」这类话才会出现";
       // 最近判定：判错了能看见原因，也能一键撤回来
       const logs = (state.decisions || {})[it.umo] || [];
-      const kindName = { event: "事件", away: "离开", return: "回来", end: "解除", sleep: "睡觉", wait: "待睡", stop: "结束" };
+      const kindName = { event: "事件", away: "离开", return: "回来", end: "解除", sleep: "睡觉", wait: "待睡", stop: "结束", appointment: "约定" };
       const logRows = logs.length
         ? logs.map((d) => {
             const badge = d.action === "llm_yes" ? ["模型确认", "ok"]
@@ -313,6 +329,7 @@
           <div><div class="k">当前事件</div><div class="v" title="${esc(eventTitle)}">${esc(event)}</div></div>
           <div><div class="k">在场</div><div class="v" title="${esc(awayTitle)}">${esc(away)}</div></div>
           <div><div class="k">睡眠</div><div class="v">${esc(sleep)}</div></div>
+          <div><div class="k">约定</div><div class="v" title="${esc(appointmentTitle)}">${esc(appointment)}</div></div>
         </div>
         <div class="task-actions">
           <button class="btn sm ghost" data-act="task" data-op="preview" data-umo="${esc(it.umo)}">生成预览</button>
@@ -321,6 +338,7 @@
           <button class="btn sm ghost" data-act="task" data-op="reset" data-umo="${esc(it.umo)}">重置计数</button>
           <button class="btn sm ghost" data-act="task" data-op="clear-event" data-umo="${esc(it.umo)}">清除事件</button>
           <button class="btn sm ghost" data-act="task" data-op="clear-sleep" data-umo="${esc(it.umo)}">清除睡眠</button>
+          <button class="btn sm ghost" data-act="task" data-op="clear-appointment" data-umo="${esc(it.umo)}">清除约定</button>
           ${togetherOn
             ? `<button class="btn sm ghost" data-act="task" data-op="clear-together" data-umo="${esc(it.umo)}">取消在一起</button>
                <button class="btn sm ghost" data-act="task" data-op="away" data-umo="${esc(it.umo)}">设为不在身边</button>`
@@ -870,6 +888,20 @@
       ],
     },
     {
+      section: "custom_engine", title: "约定到点提醒",
+      note: "他说「我上到十二点」就记下来；改完立即生效，不用重启",
+      paths: [
+        "enable_appointment",
+        "appointment_lead_enabled", "appointment_lead_minutes",
+        "appointment_merge_minutes",
+        "appointment_followup_enabled", "appointment_followup_minutes",
+        "appointment_max_followups",
+        "appointment_max_hours", "appointment_max_per_day",
+        "appointment_keywords",
+        "appointment_gray_per_hour", "appointment_gray_per_day",
+      ],
+    },
+    {
       section: "friend_settings", title: "分段发送", note: "保存后立即生效",
       paths: [
         "segmented_reply_settings.enable", "segmented_reply_settings.enable_smart_split",
@@ -1088,6 +1120,11 @@
             <textarea class="input" id="ov-reminder" rows="4" placeholder="支持 {{time}} 占位符（当前时间）"></textarea>
             <span class="hint">触发「该睡了」提醒时给模型的场景提示。支持 {{time}}。</span>
           </div>
+          <div class="field span2">
+            <div class="field-label-row"><label>约定到点话术</label><button class="btn ghost sm" data-act="overrides-reset-one" data-field="appointment_hint">重置</button></div>
+            <textarea class="input" id="ov-appointment" rows="4" placeholder="支持 {{time}} {{time_text}} {{label}} {{raw}} 占位符"></textarea>
+            <span class="hint">到点那一刻给模型的场景提示。支持 {{time}}、{{time_text}}（12:00）、{{label}}、{{raw}}（原话）。</span>
+          </div>
         </div>
         <div class="row gap8" style="margin-top:12px">
           <button class="btn sm" data-act="overrides-save">保存提示词</button>
@@ -1113,6 +1150,7 @@
       // 未自定义时显示内置默认内容（可读可改），保存后即为覆盖值
       $("#ov-classify").value = ov.classify_sys_prompt || dfl.classify_sys_prompt || "";
       $("#ov-reminder").value = ov.reminder_hint || dfl.reminder_hint || "";
+      $("#ov-appointment").value = ov.appointment_hint || dfl.appointment_hint || "";
     } catch (e) {
       // 接口不可用时静默，不影响其它配置
     }
@@ -1122,8 +1160,13 @@
     await withBusy(btn, async () => {
       const classify = $("#ov-classify").value;
       const reminder = $("#ov-reminder").value;
+      const appointment = $("#ov-appointment").value;
       await api("POST", "overrides/save", {
-        overrides: { classify_sys_prompt: classify, reminder_hint: reminder },
+        overrides: {
+          classify_sys_prompt: classify,
+          reminder_hint: reminder,
+          appointment_hint: appointment,
+        },
       });
       toast("提示词已保存，立即生效", "ok");
     }).catch(showErr);
@@ -1135,6 +1178,8 @@
       $("#ov-classify").value = dfl.classify_sys_prompt || "";
     } else if (field === "reminder_hint") {
       $("#ov-reminder").value = dfl.reminder_hint || "";
+    } else if (field === "appointment_hint") {
+      $("#ov-appointment").value = dfl.appointment_hint || "";
     }
   }
 
@@ -1248,6 +1293,9 @@
       } else if (op === "clear-sleep") {
         state.tasks = await api("POST", "tasks/action", { action: "clear_sleep", umo });
         toast("已清除睡眠状态", "ok");
+      } else if (op === "clear-appointment") {
+        state.tasks = await api("POST", "tasks/action", { action: "clear_appointment", umo });
+        toast("已清除约定", "ok");
       } else if (op === "together") {
         state.tasks = await api("POST", "tasks/action", { action: "mark_together", umo });
         toast("已设为「在一起」：提示词按「就在旁边」生成", "ok");

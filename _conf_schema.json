@@ -606,6 +606,97 @@
                     "enable_return_soon": true
                 }
             },
+            "enable_appointment": {
+                "description": "约定到点提醒",
+                "hint": "他说「我上到十二点」「11:50 下课」，到点就主动开口。关掉后完全不识别。",
+                "type": "bool",
+                "default": true
+            },
+            "appointment_lead_enabled": {
+                "description": "提前一句",
+                "hint": "到点前先轻轻提一句「快到点了」。关掉就只在到点那一刻开口。",
+                "type": "bool",
+                "default": true,
+                "condition": {"enable_appointment": true}
+            },
+            "appointment_lead_minutes": {
+                "description": "提前几分钟",
+                "hint": "提前多少分钟说那句「快到点了」。",
+                "type": "int",
+                "default": 2,
+                "slider": {"min": 0, "max": 15, "step": 1},
+                "condition": {"enable_appointment": true, "appointment_lead_enabled": true}
+            },
+            "appointment_merge_minutes": {
+                "description": "合并窗口",
+                "hint": "本来就要发的主动消息如果落在这段时间里，就直接变成提前那一句，不多花一次调用。调小更省。",
+                "type": "int",
+                "default": 15,
+                "slider": {"min": 5, "max": 60, "step": 5},
+                "condition": {"enable_appointment": true}
+            },
+            "appointment_followup_enabled": {
+                "description": "没回再补一句",
+                "hint": "到点那条发出去他还没回，过一会儿再轻声接一句。",
+                "type": "bool",
+                "default": true,
+                "condition": {"enable_appointment": true}
+            },
+            "appointment_followup_minutes": {
+                "description": "多久后补",
+                "hint": "到点后多少分钟还没回就补一句。",
+                "type": "int",
+                "default": 8,
+                "slider": {"min": 3, "max": 30, "step": 1},
+                "condition": {"enable_appointment": true, "appointment_followup_enabled": true}
+            },
+            "appointment_max_followups": {
+                "description": "最多补几次",
+                "hint": "0 表示不补。",
+                "type": "int",
+                "default": 1,
+                "slider": {"min": 0, "max": 2, "step": 1},
+                "condition": {"enable_appointment": true, "appointment_followup_enabled": true}
+            },
+            "appointment_max_hours": {
+                "description": "最远认多久",
+                "hint": "超过这么多小时的时间点不认（「明天九点」本来就该被将来时挡掉）。",
+                "type": "int",
+                "default": 14,
+                "slider": {"min": 1, "max": 24, "step": 1},
+                "condition": {"enable_appointment": true}
+            },
+            "appointment_max_per_day": {
+                "description": "一天最多记几个",
+                "hint": "防止刷屏。0 表示不限。",
+                "type": "int",
+                "default": 6,
+                "slider": {"min": 0, "max": 20, "step": 1},
+                "condition": {"enable_appointment": true}
+            },
+            "appointment_keywords": {
+                "description": "额外的事件词",
+                "hint": "内置了「下课 / 下班 / 到家 / 开会」这些，这里可以补你自己的说法。",
+                "type": "list",
+                "default": [],
+                "condition": {"enable_appointment": true}
+            },
+            "appointment_gray_per_hour": {
+                "description": "模糊句复核（每小时）",
+                "hint": "「快十二点下课」这类判不准的句子，问一次模型。独立配额，不占事件复核的名额。",
+                "type": "int",
+                "default": 4,
+                "slider": {"min": 0, "max": 20, "step": 1},
+                "condition": {"enable_appointment": true}
+            },
+            "appointment_gray_per_day": {
+                "description": "模糊句复核（每天）",
+                "hint": "同上，一天的总上限。",
+                "type": "int",
+                "default": 10,
+                "slider": {"min": 0, "max": 100, "step": 1},
+                "condition": {"enable_appointment": true}
+            },
             "enable_sleep_reminder": {
                 "description": "晚睡提醒",
                 "hint": "管晚睡窗口和「等会再睡」。说「晚安」的免打扰不受这里管。",
