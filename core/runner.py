@@ -51,6 +51,10 @@ TAG = "[Minichat]"
 # 否则 _firing 永久占用该会话、finally 不执行、后续不再重排。
 GENERATE_TIMEOUT_SECONDS = 120
 
+# 灰区复核超时：输入多了最近两句上下文，给慢一点的 provider 留点余量；
+# 输出仍是 YES / NO 两个字母，不需要长。
+GRAY_REVIEW_TIMEOUT_SECONDS = 4.0
+
 
 def _as_int(value, default: int) -> int:
     """把配置值转成整数；只有 None 或非法值才用默认值，避免把显式的 0 吞掉。"""
@@ -105,7 +109,8 @@ class Runner:
             limit=_as_int((plugin.engine_cfg or {}).get("decision_log_size"), 50),
         )
         self._dec_buffer: list[dict] = []
-        # 灰区复核（默认关得更省 token；开了也有小时/日上限兜着）
+        # 灰区复核（默认开：只对判不准的句子问一次，有小时/日上限兜着，
+        # 配置里关掉就退回纯关键词，一句都不问）
         self._gray_candidate: dict | None = None
         self._gray_calls: list[float] = []
 
@@ -1002,11 +1007,28 @@ class Runner:
         self.decisions.limit = self._dec_limit()
         # 灰区里「G2 兜底 / 事件类」才值得问一次模型；
         # G1（后面接评价）是结构性灰区，问也是浪费 token。
+        # 本句已经确认了事件的话就别再问：模型答 YES 会把刚记下的事件覆盖掉。
+        has_accept_event = any(
+            d.get("verdict") == "accept" and d.get("kind") == "event" for d in buf
+        )
         self._gray_candidate = None
         for d in buf:
-            if d.get("verdict") == "gray" and d.get("rule") == "G2" and d.get("kind") == "event":
-                self._gray_candidate = {"text": text, "kw": d["kw"], "name": d.get("name") or ""}
+            if (
+                d.get("verdict") == "gray"
+                and d.get("rule") == "G2"
+                and d.get("kind") == "event"
+                and not has_accept_event
+            ):
+                self._gray_candidate = {
+                    "text": text,
+                    "kw": d["kw"],
+                    "name": d.get("name") or "",
+                    # 记下此刻的事件快照：等模型回来时对一下，变了就别写回去
+                    "event_at_flush": copy.deepcopy(self.store.get(umo, "active_event")),
+                }
                 break
+        if has_accept_event:
+            logger.debug(f"{TAG} 本句已确认事件，跳过灰区复核")
         after = self._snapshot(umo)
         touched = [
             {"key": k, "before": before.get(k), "after": after.get(k)}
@@ -1085,7 +1107,8 @@ class Runner:
         "    （讨厌上课 / 睡觉时间被补课占了 / 没人喜欢上课 / 他睡了 / 明天上课 / 上课了吗）。"
     )
 
-    def _gray_budget_ok(self) -> bool:
+    def _gray_check(self) -> bool:
+        """只查配额，不占用额度。"""
         now = time.time()
         eng = self.engine_cfg
         per_hour = _as_int(eng.get("gray_review_per_hour"), 6)
@@ -1097,7 +1120,17 @@ class Runner:
             return False
         if len(self._gray_calls) >= per_day:
             return False
-        self._gray_calls.append(now)
+        return True
+
+    def _gray_note(self) -> None:
+        """记一次真实调用（只有真发请求才记，别让报错也白扣额度）。"""
+        self._gray_calls.append(time.time())
+
+    def _gray_budget_ok(self) -> bool:
+        """检查并占用一次额度（保留旧语义，既有调用方与测试依赖）。"""
+        if not self._gray_check():
+            return False
+        self._gray_note()
         return True
 
     def take_gray_review(self) -> dict | None:
@@ -1108,7 +1141,8 @@ class Runner:
             return None
         if not bool(self.engine_cfg.get("enable_gray_review", True)):
             return None
-        if not self._gray_budget_ok():
+        # 这里只查不占：真正扣额度留到确实要发请求的时候
+        if not self._gray_check():
             return None
         return cand
 
@@ -1125,18 +1159,29 @@ class Runner:
             return None
         return provider
 
-    async def _verify_use(self, umo: str, text: str, kw: str) -> str:
-        """问一次极短 YES/NO。返回 yes / no / error。"""
-        provider = await self._resolve_provider(umo)
+    async def _verify_use(
+        self, umo: str, text: str, kw: str, dialogue: str = "", provider=None
+    ) -> str:
+        """问一次极短 YES/NO。返回 yes / no / error。
+
+        dialogue 非空时带上最近两句：只给「词 + 句」的话，「（上文在炒菜）做好咯」
+        这种根本判不了。
+        """
+        if provider is None:
+            provider = await self._resolve_provider(umo)
         if provider is None:
             return "error"
-        user_prompt = f"词：{kw}\n句：{text}"
+        ctx = str(dialogue or "").strip()
+        if ctx:
+            user_prompt = f"上文：\n{ctx}\n\n词：{kw}\n\n句：{text}"
+        else:
+            user_prompt = f"词：{kw}\n句：{text}"
         try:
             resp = await asyncio.wait_for(
                 provider.text_chat(
                     prompt=user_prompt, contexts=[], system_prompt=self.JUDGE_SYS_PROMPT
                 ),
-                timeout=3.5,
+                timeout=GRAY_REVIEW_TIMEOUT_SECONDS,
             )
         except Exception as e:
             logger.debug(f"{TAG} 灰区复核失败: {e!r}")
@@ -1153,12 +1198,34 @@ class Runner:
         text = str(cand.get("text") or "")
         kw = str(cand.get("kw") or "")
         name = str(cand.get("name") or "")
-        verdict = await self._verify_use(umo, text, kw)
         rule = self.engine.get_rule(name) if name else None
-        if verdict != "yes" or rule is None:
+        if rule is None:
+            return
+        provider = await self._resolve_provider(umo)
+        if provider is None:
+            logger.info(f"{TAG} 灰区跳过：没有可用的模型")
+            return
+        if not self._gray_check():
+            logger.info(f"{TAG} 灰区跳过：配额已用完")
+            return
+        # 到这里才真的要发请求，这时才占一次额度
+        self._gray_note()
+        dialogue = await self._recent_dialogue(umo, limit=2, skip=text)
+        verdict = await self._verify_use(
+            umo, text, kw, dialogue=dialogue, provider=provider
+        )
+        if verdict != "yes":
             logger.info(
                 f"{TAG} 灰区未采信（{verdict}）：「{text[:16]}」命中「{kw}」"
             )
+            return
+        # 等模型的这几秒里，状态可能被别的消息改了（上一条的语义识别是异步的）。
+        # 这时候再按这条判定写回去，就会覆盖更新的状态。
+        if (
+            "event_at_flush" in cand
+            and cand.get("event_at_flush") != self.store.get(umo, "active_event")
+        ):
+            logger.info(f"{TAG} 灰区放弃：等模型期间事件已经变了（「{text[:16]}」）")
             return
         before = self._snapshot(umo)
         self._set_event(umo, rule, "灰区:" + name, source_text=text)
@@ -1311,6 +1378,29 @@ class Runner:
                 "cleared_at": None,
             })
             logger.info(f"{TAG} 到地方了（「{arrived}」），不再按在身边算")
+        elif self._together_alive(umo, now) and (
+            solo_hit := (next((k for k in self.SOLO_SCENES if k in text), None)
+                         or next((m for m in self.SPLIT_MARKS if m in text), None))
+        ):
+            # 没命中离开词，但说的是「各自进门 / 分头走」（开会去了、各走各的）。
+            # 以前这两张词表只在离开词分支里查，这类句子根本走不到，
+            # 「在一起」就一直挂到过期，话术还按「人就在旁边」写。
+            self._clear_together(umo)
+            # 说了「去 / 到 / 出门 / 过去 / 走」才当离开处理；
+            # 「开会呢」可能人在家开视频会，只断状态不硬判离开，
+            # 免得在家待着却被标成 8 小时不在。
+            if any(v in text for v in ("去", "到", "出门", "过去", "走")):
+                store.set(umo, "away", {
+                    "active": True,
+                    "reason": solo_hit,
+                    "keyword": solo_hit,
+                    "started_at": now,
+                    "expires_at": now + float(self.engine_cfg.get("away_ttl_hours", 8.0) or 8.0) * 3600,
+                    "cleared_at": None,
+                })
+                logger.info(f"{TAG} 「{solo_hit}」是各走各的，标记不在身边")
+            else:
+                logger.info(f"{TAG} 「{solo_hit}」是各走各的，不再按在身边算")
         elif self._is_together(text) and not self.engine.is_future_text(text) \
                 and not self.engine.is_far_past_text(text):
             # 没有离开词，但这句话明显是「我们在一起」（牵手/抱着/陪你…）：
@@ -1740,6 +1830,9 @@ class Runner:
             "window_count": max(2, _as_int(conf.get("context_window_count"), 40)),
             "window_hours": max(1, _as_int(conf.get("context_window_hours"), 12)),
             "window_min": max(0, _as_int(conf.get("context_window_min_messages"), 8)),
+            # 历史硬上限：不管窗口开没开，都只带最近这么多条。
+            # 0 = 不限（旧行为），默认 120 防止聊天攒几千条时把上下文塞爆。
+            "history_cap": max(0, _as_int(conf.get("history_hard_limit"), 120)),
         }
 
     # ------------------------------------------------------------------
@@ -1871,6 +1964,11 @@ class Runner:
         drop_images = not settings["include_images"]
         drop_think = not settings["include_think"]
 
+        # 先砍硬上限，再走窗口。顺序不能反：_trim_window 的「至少保留」
+        # 会把上限顶穿，那样这个上限就不硬了。
+        cap = max(0, _as_int(settings.get("history_cap"), 0))
+        if cap and len(out) > cap:
+            out = out[-cap:]
         if settings["window_enabled"]:
             out = self._trim_window(out, self._fill_times(out), settings)
         if drop_images or drop_think:
@@ -1883,7 +1981,8 @@ class Runner:
         if len(out) != before:
             logger.info(
                 f"{TAG} 上下文裁剪 {before} → {len(out)} 条"
-                f"（窗口={'开' if settings['window_enabled'] else '关'}，"
+                f"（上限={'关' if not cap else cap}，"
+                f"窗口={'开' if settings['window_enabled'] else '关'}，"
                 f"图片={'剔' if drop_images else '留'}，"
                 f"思考={'剔' if drop_think else '留'}）"
             )
@@ -2034,17 +2133,29 @@ class Runner:
             return " ".join(parts)
         return ""
 
-    async def _recent_dialogue(self, umo: str, limit: int = 6) -> str:
+    async def _recent_dialogue(self, umo: str, limit: int = 6, skip: str = "") -> str:
+        """取最近几轮对话，给判定当锚点。
+
+        skip：当前这句多半已经被写进会话历史了，如果它就是最后一条，去掉它，
+        免得「上文」和「句」重复，模型会以为他在重复自己。
+        """
         history = await self._load_history(umo)
-        lines = []
-        for item in history[-limit:]:
+        rows = []
+        for item in history:
             if not isinstance(item, dict):
                 continue
             body = self._plain_content(item.get("content")).strip().replace("\n", " ")
             if not body:
                 continue
-            who = "她" if item.get("role") == "assistant" else "他"
-            lines.append(f"{who}：{body[:60]}")
+            rows.append((item.get("role"), body))
+        tail = str(skip or "").strip()
+        if tail and rows and rows[-1][1] == tail:
+            rows = rows[:-1]
+        keep = max(1, int(limit))
+        lines = [
+            f"{'她' if role == 'assistant' else '他'}：{body[:60]}"
+            for role, body in rows[-keep:]
+        ]
         return "\n".join(lines)
 
     async def _load_history(self, umo: str) -> list:

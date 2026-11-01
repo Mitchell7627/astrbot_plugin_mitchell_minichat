@@ -189,6 +189,11 @@
   function renderOverview() {
     const s = state.status;
     if (!s) return;
+    // 版本号从接口读，发版时不用再改 HTML
+    const build = $("#panel-build");
+    if (build && s.plugin && s.plugin.version) {
+      build.textContent = `${s.plugin.version} · 有问题请到 GitHub 提 Issue`;
+    }
     // 不再放「在场」：那是每个会话各自的状态，多个会话时没法用一个值表达
     const cards = [
       ["会话", s.summary.sessions, "已配置监听"],
@@ -853,10 +858,11 @@
     },
     {
       section: "friend_settings", title: "省 token",
-      note: "只影响主动消息，正常回复不走这里；保存后立即生效",
+      note: "只影响主动消息，正常回复不走这里；上限与窗口无关，保存后立即生效",
       paths: [
         "context_settings.include_history_images",
         "context_settings.include_history_think",
+        "context_settings.history_hard_limit",
         "context_settings.enable_context_window",
         "context_settings.context_window_count",
         "context_settings.context_window_hours",

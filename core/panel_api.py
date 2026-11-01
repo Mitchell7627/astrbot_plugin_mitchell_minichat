@@ -58,6 +58,7 @@ _LIMITS: dict[tuple[str, str], tuple[float, float, type]] = {
     # 柱形图纵轴封顶（%）：纯显示设置，改了不用重载插件
     ("web_panel", "chart_ceiling_pct"): (1, 100, int),
     # 省 token：上下文窗口（与 schema slider 保持一致）
+    ("friend_settings", "context_settings.history_hard_limit"): (0, 500, int),
     ("friend_settings", "context_settings.context_window_count"): (2, 200, int),
     ("friend_settings", "context_settings.context_window_hours"): (1, 168, int),
     ("friend_settings", "context_settings.context_window_min_messages"): (0, 50, int),

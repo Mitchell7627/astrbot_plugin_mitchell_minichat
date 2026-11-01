@@ -15,13 +15,14 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
 from .core.event_detector import EventRuleStore, extract_message_text
+from .core.migrations import migrate_config
 from .core.panel_api import PanelPageApi, PanelService
 from .core.runner import Runner
 from .core.store import Store
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.1.2"
+VERSION = "v0.1.3"
 
 
 class ProactiveMiniPlugin(star.Star):
@@ -126,6 +127,18 @@ class ProactiveMiniPlugin(star.Star):
         if not self.friend_cfg.get("enable", False):
             logger.info(f"{TAG} 插件未启用")
             return
+        # 老配置升级：只把仍是出厂默认的项换成新默认，用户改过的原样保留
+        try:
+            changed = migrate_config(self.config)
+            if changed:
+                saver = getattr(self.config, "save_config_async", None)
+                if saver is not None:
+                    await saver()
+                else:
+                    self.config.save_config()
+                logger.info(f"{TAG} 已升级出厂默认配置：{'、'.join(changed)}")
+        except Exception as e:
+            logger.warning(f"{TAG} 配置升级失败（不影响启动）: {e}")
         if not self.runner:
             self.runner = Runner(self)
         await self.runner.start()
