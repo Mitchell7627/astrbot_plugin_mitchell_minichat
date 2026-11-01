@@ -825,16 +825,32 @@ class Runner:
         self._save_appointments(umo, items)
 
     def _appointment_on_user_reply(self, umo: str) -> None:
-        """他说话了：到点那一拍就算完成，别再补发。"""
+        """他说话了：已经到点的约定就算过去，别再补发。
+
+        不能只看 stage == "due"：stage 要等 due 那拍真发出去才写成 "due"。
+        他 12:02 说「下课了」，due 排在 12:08——那会儿 stage 还是 pending/lead，
+        只看 stage 拦不住，12:08 会照发一条「现在 12:08，到 12:00 了」。
+        所以按时刻判：约好的点已经过去 + 他开口 = 这件事过去了。
+        没到点的（他说「12 点下课」之后随便聊两句）不受影响。
+        """
+        now = time.time()
         items = self._appointments(umo)
-        changed = False
+        finished = []
         for item in items:
-            if str(item.get("stage")) == "due":
-                item["stage"] = "done"
-                item["follow_up_at"] = 0
-                changed = True
-        if changed:
+            if str(item.get("stage")) == "done":
+                continue
+            at = _as_float_safe(item.get("at"))
+            if at <= 0 or at > now:
+                continue
+            item["stage"] = "done"
+            item["follow_up_at"] = 0
+            finished.append(item)
+        if finished:
             self._save_appointments(umo, items)
+            for item in finished:
+                logger.info(
+                    f"{TAG} 他说话了，约定收尾：{item.get('time_text')} {item.get('label')}"
+                )
 
     def _appointment_next_delay(self, umo: str, current_minutes: float):
         """把下一次触发往约定上靠；None 表示不干预。"""

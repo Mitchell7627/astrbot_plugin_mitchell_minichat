@@ -50,6 +50,12 @@ _POINT_RE = re.compile(
 )
 _MINUTE_WORDS = {"半": 30, "一刻": 15, "三刻": 45, "整": 0}
 
+# 「差一刻五点」「差五分五点」：倒着说的时间，先算成 4:45 / 4:55
+_DIFF_RE = re.compile(
+    rf"差\s*(一刻|三刻|半|(\d{{1,2}}|[{_CN_CHARS}]{{1,3}})\s*分?)\s*"
+    rf"(\d{{1,2}}|[{_CN_CHARS}]{{1,3}})\s*点"
+)
+
 # 时段词按「离时间越近越优先」找，最多回看 4 个字
 _PERIOD_WORDS = (
     (("凌晨",), "am"),
@@ -63,7 +69,8 @@ _PERIOD_WORDS = (
 _REMAIN_RE = re.compile(
     rf"(?:还有|再有|再上|再要|过)\s*(\d{{1,3}}|[{_CN_CHARS}]{{1,3}})\s*分钟"
 )
-_VAGUE_RE = re.compile(r"(快|快到|差不多|左右|前后|大概|大约|约|将近|马上|就快)")
+# 「快十二点下课」是估摸，「约了人」是动词——「约」只有在单独出现时才算模糊
+_VAGUE_RE = re.compile(r"(快|快到|差不多|左右|前后|大概|大约|约(?!了|好|会|人|在)|将近|马上|就快)")
 # 「你几点下课」：没有具体数字，是在问对方
 _WHEN_ASK_RE = re.compile(r"(几|啥|什么|哪)\s*点")
 
@@ -78,6 +85,9 @@ DEFAULT_EVENTS = {
     "start": [
         "上班", "上课", "开会", "考试", "出门", "出发", "起飞", "开场",
         "吃饭", "吃早饭", "吃午饭", "吃晚饭", "吃宵夜",
+        # 「8 点约了人」「9:05 有个会」：说法很常见，但原先一个事件词都没有
+        "约了", "约好", "约会", "碰面", "见面",
+        "有个会", "有个局", "面试", "值班", "出差",
     ],
 }
 
@@ -116,6 +126,20 @@ def find_clock(text: str):
             "length": match.end() - match.start(),
             "period": _find_period(text, match.start()),
         }
+
+    match = _DIFF_RE.search(text)
+    if match:
+        # 差一刻五点 = 4:45；差五分五点 = 4:55
+        offset = _MINUTE_WORDS.get(match.group(1))
+        if offset is None:
+            offset = cn_to_int(match.group(2))
+        hour = cn_to_int(match.group(3))
+        if offset and hour:
+            return {
+                "h": (hour - 1) % 24, "m": 60 - offset, "idx": match.start(),
+                "length": match.end() - match.start(),
+                "period": _find_period(text, match.start()),
+            }
 
     match = _POINT_RE.search(text)
     if not match:
