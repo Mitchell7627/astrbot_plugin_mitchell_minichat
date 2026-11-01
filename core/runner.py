@@ -1943,6 +1943,27 @@ class Runner:
             result = history[-1:]
         return result
 
+    # 只认「装时间戳」的 reminder：块里必须出现 Current datetime:，
+    # 其它语义的 system_reminder（群聊 / 新消息）要原样留着。
+    _TIME_BLOCK = re.compile(r"[ \t]*<system_reminder>[\s\S]*?</system_reminder>[ \t]*", re.I)
+    _TIME_BLOCK_OPEN = re.compile(r"<system_reminder>[^\n]*?Current datetime:[^\n]*", re.I)
+
+    @staticmethod
+    def _finalize_message(message, parts):
+        """按 parts 判空：有内容→造新消息；只剩 tool_calls→空串；否则丢弃。"""
+        for part in parts:
+            if not isinstance(part, dict):
+                return {**message, "content": parts}
+            if part.get("type") != "text":
+                return {**message, "content": parts}
+            if str(part.get("text") or "").strip():
+                return {**message, "content": parts}
+        # 只剩空壳：不论有没有额外字段，都不要把 content: [] 发给 provider
+        # （部分 provider 会直接 400）。带 tool_calls 的消息必须保留。
+        if message.get("tool_calls"):
+            return {**message, "content": ""}
+        return None
+
     @staticmethod
     def _strip_parts(message, drop_images: bool, drop_think: bool):
         """剔除图片 / 思考块；被滤空的消息返回 None，str content 原样返回。"""
@@ -1964,24 +1985,108 @@ class Runner:
                 continue
             kept.append(part)
 
-        meaningful = False
-        for part in kept:
-            if not isinstance(part, dict):
-                meaningful = True
-                break
-            if part.get("type") != "text":
-                meaningful = True
-                break
-            if str(part.get("text") or "").strip():
-                meaningful = True
-                break
-        if meaningful:
-            return {**message, "content": kept}
-        # 只剩空壳：不论有没有额外字段，都不要把 content: [] 发给 provider
-        # （部分 provider 会直接 400）。带 tool_calls 的消息必须保留。
-        if message.get("tool_calls"):
-            return {**message, "content": ""}
-        return None
+        return Runner._finalize_message(message, kept)
+
+    @classmethod
+    def _drop_time_blocks(cls, text: str):
+        """删掉文本里的时间戳块，返回 (新文本, 删掉的块数)。"""
+        if not text or "current datetime" not in text.lower():
+            return text, 0
+        count = 0
+
+        def _closed(match):
+            nonlocal count
+            block = match.group(0)
+            if "current datetime:" not in block.lower():
+                return block
+            count += 1
+            return ""
+
+        new = cls._TIME_BLOCK.sub(_closed, text)
+        if "current datetime" in new.lower():
+            def _open(match):
+                nonlocal count
+                count += 1
+                return ""
+
+            new = cls._TIME_BLOCK_OPEN.sub(_open, new)
+        if count:
+            new = re.sub(r"\n{3,}", "\n\n", new).strip()
+        return new, count
+
+    @classmethod
+    def _strip_one_time(cls, message):
+        """剥掉单条消息里的时间戳块；没变化时原对象返回。"""
+        if not isinstance(message, dict):
+            return message, 0
+        content = message.get("content")
+        if isinstance(content, str):
+            new, count = cls._drop_time_blocks(content)
+            if not count:
+                return message, 0
+            if not new:
+                if message.get("tool_calls"):
+                    return {**message, "content": ""}, count
+                return None, count
+            return {**message, "content": new}, count
+        if not isinstance(content, list):
+            return message, 0
+
+        kept = []
+        count = 0
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                new, hits = cls._drop_time_blocks(str(part.get("text") or ""))
+                if hits:
+                    count += hits
+                    if not new:
+                        continue
+                    kept.append({**part, "text": new})
+                    continue
+            kept.append(part)
+        if not count:
+            return message, 0
+        return cls._finalize_message(message, kept), count
+
+    @classmethod
+    def _strip_time_blocks(cls, history: list):
+        """剥掉历史里的时间戳块，只留最近一条。
+
+        18 条 user 消息各挂一段「Current datetime」，对模型没有任何增量信息
+        （当前时间由提示词里的 {{current_time}} 给），却占了历史里近三成字符。
+        留最近一条是因为模型还需要它推算「他上次说话是多久前」。
+        """
+        if not history:
+            return history, 0
+
+        keep = -1
+        for index in range(len(history) - 1, -1, -1):
+            message = history[index]
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, str):
+                if "current datetime" in content.lower():
+                    keep = index
+                    break
+            elif isinstance(content, list):
+                if any(
+                    isinstance(part, dict) and part.get("type") == "text"
+                    and "current datetime" in str(part.get("text") or "").lower()
+                    for part in content
+                ):
+                    keep = index
+                    break
+
+        out = []
+        total = 0
+        for index, message in enumerate(history):
+            if index == keep:
+                out.append(message)
+                continue
+            item, count = cls._strip_one_time(message)
+            total += count
+            if item is not None:
+                out.append(item)
+        return out, total
 
     def _prepare_contexts(self, history: list, settings: dict) -> list:
         before = len(history)
@@ -2003,13 +2108,17 @@ class Runner:
                 if item is not None:
                     filtered.append(item)
             out = filtered
-        if len(out) != before:
+        # 时间戳只在窗口裁剪时有用（_fill_times 在上面），发出去之前一律剥掉。
+        # 放在 _strip_parts 之后：这里不看图片/思考开关，永远执行。
+        out, ts_hits = self._strip_time_blocks(out)
+        if len(out) != before or ts_hits:
             logger.info(
                 f"{TAG} 上下文裁剪 {before} → {len(out)} 条"
                 f"（上限={'关' if not cap else cap}，"
                 f"窗口={'开' if settings['window_enabled'] else '关'}，"
                 f"图片={'剔' if drop_images else '留'}，"
-                f"思考={'剔' if drop_think else '留'}）"
+                f"思考={'剔' if drop_think else '留'}，"
+                f"时间戳=剔 {ts_hits} 块）"
             )
         return out
 
