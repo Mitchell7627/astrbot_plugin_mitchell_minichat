@@ -184,15 +184,23 @@ class Runner:
             if next_at > time.time() + 5:
                 # 已有未到期的排程，沿用它
                 delay_minutes = (next_at - time.time()) / 60.0
+                # 但事件进行中不能沿用「事件结束之后」的旧排程：
+                # 那样重启一次，整段事件里她就一句都不会开口。
+                remain = self._event_remaining_minutes(umo)
+                if remain is not None and delay_minutes > remain:
+                    delay_minutes = max(1.0, remain - 0.5)
             # 没有未到期排程时不清空 delay_minutes：
             # 调用方显式传了「启动后等待」就用它，没传才走加权采样。
 
         if delay_minutes is None:
             delay_minutes = self._sample_minutes(umo, after_send=after_send)
-            # 待睡等待：把触发对准提醒窗口，而不是普通 5-240 间隔
-            sleep_delay = self._sleep_reminder_delay_minutes(umo)
-            if sleep_delay is not None:
-                delay_minutes = sleep_delay
+            # 待睡等待：把触发对准提醒窗口，而不是普通 5-240 间隔。
+            # 但事件进行中不对齐：对齐点通常落在几小时后的夜窗，会把整段事件窗口盖掉，
+            # 结果「在洗澡」这 40 分钟里一句都没有。事件结束后的下一次再对齐。
+            if self._event_remaining_minutes(umo) is None:
+                sleep_delay = self._sleep_reminder_delay_minutes(umo)
+                if sleep_delay is not None:
+                    delay_minutes = sleep_delay
 
         # 约定必须无条件压过上面算出来的一切：采样、待睡、重启沿用的旧 next_at
         appt_delay = self._appointment_next_delay(umo, delay_minutes)
@@ -302,6 +310,8 @@ class Runner:
     RESTORE_GAP_MINUTES = 30
     # 否则重抽一次，但最多再等这么久
     RESAMPLE_CAP_MINUTES = 60
+    # 事件期间一句都没开口时，事后再重抽的上限（比正常重抽更近一点，别让沉默拖太久）
+    EVENT_MISS_CAP_MINUTES = 30
 
     def reschedule_after_message(self, umo: str) -> None:
         """用户说话后的重排：这条消息刚把事件结束掉时，按事件规则决定。"""
@@ -353,8 +363,12 @@ class Runner:
     def _decide_after_event(self, umo: str, anchor: float) -> None:
         base = float(self.store.get(umo, "pre_event_next_at", 0) or 0)
         self.store.pop(umo, "pre_event_next_at")
+        # 这个事件期间到底有没有开口？没有的话，「插队那一条」根本没发生，
+        # 不能按「恢复到原计划」处理——否则事件结束后还要干等一两个小时。
+        hit = bool(self.store.get(umo, "event_hit"))
+        self.store.pop(umo, "event_hit")
         now = time.time()
-        if base and base - anchor > self.RESTORE_GAP_MINUTES * 60:
+        if base and base - anchor > self.RESTORE_GAP_MINUTES * 60 and hit:
             # 原计划还远：插队那一条发完就回到原时间，不重新随机
             delay = max(60.0, base - now)
             # 这条旁路直接写 next_at，不走 reschedule，约定要在这里单独压一次
@@ -372,10 +386,12 @@ class Runner:
                 f"{TAG} 事件已过：原排程还有 {int(delay // 60)} 分钟，恢复到原时间（不重抽）"
             )
             return
-        # 原计划就在附近：重抽一次，但别太久
-        minutes = min(float(self.RESAMPLE_CAP_MINUTES), self._sample_minutes(umo))
+        # 原计划就在附近，或者事件期间一句都没发：重抽一次，但别太久
+        cap = self.RESAMPLE_CAP_MINUTES if hit else self.EVENT_MISS_CAP_MINUTES
+        minutes = min(float(cap), self._sample_minutes(umo))
+        reason = "" if hit else "，事件期间没开口"
         logger.info(
-            f"{TAG} 事件已过：原排程够近，重抽 {int(minutes)} 分钟（上限 {self.RESAMPLE_CAP_MINUTES} 分钟）"
+            f"{TAG} 事件已过：重抽 {int(minutes)} 分钟（上限 {cap} 分钟{reason}）"
         )
         self.reschedule(umo, delay_minutes=minutes)
 
@@ -616,6 +632,17 @@ class Runner:
             return None
         return event
 
+    def _event_remaining_minutes(self, umo: str) -> float | None:
+        """活动事件还剩几分钟；没有事件（或已过期）返回 None。"""
+        event = self._active_event(umo)
+        if not isinstance(event, dict):
+            return None
+        expires = _as_float_safe(event.get("expires_at"))
+        if not expires:
+            return None
+        remain = (expires - time.time()) / 60.0
+        return remain if remain > 0 else None
+
     def _set_event(self, umo: str, rule: dict, keyword: str, source_text: str = "") -> None:
         now = time.time()
         ttl = self.engine.ttl_for(rule)
@@ -623,6 +650,8 @@ class Runner:
         prev_next = float(self.store.get(umo, "next_at", 0) or 0)
         if prev_next > 0:
             self.store.set(umo, "pre_event_next_at", prev_next)
+        # 这个事件期间有没有开口过：没开口就不能「恢复原计划」，得重抽一次
+        self.store.set(umo, "event_hit", False)
         try:
             boost = max(0.01, float(rule.get("boost", EVENT_BOOST_BASELINE) or EVENT_BOOST_BASELINE))
         except (TypeError, ValueError):
@@ -2252,6 +2281,9 @@ class Runner:
                 else:
                     count = self.store.bump_unanswered(umo)
                     logger.info(f"{TAG} 已发送，当前未回复计数 {count}")
+                # 事件期间开过口：事件结束时按「插队已发生」处理（恢复原排程）
+                if self._active_event(umo) is not None:
+                    self.store.set(umo, "event_hit", True)
                 self.store.save()
                 # 把主动消息写回会话历史，避免她下一条「接更早的话」而不是接你的回复
                 await self._append_assistant_history(umo, text)
