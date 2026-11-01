@@ -351,6 +351,23 @@ class Runner:
         self.timers[umo] = asyncio.create_task(self._wait_and_fire(umo, gap))
         logger.info(f"{TAG} 她刚回过话，下次主动开口推到 {int(gap // 60)} 分钟后")
 
+    def _next_wake_minutes(self, umo: str) -> float | None:
+        """暂停普通聊天后，下一次「必须开口」还有多久（约定 / 催睡）。没有就返回 None。"""
+        candidates = []
+        try:
+            appt = self._appointment_next_delay(umo, self._max_interval_minutes())
+        except Exception:
+            appt = None
+        if appt is not None:
+            candidates.append(float(appt))
+        try:
+            sleep_delay = self._sleep_reminder_delay_minutes(umo)
+        except Exception:
+            sleep_delay = None
+        if sleep_delay is not None:
+            candidates.append(float(sleep_delay))
+        return min(candidates) if candidates else None
+
     def _finish_cycle(self, umo: str) -> None:
         """一次发送结束后的收尾。"""
         if self.store.get(umo, "pre_event_next_at"):
@@ -1766,6 +1783,8 @@ class Runner:
         """
         if not text:
             return False
+        # 每条消息一个序号：语义识别是异步的，回来时要靠它判断结果是否已经过期
+        self.store.set(umo, "turn_seq", _as_int(self.store.get(umo, "turn_seq"), 0) + 1)
         before = self._snapshot(umo)
         self._dec_buffer = []
         self._gray_candidate = None
@@ -2120,7 +2139,16 @@ class Runner:
 
     async def classify_with_llm(self, umo: str, text: str) -> None:
         """关键词没认出时，让模型判断属于哪一类。"""
+        # 记下这句属于第几条消息：模型慢的时候，后面的消息可能已经更新了状态，
+        # 旧结果回来不能把它盖掉（「准备冲个凉」的结果晚于「我在吃饭」，就是这种）。
+        start_seq = _as_int(self.store.get(umo, "turn_seq"), 0)
         result = await self.classify_text(umo, text)
+        now_seq = _as_int(self.store.get(umo, "turn_seq"), 0)
+        if now_seq != start_seq:
+            logger.info(
+                f"{TAG} 语义识别结果已过期（第 {start_seq} 条，当前第 {now_seq} 条），丢弃：{text[:12]}"
+            )
+            return
         if result.get("error"):
             logger.warning(
                 f"{TAG} 语义识别失败（{text[:12]}）：{result['error']}"
@@ -2254,8 +2282,21 @@ class Runner:
             # 到点和补发必须绕过上限：它们是"说好的事"，被拦掉就失去意义
             bypass = reminding or shot in ("due", "follow")
             if limit > 0 and unanswered >= limit and not bypass:
-                logger.info(f"{TAG} 连续 {unanswered} 条未回复，暂停直到你说话")
+                # 暂停普通主动聊天，但「说好的事」不能跟着一起停：
+                # 12:00 的约定、该睡了的提醒都是独立承诺，被未回复上限一起掐掉就没意义了。
                 reschedule_needed = False
+                wake = self._next_wake_minutes(umo)
+                if wake is None:
+                    logger.info(f"{TAG} 连续 {unanswered} 条未回复，暂停直到你说话")
+                    return
+                delay = max(60.0, wake * 60.0)
+                self.store.set(umo, "next_at", time.time() + delay)
+                self.store.save()
+                self.timers[umo] = asyncio.create_task(self._wait_and_fire(umo, delay))
+                logger.info(
+                    f"{TAG} 连续 {unanswered} 条未回复，暂停普通聊天；"
+                    f"{int(delay // 60)} 分钟后为约定/催睡再醒一次"
+                )
                 return
 
             # 待睡提醒：这次触发是「该睡了」的提醒，不是普通主动消息
@@ -2267,7 +2308,8 @@ class Runner:
                     self._appointment_fail(umo, shot)
                 return
 
-            ok = await self._send_split(umo, text)
+            sent_text = await self._send_split(umo, text)
+            ok = bool(sent_text)
             if ok:
                 if shot:
                     self._advance_appointment(umo, shot)
@@ -2285,8 +2327,8 @@ class Runner:
                 if self._active_event(umo) is not None:
                     self.store.set(umo, "event_hit", True)
                 self.store.save()
-                # 把主动消息写回会话历史，避免她下一条「接更早的话」而不是接你的回复
-                await self._append_assistant_history(umo, text)
+                # 只把真正送达的内容写回历史：分段中途失败时，剩下的不能当成「她已经说过」
+                await self._append_assistant_history(umo, sent_text)
             elif shot:
                 self._appointment_fail(umo, shot)
         except Exception as e:
@@ -2892,7 +2934,12 @@ class Runner:
                 cleaned.append(text)
         return cleaned
 
-    async def _send_split(self, umo: str, text: str) -> bool:
+    async def _send_split(self, umo: str, text: str) -> str:
+        """分段发送。返回**实际送达**的文本（空串表示一段都没发出去）。
+
+        以前返回 bool，只要第一段成功就为 True，调用方随后把整段原文写进历史——
+        没送达的那几段会变成「她说过、你没读到」的幽灵记录，后面的回复会接着它演。
+        """
         conf = self.cfg.get("segmented_reply_settings", {}) or {}
         if not bool(conf.get("enable", True)):
             segments = [normalize_escapes(text).replace("\n", " ").strip()]
@@ -2915,9 +2962,9 @@ class Runner:
             )
 
         if not segments:
-            return False
+            return ""
 
-        sent_any = False
+        sent: list[str] = []
         for index, segment in enumerate(segments):
             try:
                 result = await self.context.send_message(
@@ -2926,7 +2973,7 @@ class Runner:
                 if result is False:
                     logger.warning(f"{TAG} 分段 {index + 1} 未送达")
                     break
-                sent_any = True
+                sent.append(segment)
             except Exception as e:
                 logger.error(f"{TAG} 发送第 {index + 1} 段失败: {e}")
                 break
@@ -2945,7 +2992,9 @@ class Runner:
                         fixed_delay=float(conf.get("fixed_delay", 1.5) or 1.5),
                     )
                 )
-        return sent_any
+        if len(sent) != len(segments):
+            logger.warning(f"{TAG} 分段只送达 {len(sent)}/{len(segments)} 段，历史只记已送达部分")
+        return "\n".join(sent)
 
     async def _append_assistant_history(self, umo: str, text: str) -> None:
         """把主动消息写回 AstrBot 会话历史。

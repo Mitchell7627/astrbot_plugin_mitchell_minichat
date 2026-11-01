@@ -162,7 +162,9 @@ class PanelHttpServer:
             expected = self._password()
             if not expected:
                 return {"status": "ok", "data": {"token": "", "required": False}}
-            if not hmac.compare_digest(given, expected):
+            # compare_digest 的 str 参数只支持 ASCII，中文密码会抛 TypeError → 500。
+            # 统一按 UTF-8 字节比较，保持常量时间语义。
+            if not hmac.compare_digest(given.encode("utf-8"), expected.encode("utf-8")):
                 self._fails.setdefault(ip, []).append(time.time())
                 return JSONResponse(
                     {"status": "error", "message": "E_AUTH: 密码不正确"}, status_code=401

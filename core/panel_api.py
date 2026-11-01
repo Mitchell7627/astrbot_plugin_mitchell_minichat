@@ -640,7 +640,8 @@ class PanelService:
                 if not text:
                     raise PanelError("E_UPSTREAM", "生成为空，未发送")
             try:
-                ok = await runner._send_split(umo, text)
+                sent_text = await runner._send_split(umo, text)
+                ok = bool(sent_text)
             except Exception as e:
                 raise PanelError("E_UPSTREAM", f"发送失败: {e}")
 
