@@ -153,7 +153,8 @@ class Runner:
             self._expiry_task.cancel()
             self._expiry_task = None
 
-    def reschedule(self, umo: str, *, delay_minutes: float | None = None, keep_if_future: bool = False) -> None:
+    def reschedule(self, umo: str, *, delay_minutes: float | None = None, keep_if_future: bool = False,
+                   after_send: bool = False) -> None:
         """安排下一次主动消息。"""
         old = self.timers.pop(umo, None)
         if old is not None:
@@ -170,7 +171,7 @@ class Runner:
             # 调用方显式传了「启动后等待」就用它，没传才走加权采样。
 
         if delay_minutes is None:
-            delay_minutes = self._sample_minutes(umo)
+            delay_minutes = self._sample_minutes(umo, after_send=after_send)
             # 待睡等待：把触发对准提醒窗口，而不是普通 5-240 间隔
             sleep_delay = self._sleep_reminder_delay_minutes(umo)
             if sleep_delay is not None:
@@ -264,7 +265,9 @@ class Runner:
         if self.store.get(umo, "pre_event_next_at"):
             self._decide_after_event(umo, time.time())
             return
-        self.reschedule(umo)
+        # 刚发完一条：事件剩余时间不够一个最短间隔时，别把窗口压到 1 分钟，
+        # 否则事件快结束那会儿会「8 分钟内连发两条」。
+        self.reschedule(umo, after_send=True)
 
     def _decide_after_event(self, umo: str, anchor: float) -> None:
         base = float(self.store.get(umo, "pre_event_next_at", 0) or 0)
@@ -294,7 +297,7 @@ class Runner:
     # ------------------------------------------------------------------
     # 采样
     # ------------------------------------------------------------------
-    def _sample_minutes(self, umo: str) -> float:
+    def _sample_minutes(self, umo: str, *, after_send: bool = False) -> float:
         schedule = self.cfg.get("schedule_settings", {}) or {}
         lo_min = max(1, _as_int(schedule.get("min_interval_minutes"), 5))
         hi_min = _as_int(schedule.get("max_interval_minutes"), 240)
@@ -317,9 +320,13 @@ class Runner:
             now_ts = time.time()
             if expires > now_ts:
                 window_sec = max(60, int(expires - now_ts))
-                if window_sec < hi:
-                    hi = window_sec
-                    lo = min(lo, hi)
+                # 刚发过一条时，事件剩下的时间若连最短间隔都不够，就放弃「卡在事件里」：
+                # 宁可这条不落在事件内，也不要 1 分钟后又冒一条（12:43 那次连发两条
+                # 「碗还搁桌上」「碗都收完了」就是这么来的）。
+                if not (after_send and window_sec < lo):
+                    if window_sec < hi:
+                        hi = window_sec
+                        lo = min(lo, hi)
 
         if not bool(eng.get("enable_weighted", True)):
             seconds, mode = sample_uniform_seconds(lo, hi)

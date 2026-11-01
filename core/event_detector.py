@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -35,7 +36,7 @@ BUILTIN_RULES = {
             "boost_budget": 1,
             "keywords": ["吃饭", "吃面", "吃了", "干饭", "外卖", "点餐", "下馆子", "食堂", "吃早饭", "吃午饭", "吃晚饭", "吃宵夜"],
             "stop_keywords": ["吃完了", "吃饱", "不吃了", "吃撑", "收碗", "洗碗", "吃完"],
-            "hint": "他 {elapsed} 分钟前提过在吃饭，这个点差不多吃完了。可以直接说\"吃完了吧\"这类已经知道答案的话，或者催他去洗碗；不要问\"吃完了吗\"。",
+            "hint": "他 {elapsed} 分钟前提过在吃饭，这个点差不多吃完了。可以直接说\"吃完了吧\"这类已经知道答案的话，或者催他收拾一下；不要问\"吃完了吗\"，也别自己补他吃的是什么、用什么碗筷——你不知道，编出来就出戏。",
         },
         {
             "name": "cooking",
@@ -124,6 +125,16 @@ END_BLOCKERS = (
 END_DONE_MARKS = ("了", "啦", "咯", "喽", "哦", "呀", "噢", "噜")
 # 前面有这些也能确认已经结束（「已经下班」「终于考完」）。
 END_DONE_HEADS = ("已经", "终于", "总算", "可算")
+
+# 吃的让出去了：「剩下的妃爱吃吧」「给你吃」「你先吃吧」。
+# 他把自己那份递过来，等于他这边已经吃完了——事件必须收尾，
+# 否则半小时后她还会拿着「他在吃饭」的提示去催他收拾碗筷。
+# 全用结构判断，不认名字；中间夹「我」的不算（「剩下的我吃吧」是他自己要吃）。
+HANDOFF_EVENTS = ("eating", "drinking")
+HANDOFF_RE = re.compile(
+    r"(?:剩下的?|剩的?|都给你|给你|让给你|留给你|喂你)[^，。！？,.!?;；\s我]{0,6}(?:吃|喝)"
+    r"|(?:你|妳|您)[^，。！？,.!?;；\s我]{0,3}(?:吃|喝)吧"
+)
 
 
 def extract_message_text(event) -> str:
@@ -579,6 +590,12 @@ class EventRuleStore:
             return {"stopped": False, "dropped": []}
         name = event.get("name")
         dropped: list[dict] = []
+        if name in HANDOFF_EVENTS and self._is_handoff(text):
+            return {
+                "stopped": True, "kw": "让给你吃", "idx": 0,
+                "verdict": "accept", "gate_rule": "H1",
+                "reason": "把吃的让出去了，他自己那份已经吃完", "dropped": dropped,
+            }
         for rule in self._rules:
             if rule.get("name") != name:
                 continue
@@ -602,6 +619,11 @@ class EventRuleStore:
 
     def is_stop(self, event: dict, text: str) -> bool:
         return self.stop_detail(event, text)["stopped"]
+
+    @staticmethod
+    def _is_handoff(text: str) -> bool:
+        """这句话是不是把吃的让给对方了（「剩下的妃爱吃吧」）。"""
+        return bool(text and HANDOFF_RE.search(text))
 
     def build_hint(self, event: dict, elapsed_minutes: int) -> str:
         """渲染事件提示文本。

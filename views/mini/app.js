@@ -472,7 +472,7 @@
         </div>
         <div class="muted" style="font-size:12px">
           ${ev.mass_in_window >= 0.999
-            ? "采样已压在这段时间内：她会在事件结束前开口"
+            ? "采样已限制在事件剩余时间内：会在事件结束前开口"
             : `这段时间内开口的概率 ${L.pct(ev.mass_in_window)}，剩下 ${L.pct(1 - ev.mass_in_window)} 落在事件过期之后`}
           · 80% 落在 ${L.fmtClock(ev.quantiles.p10)} – ${L.fmtClock(ev.quantiles.p90)}
         </div>`;
@@ -849,7 +849,7 @@
       paths: ["enable", "session_list", "enable_auto_start", "auto_start_delay_minutes", "proactive_prompt"],
     },
     {
-      section: "friend_settings", title: "上下文注入", note: "决定她开口前能看到多少前文",
+      section: "friend_settings", title: "上下文注入", note: "决定开口前能看到多少前文",
       paths: [
         "context_settings.use_conversation_history", "context_settings.use_platform_history",
         "context_settings.platform_history_count", "context_settings.include_bot_messages",
@@ -1250,13 +1250,13 @@
         toast("已清除睡眠状态", "ok");
       } else if (op === "together") {
         state.tasks = await api("POST", "tasks/action", { action: "mark_together", umo });
-        toast("已设为在一起：她知道你在旁边", "ok");
+        toast("已设为「在一起」：提示词按「就在旁边」生成", "ok");
       } else if (op === "clear-together") {
         state.tasks = await api("POST", "tasks/action", { action: "clear_together", umo });
         toast("已取消在一起", "ok");
       } else if (op === "away") {
         state.tasks = await api("POST", "tasks/action", { action: "mark_away", umo });
-        toast("已设为不在身边：她不会再说「就在你旁边」", "ok");
+        toast("已设为「不在身边」：不再生成「就在你旁边」", "ok");
       } else if (op === "clear-away") {
         state.tasks = await api("POST", "tasks/action", { action: "clear_away", umo });
         toast("已回到身边", "ok");

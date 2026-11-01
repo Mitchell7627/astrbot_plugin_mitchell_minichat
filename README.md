@@ -1,12 +1,12 @@
 # 主动私聊Mini（astrbot_plugin_mitchell_minichat）
 
-> 版本 **v0.1.4** ｜ 仅支持 **aiocqhttp（QQ）私聊** ｜ MIT
+> 版本 **v0.1.5** ｜ 仅支持 **aiocqhttp（QQ）私聊** ｜ MIT
 
 > **反馈**：遇到问题请到 [GitHub Issues](https://github.com/Mitchell7627/astrbot_plugin_mitchell_minichat/issues) 提交，并附上 AstrBot 版本、插件版本和相关日志。
 
-一个给 AstrBot 用的轻量「主动消息」插件：不用你招呼，她会自己挑时机凑过来开口。
+一个给 AstrBot 用的轻量「主动消息」插件：按加权曲线挑时机主动开口，不需要用户先说话。
 
-不是定时群发，也不是关键词自动回复——她按一条加权概率曲线挑时间，结合你正在做什么、你在不在她身边，决定说什么、用什么语气。
+不是定时群发，也不是关键词自动回复：每次触发都按加权概率曲线采样，再结合事件与在场状态决定内容和语气。
 
 **平台范围**：只处理 aiocqhttp 的私聊消息，群聊不生效，其他平台适配器未做验证。
 

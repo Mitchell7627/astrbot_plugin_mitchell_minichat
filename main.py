@@ -22,7 +22,7 @@ from .core.store import Store
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.1.4"
+VERSION = "v0.1.5"
 
 
 class ProactiveMiniPlugin(star.Star):
