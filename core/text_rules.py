@@ -56,8 +56,12 @@ CONDITIONAL_LEADS = ("如果", "要是", "假如", "万一", "除非", "倘若",
 # 「如果下雨怎么办，现在我们确实在一起吃饭」的后件是「现在我们…」，不算。
 CONDITIONAL_THENS = ("就", "那", "便", "则", "于是", "那么", "我", "你", "他", "她", "咱")
 # 「的话」有两种：条件助词（下雨的话，我就不去）和名词（听你的话 / 我说的话）。
-# 前一字是人称或言语动词时按名词处理，判定前等长遮蔽，索引不变。
+# 前一字是人称、常见人物名词，或言语/认知动词时按名词处理，判定前等长遮蔽，索引不变。
 _DE_HUA_PRONOUNS = "我你您他她它咱俺"
+_DE_HUA_NOUNS = (
+    "朋友", "医生", "老师", "妈妈", "爸爸", "家人", "别人", "老板", "同事",
+    "同学", "老婆", "老公", "孩子", "室友", "父母", "我妈", "我爸", "人家",
+)
 _DE_HUA_VERBS = (
     "说", "讲", "听", "问", "写", "记", "在乎", "相信", "明白", "懂",
     "打断", "回", "理", "留", "信", "管",
@@ -315,6 +319,7 @@ def _mask_possessive_de_hua(text: str) -> str:
         possessive = (
             (pos >= 1 and text[pos - 1] in _DE_HUA_PRONOUNS)
             or prev.endswith(_DE_HUA_VERBS)
+            or prev.endswith(_DE_HUA_NOUNS)
         )
         if possessive:
             if out is None:
@@ -470,25 +475,24 @@ def negated_by_clause(text: str, idx: int, negations, window: int = 4) -> bool:
     """
     if idx <= 0 or not negations:
         return False
-    tight = clause_head(text, idx, window=window)
+    # 先在一个更宽的头里剔除「不得不 / 不过 / 不但」这类假否定，再取紧贴窗口。
+    # 「我现在不得不去坐地铁」里「不得不」正好跨过 4 字边界（tight=「得不去坐」），
+    # 只清 tight 会漏掉，必须先清宽窗口再切尾部。
+    wide = clause_head(text, idx, window=max(window, 14))
+    wide_clean = _strip_neg_false_friends(wide)
+    tight = wide_clean[-window:] if window else wide_clean
     if tight:
-        # 「我现在不得不开会」的 tight 是「在不得不」，末尾就是「不」；
-        # 「我现在不得不去洗澡了」的 tight 里含「不去」。假否定词必须先剔除，
-        # 否则紧贴窗口会先把真实动作否掉，后面再剔已经来不及。
-        tight_clean = _strip_neg_false_friends(tight)
-        if any(n in tight_clean for n in negations):
+        if any(n in tight for n in negations):
             return True
-        if tight_clean and tight_clean[-1] in ("不", "别", "没"):
+        if tight[-1] in ("不", "别", "没"):
             return True
-        if _NEG_TAIL_RE.search(tight_clean):
+        if _NEG_TAIL_RE.search(tight):
             return True
-    head = clause_head(text, idx, window=10)
-    if not head:
+    if not wide_clean:
         return False
-    clean = _strip_neg_false_friends(head)
-    if _NEG_STRONG_RE.search(clean):
+    if _NEG_STRONG_RE.search(wide_clean):
         return True
-    return bool(_NEG_WEAK_RE.search(clean))
+    return bool(_NEG_WEAK_RE.search(wide_clean))
 
 
 # ---------------------------------------------------------------- 消费跨度

@@ -51,8 +51,10 @@ from .decisions import DecisionLog, clip_text
 from .appointment import (
     DEFAULT_EVENTS,
     build_hint as build_appointment_hint,
+    find_clock as find_appointment_clock,
     next_delay as appointment_next_delay,
     parse as parse_appointment,
+    resolve_at as resolve_appointment_at,
     stage_of as appointment_stage,
 )
 
@@ -856,6 +858,90 @@ class Runner:
             return item
         return None
 
+    def _rule_for_end_label(self, label: str):
+        """把约定里的结束说法（下课 / 下班 / 散会）映射回事件规则。"""
+        label = str(label or "").strip()
+        if label.endswith("了"):
+            label = label[:-1]
+        if not label:
+            return None
+        rules = self.engine.rules_snapshot()
+        for rule in rules:
+            stops = [str(x).strip() for x in (rule.get("stop_keywords") or []) if x]
+            if label in stops:
+                return rule
+        for rule in rules:
+            for stop in rule.get("stop_keywords") or []:
+                stop = str(stop or "").strip()
+                if stop and (stop in label or label in stop):
+                    return rule
+        return None
+
+    def _end_label_matches(self, event, label: str) -> bool:
+        """这条结束约定说的是不是当前这件事。"""
+        if not isinstance(event, dict):
+            return False
+        rule = self._rule_for_end_label(label)
+        if rule is not None:
+            return event.get("name") == rule.get("name")
+        # 「下班」这类没有对应规则结束词的，只认工作/通勤/学习/会议这几类；
+        # 不能拿它去结束「在吃饭」这种无关状态。
+        return event.get("name") in self.PERIOD_END_EVENTS
+
+    def _align_event_to_end(self, umo: str, label: str, at: float,
+                            time_text: str = "") -> None:
+        """说了「18:00 下课」就把当前事件的结束时间对齐到 18:00。
+
+        以前事件只按自己的 TTL 走（学习 90 分钟），18:06 才过期，
+        18:00 的约定到点时提示词还会说「他还在学习」。
+        """
+        event = self.store.get(umo, "active_event")
+        if not self._end_label_matches(event, label):
+            return
+        old = _as_float_safe(event.get("expires_at"))
+        if abs(old - at) < 1:
+            return
+        event["expires_at"] = at
+        self.store.set(umo, "active_event", event)
+        logger.info(
+            f"{TAG} 约定对齐：{time_text or label} 结束，"
+            f"事件「{event.get('label')}」按这个点收尾"
+        )
+
+    def _end_matching_event(self, umo: str, label: str, now: float) -> bool:
+        """约定到点：结束对应事件，并把 away 的原因改成「下课了 / 下班了」。
+
+        只改原因，不解除离开——下课不等于到家（v0.2.9 的约定）。
+        """
+        label = str(label or "").strip()
+        if not label:
+            return False
+        event = self.store.get(umo, "active_event")
+        matched = False
+        if self._end_label_matches(event, label):
+            self.store.pop(umo, "active_event")
+            self._sync_together_until(umo, closing=True)
+            matched = True
+            logger.info(f"{TAG} 约定到点（{label}），事件「{event.get('label')}」结束")
+        away_state = self.store.get(umo, "away")
+        if isinstance(away_state, dict) and away_state.get("active"):
+            base = label[:-1] if label.endswith("了") else label
+            if matched or base in self.engine.period_end_keywords():
+                self.store.set(umo, "away", {
+                    **away_state,
+                    "active": True,
+                    "reason": f"{base}了",
+                    "keyword": base,
+                    "reason_at": now,
+                    "expires_at": max(
+                        _as_float_safe(away_state.get("expires_at")),
+                        now + PERIOD_END_AWAY_GRACE_HOURS * 3600,
+                    ),
+                    "cleared_at": None,
+                })
+                logger.info(f"{TAG} 约定到点（{label}），仍在外面，改按「{base}了」计时")
+        return matched
+
     def _set_appointment(self, umo: str, hit: dict) -> bool:
         now = time.time()
         at = _as_float_safe(hit.get("at"))
@@ -898,6 +984,9 @@ class Runner:
         logger.info(
             f"{TAG} 记下约定：{record['time_text']} {record['label']}（原话「{record['raw']}」）"
         )
+        # 结束类约定（18:00 下课）同时约束当前事件：到点就结束，不能按自己的 TTL 继续挂。
+        if record["kind"] == "end" and at > now:
+            self._align_event_to_end(umo, record["label"], at, record["time_text"])
         return True
 
     def _clear_appointment(self, umo: str) -> None:
@@ -1079,16 +1168,24 @@ class Runner:
         return best
 
     def appointment_shot_item(self, umo: str) -> dict | None:
-        """这次真正要发的那条约定：返回 {"item", "shot", "at", "id"}；没有就 None。"""
+        """这次真正要发的那条约定：返回 {"item", "shot", "at", "id"}；没有就 None。
+
+        旧队列没有 id。多条约定被睡眠统一顺延到同一分钟后，只按 at 定位会
+        永远拿到同一条，提示词就会张冠李戴。这里给旧条目补一个稳定 id 再返回。
+        """
         cfg = self._appointment_cfg()
         if not cfg["enable"]:
             return None
         now = time.time()
-        for item in self._appointments(umo):
+        items = self._appointments(umo)
+        for item in items:
             if not self._appointment_alive(item, now, cfg):
                 continue
             shot = appointment_stage(item, now, cfg)
             if shot:
+                if not item.get("id"):
+                    item["id"] = uuid.uuid4().hex[:12]
+                    self._save_appointments(umo, items)
                 return {
                     "item": item,
                     "shot": shot,
@@ -1167,10 +1264,69 @@ class Runner:
             else:
                 scene = f"他已经按说好的时间{label}了。"
             return f"{body}\n{scene}" if body else scene
-        scene = self.event_hint(umo)
+        # 「18:00 下课」这一拍不要再描述「他还在学习」：这件事正好在这一刻结束。
+        skip_event = (
+            shot == "due"
+            and str(item.get("kind") or "") == "end"
+            and self._end_label_matches(self.store.get(umo, "active_event"), item.get("label"))
+        )
+        scene = self.event_hint(umo, skip_event=skip_event)
         if body and scene:
             return f"{body}\n{scene}"
         return body or scene
+
+    def _mask_future_clock(self, text: str, now: datetime) -> str:
+        """把「下午三点我去开会」这类未来安排挡在当前事件之外。
+
+        约定功能关掉时 `_handle_appointment_words` 不会消费它；但「三点」仍然
+        不是此刻。这里只遮时钟所在分句，前半段已有的当前动作保留。
+        """
+        if not text:
+            return text
+        clock = find_appointment_clock(text)
+        if not clock:
+            return text
+        idx = int(clock.get("idx") or 0)
+        head = text[max(0, idx - 4):idx]
+        # 「现在三点」「已经三点了」是在报当前时间，不是安排。
+        if any(w in head for w in ("现在", "已经", "都", "刚")):
+            return text
+        at = resolve_appointment_at(
+            int(clock.get("h") or 0), int(clock.get("m") or 0),
+            clock.get("period"), now,
+            max(1, _as_int(self.engine_cfg.get("appointment_max_hours"), 14)),
+        )
+        if at is None:
+            return text
+        # 已经到点 / 就在此刻的钟点（「我十点吃饭」在 10:00 说）不算未来安排。
+        if at <= now.timestamp() + 60:
+            return text
+        start = rules.clause_start(text, idx, None)
+        prefix = text[start:idx]
+        if prefix.strip() and self.engine.match(prefix) is not None:
+            start = idx
+        end = rules.clause_end(text, idx)
+        end = self._action_tail_start(text, idx, end)
+        return self._mask_span(text, start, end)
+
+    def _action_tail_start(self, text: str, start: int, end: int) -> int:
+        """未来分句后面又接了一件「现在正在做」的事时，返回那件事的起点。
+
+        没有标点时 `clause_end` 会一路吃到句尾（「下午三点开会现在我正在洗澡」），
+        只遮未来那半句，剩下的回炉才能认出洗澡。
+        """
+        for cut in range(max(0, start), min(end, len(text))):
+            # 只认转折词或「现在」起头的新动作；裸「我」多半还是未来分句的主语
+            # （「下午三点我去吃饭」），在这里切会把未来句又放回当前事件。
+            if text[cut] in "但可而":
+                pass
+            elif text.startswith("不过", cut) or text.startswith("现在", cut):
+                pass
+            else:
+                continue
+            if self.engine.match(text[cut:end]) is not None:
+                return cut
+        return end
 
     def _handle_appointment_words(self, umo: str, text: str):
         """识别约定。返回 `(是否处理, 剩余文本|None)`。
@@ -1221,8 +1377,16 @@ class Runner:
         event_idx = hit.get("event_idx")
         event_idx = idx if event_idx is None else int(event_idx)
         event_len = int(hit.get("event_len") or 0)
-        start = rules.clause_start(text, min(idx, event_idx), None)
+        anchor = min(idx, event_idx)
+        start = rules.clause_start(text, anchor, None)
+        # 同一分句里前半段可能还有一件「现在正在做」的事：
+        # 「我现在正在吃饭不过下午三点要开会」只遮未来那半句，别把吃饭一起吞掉。
+        prefix = text[start:anchor]
+        if prefix.strip() and self.engine.match(prefix) is not None:
+            start = anchor
         end = rules.clause_end(text, max(idx + length, event_idx + event_len))
+        # 后面没有标点时，别把「但我现在正在洗澡」一起遮掉。
+        end = self._action_tail_start(text, max(idx + length, event_idx + event_len), end)
         rest = self._mask_span(text, start, end)
 
         enqueued = False
@@ -2476,6 +2640,11 @@ class Runner:
                 return None, True
             return rest, True
 
+        # 约定功能关闭、或这句话没被认成约定时，未来的钟点仍不是当前活动：
+        # 「下午三点我去开会」不能落成 studying。放在这里而不是入口，
+        # 是为了让「下班了，我正在吃饭，下午三点开会」先有机会在回炉时认出约定。
+        text = self._mask_future_clock(text, datetime.now())
+
         md = self.engine.match_detail(text)
         self._note("event", {"hit": md if md.get("rule") else None, "dropped": md.get("dropped") or []})
         rule = md["rule"]
@@ -2707,7 +2876,7 @@ class Runner:
         if not with_company and subject != "her":
             if label:
                 return (
-                    f"他现在在{label}（已经 {elapsed} 分钟），人在外面，不在你这边。"
+                    f"他现在{label}（已经 {elapsed} 分钟），人在外面，不在你这边。"
                     "别提需要他伸手、凑近、递东西才能做的动作，"
                     "可以说等他回来、给他留着、别太累这类话。"
                 )
@@ -2732,7 +2901,7 @@ class Runner:
             hint = ""
         return hint or ""
 
-    def event_hint(self, umo: str) -> str:
+    def event_hint(self, umo: str, skip_event: bool = False) -> str:
         fallback = "他眼下没在忙什么特别的事。"
         now = time.time()
 
@@ -2767,7 +2936,7 @@ class Runner:
                     when = "刚刚" if gap < 1 else f"{gap} 分钟前"
                     returned_text = f"他{when}回到你这边了，人就在旁边。"
 
-        event = self._fresh_event(umo, now)
+        event = None if skip_event else self._fresh_event(umo, now)
         scene = self._event_scene(umo, event, now, with_company=not away_text) if event else ""
 
         # 「刚回来」是场景信息，不是新的状态：同句里的「我正在洗澡」不能被它吞掉。
@@ -2804,7 +2973,7 @@ class Runner:
                 elif subject == "self" and label:
                     # 人在旁边 ≠ 两个人做同一件事：「我正在吃饭」是他在吃。
                     base = (
-                        f"他现在在{label}（已经 {elapsed} 分钟），你就在他旁边，不是在外面。"
+                        f"他现在{label}（已经 {elapsed} 分钟），你就在他旁边，不是在外面。"
                         "这是他自己的事，别说成「你们一起在做」；可以说你就在旁边看着、陪着，"
                         "别提需要他停下手里的事才能回应的要求。"
                     )
@@ -2911,6 +3080,15 @@ class Runner:
                     f"{int(delay // 60)} 分钟后为约定/催睡再醒一次"
                 )
                 return
+
+            # 结束类约定到点：先把对应事件收掉，再生成提示词，
+            # 否则「18:00 下课」这一拍还会说「他还在学习」。
+            if shot == "due":
+                due_item = appt.get("item") or {}
+                if str(due_item.get("kind") or "") == "end":
+                    self._end_matching_event(
+                        umo, due_item.get("label"), time.time()
+                    )
 
             # 待睡提醒：这次触发是「该睡了」的提醒，不是普通主动消息
             text = await self._generate(
