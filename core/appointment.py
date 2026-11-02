@@ -200,12 +200,12 @@ def resolve_at(hour: int, minute: int, period: str | None,
 
 
 def _find_event(text: str, clock: dict, keywords: dict):
-    """在时间附近找事件词，返回 (label, kind, idx) 或 None。"""
+    """在时间附近找事件词，返回 (label, kind, idx, length) 或 None。"""
     start, end = clock["idx"], clock["idx"] + clock["length"]
 
     up = _UP_TO_RE.search(text)
     if up and abs(up.start() - start) <= _MAX_GAP:
-        return ("结束", "end", up.start())
+        return ("结束", "end", up.start(), len(up.group(0)))
 
     best = None
     for kind, words in keywords.items():
@@ -221,7 +221,7 @@ def _find_event(text: str, clock: dict, keywords: dict):
             if best is None or score > best[0]:
                 best = (score, word, kind, idx)
     if best:
-        return (best[1], best[2], best[3])
+        return (best[1], best[2], best[3], len(best[1]))
     return None
 
 
@@ -296,7 +296,7 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
     if not event:
         return drop("E1", "有时间但没有对应的事")
 
-    label, kind, _event_idx = event
+    label, kind, _event_idx, _event_len = event
     at = resolve_at(clock["h"], clock["m"], clock["period"], now, max_hours)
     if at is None:
         return drop("T1", "这个时刻已经过去，或者太远")
@@ -319,6 +319,10 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
         "source": "gray" if force else "kw",
         "idx": idx,
         "length": kw_len,
+        # 事件词的位置：上层用它把「几点 + 做什么」整段消费掉，
+        # 不让同一句话再落成「当前正在做」。
+        "event_idx": _event_idx,
+        "event_len": _event_len,
     }
     return out
 

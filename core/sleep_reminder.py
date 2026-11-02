@@ -351,6 +351,14 @@ def match_wait_detail(
             continue
         if _is_past_at(text, kw, idx):
             continue
+        # 与入睡路径同一口径：「示例：'等会睡'」「我梦见自己等会睡」
+        # 「要是我等会睡就好了」都不是真实安排。
+        if rules.is_reported_clause(text, idx):
+            continue
+        if rules.is_dream_clause(text, idx):
+            continue
+        if rules.is_conditional_clause(text, idx):
+            continue
         ok, d = _gate_ok(text, kw, idx, "wait", enable_judge, strict, nicknames)
         if ok:
             return {

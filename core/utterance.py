@@ -113,6 +113,11 @@ _STRONG_SLEEP = (
     "睡了", "睡觉", "睡觉了", "睡啦", "要睡了", "去睡了", "先睡了",
     "我睡了", "睡了哦", "困了睡了", "晚安",
 )
+# A9：醒来的说法本身就是谓语。head 只允许出现这些修饰语，
+# 「我已经醒了 / 我刚睡醒了 / 我不睡了 / 我睡不着」都算；
+# 「我起床气很大」tail 还有名词，不算。
+_WAKE_MODIFIERS = "我已经都也才刚终于总算可算现在这就还"
+_WAKE_TAIL_STRIP = "。！？!?～~ ，,、…\n\t"
 
 # G1：后面接抽象评价 —— 明显不是在报告动作，直接判灰（不送模型，省 token）
 _EVAL_TAILS = (
@@ -129,6 +134,9 @@ _SCOPE: dict[str, frozenset[str]] = {
     "away": frozenset(("R1", "R2", "R2b", "R2c", "R3", "R4", "R5", "R5b", "R6", "R7", "R8", "A1", "A2", "A3", "A4", "A5", "A8")),
     "return": frozenset(("R1", "R2", "R2b", "R2c", "R3", "A1", "A2", "A5", "A8")),
     "sleep": frozenset(("R1", "R2", "R2b", "R2c", "R3", "R4", "R5", "R5b", "R6", "A1", "A2", "A3", "A4", "A5", "A6", "A8")),
+    # 醒来是「睡」的反向动作，不能复用 sleep 的正面规则（A6 只认入睡词）。
+    # 单独一套 scope：只补 A9「裸谓语」，其余判定与 sleep 同口径。
+    "wake": frozenset(("R1", "R2", "R2b", "R2c", "R3", "R4", "R5", "R5b", "R6", "A1", "A2", "A3", "A4", "A5", "A8", "A9")),
     "wait": frozenset(("R1", "R2", "R2b", "R2c", "R3", "R4", "R5", "R6", "A1", "A2", "A3", "A4", "A5", "A7", "A8")),
     # 结束词只做最窄的判断：名词化 / 定语链 / 情绪宾语 / 体标记
     "stop": frozenset(("R1", "R2", "R2b", "R4", "A2", "A5")),
@@ -156,6 +164,7 @@ _REASONS = {
     "A5": "整句就是这个动作",
     "A8": "省略主语，就是他在做",
     "A6": "就是睡前那句话",
+    "A9": "醒来的裸谓语，就是他在说醒了",
     "A7": "整句就是「晚点睡」的说法",
     "G1": "后面是评价，不是在报告动作",
     "G2": "看不出是不是在说此刻",
@@ -285,6 +294,12 @@ def _judge_cached(
         # 再长就不是「孤立的一句动作」了（「今天看书」这种要留给灰区）。
         if bare == kw or (len(bare) <= 3 and kw in bare):
             return hit("A5", VERDICT_ACCEPT)
+
+    # A9：醒来词的裸谓语。「我已经醒了」「我不睡了」的 head 只有修饰语、
+    # tail 只有语气词——这就是「他醒了」，不需要「去/在/了」这些谓语证据。
+    if "A9" in scope and kind == "wake" and head:
+        if all(ch in _WAKE_MODIFIERS for ch in head) and not tail.strip(_WAKE_TAIL_STRIP):
+            return hit("A9", VERDICT_ACCEPT)
 
     # A8：中文常省略主语，「出门打车了」「吃完饭了」分句头是空的，
     # 但前面已经排除了名词短语和评价句，这里可以放心当成「他在做」。

@@ -426,6 +426,15 @@ class EventRuleStore:
         # 「如果我去洗澡」「要是明天下雨」：假设句里的动作不算发生
         if rules.is_conditional_clause(text, idx):
             return self._filtered()
+        # 「我梦见自己正在洗澡」：梦里的事不算发生。睡眠路径早有这道，
+        # 普通事件路径此前漏了，16 类活动都会被梦境带进来。
+        if rules.is_dream_clause(text, idx):
+            return self._filtered()
+        # 「你去上班吧」是在对机器人说话，不是本人离开/回来。
+        # 事件侧由 _event_subject 记成 her；away/return/end 没有主体概念，
+        # 只能在这里拒掉，否则会把用户标成不在身边 8 小时。
+        if kind in ("away", "return", "end", "solo") and rules.is_second_person_clause(text, idx):
+            return self._filtered()
         if kind == "away":
             # 「出差结束」「上班完了」：这是在说这件事收尾，不是现在要出门
             tail = text[idx + len(kw): rules.clause_end(text, idx + len(kw))]
@@ -538,6 +547,16 @@ class EventRuleStore:
         hit, dropped = self._scan_list(text, self._away_keywords, "away")
         return {"hit": hit, "dropped": dropped}
 
+    def match_words_ex(self, text: str, keywords, kind: str = "away") -> dict:
+        """对任意词表跑完整判定（时态/人称/否定/取消/条件/闸门）。
+
+        runner 里的到站兜底、各走各的兜底以前用裸 `in text`，会绕开上面所有守卫；
+        统一走这里，才能和离开/回归词保持同一口径。
+        """
+        self.reload_if_changed()
+        hit, dropped = self._scan_list(text, keywords, kind)
+        return {"hit": hit, "dropped": dropped}
+
     def match_away(self, text: str):
         hit = self.match_away_ex(text)["hit"]
         return hit["kw"] if hit else None
@@ -633,7 +652,7 @@ class EventRuleStore:
                     continue
                 # 结束词本身是完成体，不能用 is_past_clause（会把「吃完了」全挡掉），
                 # 只挡明确过去；其余按分句判别人称/疑问/转述/假设。
-                if (rules.is_third_person_subject(text, idx)
+                if (rules.is_third_person_clause(text, idx)
                         or rules.is_question_clause(text, idx, len(kw))
                         or rules.is_reported_clause(text, idx)
                         or rules.is_conditional_clause(text, idx)

@@ -50,6 +50,18 @@ _FUTURE_GUARDS = ("回头一看", "回头一瞅", "回头看了眼", "回头看�
 # ---------------------------------------------------------------- 假设/条件
 # 「如果我去洗澡，你就等我」「要是我在洗澡就好了」不是在陈述事实。
 CONDITIONAL_MARKERS = ("如果", "要是", "假如", "万一", "除非", "倘若", "如若", "的话")
+# 条件从句的开头（跨逗号回看上一分句时只认这些，不能认「如果」出现在句中）
+CONDITIONAL_LEADS = ("如果", "要是", "假如", "万一", "除非", "倘若", "如若", "如果说", "哪天")
+# 条件句的后件连词。只有本分句以这些开头，才把上一分句的条件算到本分句头上；
+# 「如果下雨怎么办，现在我们确实在一起吃饭」的后件是「现在我们…」，不算。
+CONDITIONAL_THENS = ("就", "那", "便", "则", "于是", "那么", "我", "你", "他", "她", "咱")
+# 「的话」有两种：条件助词（下雨的话，我就不去）和名词（听你的话 / 我说的话）。
+# 前一字是人称或言语动词时按名词处理，判定前等长遮蔽，索引不变。
+_DE_HUA_PRONOUNS = "我你您他她它咱俺"
+_DE_HUA_VERBS = (
+    "说", "讲", "听", "问", "写", "记", "在乎", "相信", "明白", "懂",
+    "打断", "回", "理", "留", "信", "管",
+)
 # 「梦见我起床了」：梦里的事不算发生
 DREAM_MARKERS = ("梦见", "梦到", "做梦", "梦里")
 
@@ -222,6 +234,32 @@ def is_third_person_subject(text: str, idx: int, extra_names=()) -> bool:
     return False
 
 
+def is_third_person_clause(text: str, idx: int, extra_names=()) -> bool:
+    """分句开头就是第三人称，不要求后面紧跟谓语。
+
+    只给结束词（stop/end）用：「我妈约会结束了」「室友的电影看完了」里
+    命中的是「结束了 / 看完了」，人称和谓语之间隔着名词，不能再按
+    `is_third_person_subject` 的「人称+谓语」严格形态判。
+    """
+    head = clause_head(text, idx, window=14)
+    if not head:
+        return False
+    return any(
+        head.startswith(who)
+        for who in tuple(THIRD_PERSON_SUBJECTS) + tuple(extra_names)
+        if who
+    )
+
+
+def is_second_person_clause(text: str, idx: int) -> bool:
+    """分句主语是「你/您」——是在对机器人说话，不是用户本人。
+
+    事件侧会把它记成 her；但 away/return/end 没有主体概念，
+    「你去上班吧」会被当成用户自己出门。这三条链路要先拒掉。
+    """
+    return clause_head(text, idx, window=14).startswith(("你", "您"))
+
+
 def _quote_spans(text: str) -> list[tuple[int, int]]:
     """成对引号覆盖的区间（左引号位置, 右引号位置）。没闭合的中文引号算到句尾。
 
@@ -262,19 +300,62 @@ def is_reported_clause(text: str, idx: int) -> bool:
     return any(w in head for w in _REPORTED_WORDS)
 
 
+def _mask_possessive_de_hua(text: str) -> str:
+    """把名词性的「的话」等长遮蔽成「的□」，索引不变。
+
+    「我正在开会先别打断我的话」「我在听你的话」里的「的话」是「的+话」，
+    不是条件助词；只有「下雨的话，我就不去」这种才该拦。
+    """
+    if "的话" not in text:
+        return text
+    out = None
+    pos = text.find("的话")
+    while pos != -1:
+        prev = text[max(0, pos - 2):pos]
+        possessive = (
+            (pos >= 1 and text[pos - 1] in _DE_HUA_PRONOUNS)
+            or prev.endswith(_DE_HUA_VERBS)
+        )
+        if possessive:
+            if out is None:
+                out = list(text)
+            out[pos] = "的"
+            out[pos + 1] = "□"
+        pos = text.find("的话", pos + 1)
+    return "".join(out) if out is not None else text
+
+
+def _conditional_in_prev(text: str, idx: int) -> bool:
+    """条件写在前一分句：「如果下雨，我就去洗澡」。
+
+    只认「上一分句以条件词开头」且「本分句以就/那/便/则…开头」，
+    避免「刚才我们讨论了如果下雨怎么办，现在我们确实正在一起吃饭」被误杀。
+    """
+    start = clause_start(text, idx, 14)
+    prev = prev_clause(text, start, 24)
+    if not prev or not prev.startswith(CONDITIONAL_LEADS):
+        return False
+    head = clause_head(text, idx, window=14)
+    return head.startswith(CONDITIONAL_THENS)
+
+
 def is_conditional_clause(text: str, idx: int, window: int = 14, prev_max: int = 4) -> bool:
     """命中词所在分句是不是假设/条件（「如果我去洗澡」「要是明天下雨」）。
 
     「的话」通常在句尾，所以 head 和 tail 都要看；同时允许并上紧邻的短分句
-    （「如果明天，我就去洗澡」）。
+    （「如果明天，我就去洗澡」）。prev_max 保留在签名里兼容旧调用，
+    真正的跨分句判断交给 `_conditional_in_prev`。
     """
     if not text:
         return False
-    head = clause_head(text, idx, window=window, prev_max=prev_max)
+    view = _mask_possessive_de_hua(text)
+    head = clause_head(view, idx, window=window)
     if any(w in head for w in CONDITIONAL_MARKERS):
         return True
-    tail = text[idx: clause_end(text, idx)]
-    return any(w in tail for w in CONDITIONAL_MARKERS)
+    tail = view[idx: clause_end(view, idx)]
+    if any(w in tail for w in CONDITIONAL_MARKERS):
+        return True
+    return _conditional_in_prev(view, idx)
 
 
 def is_dream_clause(text: str, idx: int, window: int = 14) -> bool:
@@ -318,6 +399,27 @@ def drop_keyword(text: str, idx: int, kw_len: int) -> str:
 SELF_NEGATIONS = ("不想", "不要", "不用", "不必", "没空", "没时间", "没心情", "还没", "没在")
 # 命中词前的否定尾巴：「没有在」「不是我在」「不在」「别在」……
 _NEG_TAIL_RE = re.compile(r"(?:(?:没有|没|不|别)(?:在|正|是)?|不是)(?:我)?(?:在|正)?$")
+# 含否定字但不是否定的词：先等长替换掉，避免「不过我在洗澡」被误判。
+_NEG_FALSE_FRIENDS = (
+    "不小心", "不但", "不过", "不仅", "不断", "差不多", "不得不", "忍不住",
+    "恨不得", "不见得", "不由得", "不管", "不论", "不光", "不只", "不一会",
+)
+# 强否定：否定词和关键词之间可以隔「在/正/是 + 我 + 一个短动词」。
+# 「我没有在坐地铁」「不是我在看电影」都靠它收。
+_NEG_STRONG_RE = re.compile(
+    r"(?:没有|不是|并非|并没|根本没有|根本没|从来没|从没|从未|不曾)"
+    r"(?:是|在|正|有)?[我]{0,1}[^\s，。！？；,.!?;]{0,3}$"
+)
+# 弱否定：单个否定字 + 最多两个动词/助词。「我没在看电影」「我不坐地铁」。
+_NEG_WEAK_RE = re.compile(
+    r"(?:没|不|别)[在正看坐听写玩吃洗做待呆逛跑走读学练刷等]{0,2}$"
+)
+
+
+def _strip_neg_false_friends(head: str) -> str:
+    for word in _NEG_FALSE_FRIENDS:
+        head = head.replace(word, "　" * len(word))
+    return head
 
 
 def is_self_action_clause(text: str, idx: int, kw_len: int = 0) -> bool:
@@ -350,19 +452,58 @@ def is_self_action_clause(text: str, idx: int, kw_len: int = 0) -> bool:
 
 
 def negated_by_clause(text: str, idx: int, negations, window: int = 4) -> bool:
-    """命中词前 4 个字内出现否定词才算否定，且不跨分句。
+    """命中词前出现否定词才算否定，且不跨分句。
 
     「不困，再看会手机」：`再看会手机` 的分句头在逗号之后，前面的「不」不影响它。
+
+    先看命中词前 4 字（原有口径），再放宽到 10 字，专门收
+    「我没有在坐地铁」「不是我在看电影」这种否定与关键词之间夹了动词的形态。
+    放宽前先剔除「不小心 / 不但 / 不过 / 不仅」这类含否定字但不是否定的词。
     """
     if idx <= 0 or not negations:
         return False
-    head = clause_head(text, idx, window=window)
+    tight = clause_head(text, idx, window=window)
+    if tight:
+        if any(n in tight for n in negations):
+            return True
+        if tight[-1] in ("不", "别", "没"):
+            return True
+        if _NEG_TAIL_RE.search(tight):
+            return True
+    head = clause_head(text, idx, window=10)
     if not head:
         return False
-    if any(n in head for n in negations):
+    clean = _strip_neg_false_friends(head)
+    if _NEG_STRONG_RE.search(clean):
         return True
-    if head[-1] in ("不", "别", "没"):
-        return True
-    # 「没在开会」「不在洗澡」「我没有在吃饭」「不是我在打游戏」：
-    # 否定词和「在/正」之间可能隔了「有/是/我」，统一用尾部正则收。
-    return bool(_NEG_TAIL_RE.search(head))
+    return bool(_NEG_WEAK_RE.search(clean))
+
+
+# ---------------------------------------------------------------- 消费跨度
+# 处理完一个动作后，只遮住「这个动作本身」，不要整句/整个分句一起抹掉。
+_CONSUME_PARTICLES = "了啦咯喽哦呀噢噜着"
+_CONSUME_CONNECTORS = ("然后", "接着", "随后", "于是", "现在", "马上", "就", "再", "先")
+_CONSUME_TAIL_MARKS = "，,。！？!?；;、~～… \t\n"
+
+
+def consume_span(text: str, idx: int, kw_len: int = 0) -> tuple[int, int]:
+    """返回「这个动作已经消费掉」的区间 [start, end)。
+
+    start 是该分句开头（把主语和前面的状语一起吃掉）；
+    end 停在命中词 + 语气词 + 一个转接词 + 尾随标点之后。
+    「吃完了我正在洗澡」→ 只吃掉「吃完了」，留下「我正在洗澡」；
+    「吃完了，我正在洗澡」→ 连逗号一起吃掉。
+    """
+    if not text:
+        return 0, 0
+    start = clause_start(text, idx, None)
+    end = min(len(text), idx + max(0, kw_len))
+    while end < len(text) and text[end] in _CONSUME_PARTICLES:
+        end += 1
+    for word in _CONSUME_CONNECTORS:
+        if text.startswith(word, end):
+            end += len(word)
+            break
+    while end < len(text) and text[end] in _CONSUME_TAIL_MARKS:
+        end += 1
+    return start, end

@@ -57,9 +57,14 @@ from .appointment import (
 
 TAG = "[Minichat]"
 
+# 「明确禁用」和「没设置」必须分开：前者绝不能回退默认人格。
+_PERSONA_DISABLED = object()
+
 APPOINTMENT_KEY = "appointments"
 # 到点后多久还没发出去就放弃（重启/睡眠错过的约定不该在半夜补发）
 APPOINTMENT_GRACE_MINUTES = 20
+# 事件结束后「在一起」再保留一小段：人还在旁边，但别一直挂到过期。
+TOGETHER_TAIL_MINUTES = 15
 # 队列上限：一天说三个时间点够用了，再多就是噪音
 APPOINTMENT_MAX_SLOTS = 3
 
@@ -304,6 +309,7 @@ class Runner:
                 continue
             label = event.get("label") or event.get("name") or "事件"
             self.store.pop(umo, "active_event")
+            self._sync_together_until(umo, closing=True)
             changed = True
             if self.store.get(umo, "pre_event_next_at"):
                 logger.info(f"{TAG} 事件「{label}」已结束，按事件规则决定下一次时间")
@@ -717,6 +723,10 @@ class Runner:
             "expires_at": now + ttl * 60,
             "hint": rule.get("hint") or "",
         })
+        # 事件比「在一起」更长时，在一起跟到事件结束
+        self._sync_together_until(umo, {
+            "expires_at": now + ttl * 60,
+        })
 
     # 说「快回来了」时，只有这类「出门在外」的事件才有意义去叠加加成；
     # 在家做别的（吃饭/洗澡/打游戏）说快回来是说不通的，跳过。
@@ -932,7 +942,50 @@ class Runner:
                 else:
                     item["follow_up_at"] = 0
                     item["stage"] = "done"
+            # 「到家」这条约定到点：人是真的回来了，清掉离开状态；
+            # 通勤事件也该结束。不主动写 together（不能凭空断定她和你在同一处）。
+            if shot == "due" and str(item.get("kind") or "") == "arrive":
+                label = str(item.get("label") or "")
+                if any(w in label for w in ("到家", "进门", "回来")):
+                    away = self.store.get(umo, "away")
+                    if isinstance(away, dict) and away.get("active"):
+                        self.store.set(umo, "away", {
+                            "active": False,
+                            "reason": away.get("reason") or "",
+                            "keyword": label,
+                            "cleared_at": now,
+                        })
+                    current_event = self.store.get(umo, "active_event")
+                    if isinstance(current_event, dict) and current_event.get("name") == "commute":
+                        self.store.pop(umo, "active_event")
+                        self._sync_together_until(umo, closing=True)
         self._save_appointments(umo, items)
+
+    def _defer_appointment(self, umo: str, at: float | None, wake_at: float) -> bool:
+        """睡眠中到点的约定：改排到起床后一分钟，别静默丢掉。"""
+        if not at:
+            return False
+        items = self._appointments(umo)
+        cfg = self._appointment_cfg()
+        item = self._pick_appointment(items, "due", time.time(), cfg, at)
+        if item is None:
+            return False
+        new_at = float(wake_at) + 60
+        if new_at <= time.time():
+            return False
+        item["at"] = new_at
+        item["stage"] = "pending"
+        item["lead_sent_at"] = 0
+        item["due_sent_at"] = 0
+        item["follow_up_at"] = 0
+        item["follow_ups"] = 0
+        # 保留原来的 time_text（那是他昨晚说的时间），用标记让提示词别写成「到点了」
+        item["deferred"] = True
+        self._save_appointments(umo, items)
+        logger.info(
+            f"{TAG} 约定到点时在睡眠中，延后到起床后：{item.get('time_text')} {item.get('label')}"
+        )
+        return True
 
     def _appointment_fail(self, umo: str, shot: str, at: float | None = None) -> None:
         """生成或发送失败：记一次，连续两次就放弃，别每分钟重试烧钱。"""
@@ -1047,6 +1100,12 @@ class Runner:
         cfg = self._appointment_cfg()
         template = cfg["hint"] if shot == "due" else ""
         body = build_appointment_hint(item, shot, datetime.now(), template)
+        if item.get("deferred"):
+            note = (
+                "（这条是昨晚该发的，他睡着了，现在才补说；别提具体几点，"
+                "用「说好的事」带过，别让他觉得时间穿越了）"
+            )
+            body = f"{body}\n{note}" if body else note
         if shot == "due" and str(item.get("kind") or "") == "arrive":
             # 只有「到家/进门」才说她就在你身边；「到公司/到学校」是她去了别处，
             # 不能说成人回来了。
@@ -1061,17 +1120,21 @@ class Runner:
             return f"{body}\n{scene}"
         return body or scene
 
-    def _handle_appointment_words(self, umo: str, text: str) -> bool:
-        """识别约定。返回 True 表示这句话已经处理过，不必再走语义识别。"""
+    def _handle_appointment_words(self, umo: str, text: str):
+        """识别约定。返回 `(是否处理, 剩余文本|None)`。
+
+        命中后把「几点 + 做什么」整段遮掉再回炉：这句话说的是将来的安排，
+        不能再被当前事件匹配一遍（「下午三点我去开会」不能同时记成正在开会）。
+        """
         cfg = self._appointment_cfg()
         if not cfg["enable"] or not text or not text.strip():
-            return False
+            return False, None
 
         counter = self.store.get(umo, "appointment_counter") or {}
         today = datetime.now().strftime("%Y-%m-%d")
         used = _as_int(counter.get("n"), 0) if counter.get("date") == today else 0
         if cfg["max_per_day"] and used >= cfg["max_per_day"]:
-            return False
+            return False, None
 
         result = parse_appointment(text, datetime.now(), cfg)
         for item in result["dropped"]:
@@ -1094,13 +1157,13 @@ class Runner:
                 "text": text.strip(),
                 "snapshot": copy.deepcopy(self.store.get(umo, APPOINTMENT_KEY)),
             }
-            return False
+            return False, None
 
         hit = result["hit"]
         if not hit:
-            return False
+            return False, None
         if not self._set_appointment(umo, hit):
-            return False
+            return False, None
         self.store.set(umo, "appointment_counter", {"date": today, "n": used + 1})
         self._dec_buffer.append({
             "kind": "appointment",
@@ -1110,7 +1173,16 @@ class Runner:
             "reason": f"约定 {hit['label']}",
         })
         self.reschedule(umo)
-        return True
+
+        idx = int(hit.get("idx") or 0)
+        length = int(hit.get("length") or 0)
+        event_idx = hit.get("event_idx")
+        event_idx = idx if event_idx is None else int(event_idx)
+        event_len = int(hit.get("event_len") or 0)
+        start = rules.clause_start(text, min(idx, event_idx), None)
+        end = rules.clause_end(text, max(idx + length, event_idx + event_len))
+        rest = self._mask_span(text, start, end)
+        return True, (rest if rest.strip() else None)
 
     # ------------------------------------------------------------------
     # 提醒睡觉
@@ -1320,12 +1392,13 @@ class Runner:
             return list(self.WAKE_KEYWORDS_DEFAULT)
         return [k.strip() for k in str(raw).replace("，", ",").split(",") if k.strip()]
 
-    @staticmethod
-    def _first_action_hit(text: str, words):
-        """在一组词里找第一个「用户本人在做」的命中（否定/疑问/第三人称/时态/转述都过滤）。
+    @classmethod
+    def _first_action_hit_ex(cls, text: str, words):
+        """在一组词里找第一个「用户本人在做」的命中，返回 (词, 位置)。
 
         交接词、唤醒词这类短词以前都是裸 `in text`，误判率很高：
         「不好吃」「还没开饭」「他觉得好吃」「明天开饭再说」全会被当成已经吃上了。
+        返回位置是为了能精确消费这一段，而不是把整句一起吃掉。
         """
         if not text:
             return None
@@ -1335,9 +1408,14 @@ class Runner:
             idx = text.find(word)
             while idx != -1:
                 if rules.is_self_action_clause(text, idx, len(word)):
-                    return word
+                    return word, idx
                 idx = text.find(word, idx + 1)
         return None
+
+    @classmethod
+    def _first_action_hit(cls, text: str, words):
+        hit = cls._first_action_hit_ex(text, words)
+        return hit[0] if hit else None
 
     def _match_wake(self, text: str):
         """命中「醒了」类的词，但要排除别人的、疑问的、否定的、将来和转述。
@@ -1360,8 +1438,10 @@ class Runner:
                 if not rules.is_self_action_clause(text, idx, len(kw)):
                     idx = text.find(kw, idx + 1)
                     continue
-                # 名词化：「起床时间太早了」里的「起床」不是动作
-                d = utterance.judge_detail(text, idx, kw, kind="sleep")
+                # 名词化：「起床时间太早了」里的「起床」不是动作。
+                # 醒来用独立的 wake scope：sleep 的正面规则只认「要去睡」，
+                # 「我已经醒了 / 我不睡了」在 sleep 下全是灰区。
+                d = utterance.judge_detail(text, idx, kw, kind="wake")
                 if d.get("verdict") != utterance.VERDICT_ACCEPT:
                     idx = text.find(kw, idx + 1)
                     continue
@@ -1385,6 +1465,9 @@ class Runner:
     SPLIT_MARKS = (
         "先去", "先进", "先走", "先回", "自己", "一个人", "单独", "各走", "分头",
     )
+    # 这些事件会被「下课/下班/散会」这类阶段结束词真正结束掉；
+    # 「在一起」不跟着清（人在旁边这个事实没变）。
+    PERIOD_END_EVENTS = ("working", "commute", "study", "meeting")
     # 只报站不说去做什么（「到学校咯」）：一到地方，「在一起」就该断。
     # 不含「到家」——到家是回到身边，不是离开。
     ARRIVE_PLACES = (
@@ -1397,6 +1480,15 @@ class Runner:
     # 于是第三方同行被误判、离开状态被吞。现在只认二人称（和你/跟您），
     # 昵称场景交给 bot_nicknames 配置（默认「宝宝/宝贝」，与 v0.0.3 行为一致）。
     _TOGETHER_RE = re.compile(r"[和跟与同]\s*[你您]")
+    # 「和好 / 和气 / 暖和」里的「和」不是同行对象，先剔掉再看同伴。
+    _TOGETHER_NOISE_RE = re.compile(r"和好|和气|和谐|和善|暖和|柔和|温和|总和|共和")
+    _COMPANION_RE = re.compile(r"[和跟与同]\s*([\u4e00-\u9fa5]{1,3})")
+    # 「不想和你一起」「别和朋友一起走」：否定在同行词前面 0~3 字内
+    _TOGETHER_NEG_RE = re.compile(
+        r"(?:不想|不要|不用|别|没|不)[^，。！？,.!?;；]{0,3}"
+        r"(?:一起|一块|一道|陪你|带你|[和跟与同][你您])"
+    )
+    _BOT_COMPANIONS = ("你", "您", "我", "咱", "俺", "我们", "咱们", "俩人", "两人")
     # 同理：「帮/给/替/哄/喂/教 + 你」才是"对方在做"。
     # 「给狗洗澡」「帮老板带饭」这类第三人称受事不再反转主体。
     _HER_RE = re.compile(r"(?:帮|给|替|哄|喂|教)\s*[你您]")
@@ -1420,21 +1512,79 @@ class Runner:
         joined = "|".join(re.escape(n) for n in names)
         return re.compile(rf"[{verb_chars}]\s*(?:{joined})")
 
-    def _is_together(self, text: str) -> bool:
-        # 「我不想和你一起出门」「如果我们一起出门就好了」不是真的在一起
-        if rules.is_conditional_clause(text, 0):
+    def _companion_not_bot(self, view: str) -> bool:
+        """同行对象里出现了「不是机器人」的同伴。
+
+        先看这句话有没有指向机器人的称呼（你/您/配置昵称）；有就是和机器人。
+        没有的话，只要出现 `和/跟/与/同 + 人`，就按第三方同行处理——
+        「和朋友 / 我妈 / 陌生人」一次收掉，不用一直补名单。
+        """
+        cleaned = self._TOGETHER_NOISE_RE.sub(lambda m: "　" * len(m.group(0)), view)
+        if re.search(r"[你您]", cleaned):
             return False
-        if re.search(r"(?:不想|别|不要|没|不)[和跟与同你]", text):
+        if any(name and name in cleaned for name in self._bot_nicknames()):
             return False
-        if any(k in text for k in self.TOGETHER_KEYWORDS):
-            # 「我和朋友一起吃饭」「跟同事一块出门」：同伴不是机器人
-            if re.search(r"[和跟与同](?:朋友|同事|同学|室友|老板|客户|老师|家人|对象|老婆|老公)", text):
-                return False
-            return True
-        if self._TOGETHER_RE.search(text):
-            return True
+        return bool(self._COMPANION_RE.search(cleaned))
+
+    def _together_hit(self, text: str, idx: int | None = None):
+        """返回 (同行词, 位置) 或 None。逐命中、按命中分句判定。
+
+        idx 给定时只在该分句里找（「我和朋友告别了，现在和你一起出门」
+        只认后半句），避免整句一票否决。
+        """
+        if not text:
+            return None
+        hits: list[tuple[int, str]] = []
+        for kw in self.TOGETHER_KEYWORDS:
+            if not kw:
+                continue
+            pos = text.find(kw)
+            while pos != -1:
+                hits.append((pos, kw))
+                pos = text.find(kw, pos + 1)
+        for match in self._TOGETHER_RE.finditer(text):
+            hits.append((match.start(), match.group(0)))
         nick = self._nick_re("和跟与同")
-        return bool(nick and nick.search(text))
+        if nick is not None:
+            for match in nick.finditer(text):
+                hits.append((match.start(), match.group(0)))
+        if not hits:
+            return None
+        hits.sort(key=lambda item: (item[0], -len(item[1])))
+
+        span = None
+        if idx is not None and 0 <= idx < len(text):
+            span = (rules.clause_start(text, idx, None), rules.clause_end(text, idx))
+        seen: set[int] = set()
+        for pos, kw in hits:
+            if pos in seen:
+                continue
+            seen.add(pos)
+            if span is not None and not (span[0] <= pos < span[1]):
+                continue
+            if rules.is_reported_clause(text, pos):
+                continue
+            if rules.is_dream_clause(text, pos):
+                continue
+            if rules.is_conditional_clause(text, pos):
+                continue
+            if rules.is_future_clause(text, pos, prev_max=4):
+                continue
+            if rules.is_far_past_clause(text, pos):
+                continue
+            view = text[rules.clause_start(text, pos, None): rules.clause_end(text, pos)]
+            if self._TOGETHER_NEG_RE.search(view):
+                continue
+            if self._companion_not_bot(view):
+                continue
+            return kw, pos
+        return None
+
+    def _is_together(self, text: str) -> bool:
+        return self._together_hit(text) is not None
+
+    def _is_together_at(self, text: str, idx: int) -> bool:
+        return self._together_hit(text, idx) is not None
 
     def _is_her(self, text: str) -> bool:
         """这件事是机器人在做（「给你擦药」「帮宝宝吹头发」）。"""
@@ -1491,16 +1641,19 @@ class Runner:
             since = float(prev.get("since") or now)
         until = now + self._together_ttl()
         event = self.store.get(umo, "active_event")
+        linked = False
         if isinstance(event, dict):
             exp = float(event.get("expires_at") or 0)
             if exp > until:
                 # 事件比默认时长还长（约会的 ttl 是 3 小时），就跟到事件结束
                 until = min(exp, now + self._together_ttl() * 2)
+                linked = True
         self.store.set(umo, "together", {
             "active": True,
             "since": since,
             "until": until,
             "keyword": keyword or (prev or {}).get("keyword") or "",
+            "event_linked": linked,
         })
         # 「在一起」和「不在身边」是互斥的：人都说你旁边了，
         # 就别再留着"他出门了"的记录，否则提示词会同时给出两个矛盾的场景。
@@ -1516,6 +1669,38 @@ class Runner:
     def _clear_together(self, umo: str) -> None:
         if isinstance(self.store.get(umo, "together"), dict):
             self.store.pop(umo, "together")
+
+    def _sync_together_until(self, umo: str, event=None, closing: bool = False) -> None:
+        """让「在一起」的时长跟当前事件对齐。
+
+        以前 `_touch_together` 只在建立时按事件延长一次；事件续期、结束、
+        过期巡检都不回写，导致事件结束后 together 还按最长 300 分钟挂着。
+        """
+        tg = self.store.get(umo, "together")
+        if not (isinstance(tg, dict) and tg.get("active")):
+            return
+        now = time.time()
+        if closing:
+            if not tg.get("event_linked"):
+                return
+            tg["until"] = min(float(tg.get("until") or now) or now,
+                              now + TOGETHER_TAIL_MINUTES * 60)
+            tg["event_linked"] = False
+            self.store.set(umo, "together", tg)
+            return
+        ev = event if isinstance(event, dict) else self.store.get(umo, "active_event")
+        if not isinstance(ev, dict):
+            return
+        exp = float(ev.get("expires_at") or 0)
+        if exp <= now:
+            return
+        current = float(tg.get("until") or now)
+        if exp <= current:
+            # 事件比「在一起」还短，别反过来把它缩短
+            return
+        tg["event_linked"] = True
+        tg["until"] = min(exp, now + self._together_ttl() * 2)
+        self.store.set(umo, "together", tg)
 
     def _wake_if_sleeping(self, umo: str, text: str) -> None:
         """睡眠免打扰只在明确说「醒了/起床/睡不着」时解除，睡前闲聊不误触。"""
@@ -1952,8 +2137,9 @@ class Runner:
             handled = self._flush_decisions(umo, text, before, handled)
         return handled
 
-    # 一句话最多回炉几次：每轮至少遮掉一个分句，防止遮罩不收敛导致死循环
-    CLAUSE_PASS_MAX = 4
+    # 一句话最多回炉几次：每轮至少遮掉一个分句，防止遮罩不收敛导致死循环。
+    # 约定 + 结束词 + 交接可能连着回炉三次，留到 6 轮。
+    CLAUSE_PASS_MAX = 6
 
     @staticmethod
     def _mask_span(text: str, start: int, end: int) -> str:
@@ -1964,6 +2150,16 @@ class Runner:
     def _mask_clause(cls, text: str, idx: int) -> str:
         return cls._mask_span(text, rules.clause_start(text, idx, None),
                               rules.clause_end(text, idx))
+
+    @classmethod
+    def _consume_stop(cls, text: str, idx: int, kw: str) -> str:
+        """只遮掉「这个结束词本身」，留下同分句里的下一个动作。"""
+        if kw and text[idx: idx + len(kw)] == kw:
+            start, end = rules.consume_span(text, idx, len(kw))
+        else:
+            # 兜底（例如「让给你吃」这种没有真实命中位置的合成词）
+            start, end = rules.clause_start(text, idx, None), rules.clause_end(text, idx)
+        return cls._mask_span(text, start, end)
 
     def _update_inner(self, umo: str, text: str) -> bool:
         handled, work = False, text
@@ -1989,15 +2185,20 @@ class Runner:
         self._wake_if_sleeping(umo, text)
 
         # 约定时间点：独立于事件开关（说了「上到十二点」就该记住）
-        appt_hit = self._handle_appointment_words(umo, text)
+        appt_hit, appt_rest = self._handle_appointment_words(umo, text)
 
         if not bool(self.engine_cfg.get("enable_event", True)):
             return None, True
+
+        # 约定命中的分句已经消费掉了（那是将来的安排），剩下的分句回炉。
+        if appt_hit:
+            return (appt_rest if appt_rest and appt_rest.strip() else None), True
 
         # 过期清理
         event = store.get(umo, "active_event")
         if isinstance(event, dict) and now >= float(event.get("expires_at") or 0):
             store.pop(umo, "active_event")
+            self._sync_together_until(umo, closing=True)
             event = None
 
         # 「快回来了」要先判：默认词表里「快到家」本身包含回归词「到家」，
@@ -2050,6 +2251,12 @@ class Runner:
                     "keyword": end_kw,
                     "cleared_at": now,
                 })
+                # 下课/下班/散会也意味着对应事件结束：以前只改 away，
+                # 事件还挂着「在上班」，提示词会继续按上班写。
+                if isinstance(event, dict) and event.get("name") in self.PERIOD_END_EVENTS:
+                    store.pop(umo, "active_event")
+                    event = None
+                    self._sync_together_until(umo, closing=True)
                 logger.info(f"{TAG} 阶段性结束（命中「{end_kw}」），解除离开")
                 # 旧的解除之后，同句里可能还有一件新的事：
                 # 「下班了，我正在洗澡」要能继续往下认出洗澡。离开词还按整句判，
@@ -2063,6 +2270,7 @@ class Runner:
         away_ex = self.engine.match_away_ex(text)
         self._note("away", {"hit": away_ex["hit"], "dropped": away_ex["dropped"]})
         away_kw = away_ex["hit"]["kw"] if away_ex["hit"] else None
+        away_idx = int(away_ex["hit"].get("idx") or 0) if away_ex["hit"] else 0
         if away_kw and self._is_request_to_someone(text, away_kw):
             # 「帮我拿快递」「给你取外卖」是支使别人去做，不是用户自己要出门
             away_kw = None
@@ -2070,16 +2278,17 @@ class Runner:
             # 刚说好「一起」时，接下来省略主语的「出门吧 / 走吧 / 出门了」算一起出门，
             # 不切成"他一个人走了"。带「我」的才算他自己走（「我先出门了」）。
             # 但「先上课 / 去上班 / 各走各的」这类只能各进各的门，不能沿用"一起"。
-            solo = any(k in text for k in self.SOLO_SCENES) or any(
-                m in text for m in self.SPLIT_MARKS
+            solo = bool(
+                self.engine.match_words_ex(text, self.SOLO_SCENES, "solo")["hit"]
+                or self.engine.match_words_ex(text, self.SPLIT_MARKS, "solo")["hit"]
             )
             carried = (
                 not solo
-                and not self._is_together(text)
+                and not self._is_together_at(text, away_idx)
                 and "我" not in text
                 and self._together_alive(umo, now)
             )
-            if self._is_together(text) or carried:
+            if self._is_together_at(text, away_idx) or carried:
                 # 一起出门：不算「离开」，她就在你身边。直接清掉 away 记录，
                 # 不写 cleared_at，这样 event_hint 会落到「在一起」，而不是「刚回来」。
                 store.pop(umo, "away")
@@ -2100,10 +2309,13 @@ class Runner:
                 })
                 logger.info(f"{TAG} 标记不在身边（命中“{away_kw}”）")
         elif self._together_alive(umo, now) and (
-            arrived := next((p for p in self.ARRIVE_PLACES if p in text), None)
+            arrived := (self.engine.match_words_ex(
+                text, self.ARRIVE_PLACES, "solo")["hit"] or {}).get("kw")
         ):
             # 「到学校咯」这种只报站、不说去做什么的句子：人已经在那边了，
             # 「在一起」必须断掉，否则会一路挂到过期，她还在按"就在你旁边"说话。
+            # 但要先过完整判定：「明天才到公司」「我妈到公司了」「他说我到学校了」
+            # 都不是此刻，不能把「在一起」清掉。
             self._clear_together(umo)
             store.set(umo, "away", {
                 "active": True,
@@ -2115,8 +2327,10 @@ class Runner:
             })
             logger.info(f"{TAG} 到地方了（「{arrived}」），不再按在身边算")
         elif self._together_alive(umo, now) and (
-            solo_hit := (next((k for k in self.SOLO_SCENES if k in text), None)
-                         or next((m for m in self.SPLIT_MARKS if m in text), None))
+            solo_hit := ((self.engine.match_words_ex(
+                text, self.SOLO_SCENES, "solo")["hit"] or {}).get("kw")
+                or (self.engine.match_words_ex(
+                    text, self.SPLIT_MARKS, "solo")["hit"] or {}).get("kw"))
         ):
             # 没命中离开词，但说的是「各自进门 / 分头走」（开会去了、各走各的）。
             # 以前这两张词表只在离开词分支里查，这类句子根本走不到，
@@ -2137,12 +2351,11 @@ class Runner:
                 logger.info(f"{TAG} 「{solo_hit}」是各走各的，标记不在身边")
             else:
                 logger.info(f"{TAG} 「{solo_hit}」是各走各的，不再按在身边算")
-        elif self._is_together(text) and not self.engine.is_future_text(text) \
-                and not self.engine.is_far_past_text(text):
+        elif (together_hit := self._together_hit(text)):
             # 没有离开词，但这句话明显是「我们在一起」（牵手/抱着/陪你…）：
             # 记一段「在一起」状态，主动消息才不会按「他不在」来写。
-            # 「改天一起看电影」「昨天一起吃了饭」是计划/过去，不该现在就记在一起。
-            self._touch_together(umo, now)
+            # 引用/梦境/将来/过去/第三方同伴已由 _together_hit 按命中分句过滤。
+            self._touch_together(umo, now, together_hit[0])
 
         # 结束词（带闸门：「吃完了的时候」这种名词化不算结束）
         stop = self.engine.stop_detail(event, text) if isinstance(event, dict) else {"stopped": False, "dropped": []}
@@ -2164,8 +2377,9 @@ class Runner:
         # 不换的话「在做饭」会挂满 40 分钟，提示词一直让她凑过去闻、尝第一口——
         # 人都已经吃上了，她还在说锅里。
         if isinstance(event, dict) and event.get("name") == "cooking":
-            meal = self._first_action_hit(text, self.MEAL_HANDOFF)
-            if meal:
+            meal_hit = self._first_action_hit_ex(text, self.MEAL_HANDOFF)
+            if meal_hit:
+                meal, meal_idx = meal_hit
                 store.pop(umo, "active_event")
                 self._note("event", {"hit": {
                     "kw": meal, "verdict": "accept",
@@ -2180,13 +2394,20 @@ class Runner:
                     logger.info(f"{TAG} 事件交接：做饭 → 吃饭（「{meal}」）")
                 else:
                     logger.info(f"{TAG} 事件结束：做饭（「{meal}」）")
+                # 「吃饱了，我正在洗澡」：只消费「吃饱了」这一段，
+                # 剩下的分句回炉，别把洗澡一起吞掉。
+                rest = self._mask_span(text, *rules.consume_span(text, meal_idx, len(meal)))
+                if rest.strip():
+                    return rest, True
                 return None, True
 
         if stopping:
             store.pop(umo, "active_event")
+            self._sync_together_until(umo, closing=True)
             logger.info(f"{TAG} 事件结束：{event.get('label')}")
-            # 「吃完了，我正在洗澡」：吃完只占前半句，剩下的要能继续认出洗澡
-            rest = self._mask_clause(text, stop["idx"])
+            # 「吃完了，我正在洗澡」「吃完了我正在洗澡」：只消费结束词本身，
+            # 剩下的新动作继续回炉；无标点时也不会连新谓语一起抹掉。
+            rest = self._consume_stop(text, stop["idx"], stop.get("kw") or "")
             if not rest.strip():
                 return None, True
             return rest, True
@@ -2195,13 +2416,19 @@ class Runner:
         self._note("event", {"hit": md if md.get("rule") else None, "dropped": md.get("dropped") or []})
         rule = md["rule"]
         if rule is None:
-            # 约定命中过就不必再问模型了
-            return None, bool(appt_hit)
+            return None, False
 
         if isinstance(event, dict) and event.get("name") == rule.get("name"):
             ttl = self.engine.ttl_for(rule)
             event["expires_at"] = now + ttl * 60
             event["boost_used"] = 0
+            # 同名事件续期时主体可能变了：「你正在洗澡」→「我正在洗澡」，
+            # 只续期不重算会让 event_hint 一直按「你在洗」来写。
+            event["subject"] = self._event_subject(
+                text, md.get("idx"), len(md.get("kw") or "")
+            )
+            event["keyword"] = md.get("kw") or event.get("keyword")
+            self._sync_together_until(umo, event)
             logger.info(f"{TAG} 事件续期：{event.get('label')}")
             return None, True
 
@@ -2391,10 +2618,49 @@ class Runner:
     # ------------------------------------------------------------------
     # 提示词素材
     # ------------------------------------------------------------------
+    def _fresh_event(self, umo: str, now: float):
+        event = self.store.get(umo, "active_event")
+        if isinstance(event, dict) and now < float(event.get("expires_at") or 0):
+            return event
+        return None
+
+    def _event_scene(self, umo: str, event: dict, now: float,
+                     with_company: bool = True) -> str:
+        """只描述「当前事件」，不掺在场/在一起。
+
+        with_company=False：用户不在身边时，别说「他就在旁边陪着你」。
+        """
+        if not isinstance(event, dict):
+            return ""
+        elapsed = max(1, int((now - float(event.get("started_at") or now)) // 60))
+        # 主体是「她」：这件事是对方在做，别写成"他在做"
+        if str(event.get("subject") or "") == "her":
+            label = str(event.get("label") or "").strip()
+            if label:
+                if not with_company:
+                    return (
+                        f"你现在{label}（已经 {elapsed} 分钟）。"
+                        "这件事是你自己在做，不是他在做——别提「你先去」「你快点」"
+                        "这种把他当主角的说法；可以说说自己的感受。"
+                    )
+                return (
+                    f"你现在{label}（已经 {elapsed} 分钟），他就在旁边陪着你、帮你弄。"
+                    f"这件事是你自己在做，不是他在做——别提「你先去」「你快点」这种把他当主角的说法；"
+                    "可以说说自己的感受，让他帮你搭把手，语气黏一点。"
+                )
+        try:
+            hint = self.engine.build_hint(event, elapsed)
+        except Exception:
+            hint = ""
+        return hint or ""
+
     def event_hint(self, umo: str) -> str:
         fallback = "他眼下没在忙什么特别的事。"
         now = time.time()
 
+        # 「不在身边」和「当前事件」是两个正交的轴：以前 away 直接 return，
+        # 人明明在通勤/在公司，提示词里完全看不到他在做什么。
+        away_text = ""
         away = self.store.get(umo, "away")
         if isinstance(away, dict):
             if away.get("active") and now < float(away.get("expires_at") or 0):
@@ -2407,52 +2673,54 @@ class Runner:
                         "也别问「到哪了」；可以说去门口接、把拖鞋摆好、饭别凉了这类眼前的事。"
                     )
                 mins = max(1, int((now - float(away.get("started_at") or now)) // 60))
-                return f"他 {mins} 分钟前说{away.get('reason') or '出门'}，现在还没回来，不在你这边。"
-            cleared = float(away.get("cleared_at") or 0)
-            window = int(self.engine_cfg.get("back_window_minutes", 10) or 10)
-            if cleared and (now - cleared) < window * 60:
-                gap = int((now - cleared) // 60)
-                when = "刚刚" if gap < 1 else f"{gap} 分钟前"
-                return f"他{when}回到你这边了，人就在旁边。"
+                away_text = (
+                    f"他 {mins} 分钟前说{away.get('reason') or '出门'}，"
+                    "现在还没回来，不在你这边。"
+                )
+            else:
+                cleared = float(away.get("cleared_at") or 0)
+                window = int(self.engine_cfg.get("back_window_minutes", 10) or 10)
+                if cleared and (now - cleared) < window * 60:
+                    gap = int((now - cleared) // 60)
+                    when = "刚刚" if gap < 1 else f"{gap} 分钟前"
+                    return f"他{when}回到你这边了，人就在旁边。"
+
+        event = self._fresh_event(umo, now)
+        scene = self._event_scene(umo, event, now, with_company=not away_text) if event else ""
 
         together = self.store.get(umo, "together")
-        if (isinstance(together, dict) and together.get("active")
-                and now < float(together.get("until") or 0)):
-            event = self.store.get(umo, "active_event")
-            if isinstance(event, dict) and now < float(event.get("expires_at") or 0):
+        together_alive = bool(
+            isinstance(together, dict) and together.get("active")
+            and now < float(together.get("until") or 0)
+        )
+        if together_alive:
+            if isinstance(event, dict):
                 label = str(event.get("label") or "").strip()
                 elapsed = max(1, int((now - float(event.get("started_at") or now)) // 60))
-                if label:
-                    return (
+                # 「你正在洗澡」的主体是她：不能写成「你们现在在洗澡」。
+                if str(event.get("subject") or "") == "her" and label:
+                    base = (
+                        f"你现在{label}（已经 {elapsed} 分钟），他就在你旁边陪着你。"
+                        "这件事是你自己在做，不是他在做；别提「你先去」「你快点」这种"
+                        "把他当主角的说法，可以说说自己的感受，让他帮你搭把手。"
+                    )
+                elif label:
+                    base = (
                         f"你们现在{label}（已经 {elapsed} 分钟），他就在你旁边，不是在外面。"
                         "别说「想你」「等你回来」「到哪了」「给你留着」这种不在身边的说法，"
                         "也别给他留位置；直接说眼前的事——手、座位、吃的、下一步去哪，"
                         "语气黏但踏实，不孤单。"
                     )
-            return "你们在一起，他人就在你旁边。别用「想你」「等你回来」这种话，直接跟身边的人说话。"
+                else:
+                    base = scene or "你们在一起，他人就在你旁边。"
+            else:
+                base = "你们在一起，他人就在你旁边。别用「想你」「等你回来」这种话，直接跟身边的人说话。"
+            return f"{away_text}\n{base}" if away_text else base
 
-        event = self.store.get(umo, "active_event")
-        if not isinstance(event, dict):
-            return fallback
-        if now >= float(event.get("expires_at") or 0):
-            return fallback
-        elapsed = max(1, int((now - float(event.get("started_at") or now)) // 60))
-
-        # 主体是「她」：这件事是对方在做，别写成"他在做"
-        if str(event.get("subject") or "") == "her":
-            label = str(event.get("label") or "").strip()
-            if label:
-                return (
-                    f"你现在{label}（已经 {elapsed} 分钟），他就在旁边陪着你、帮你弄。"
-                    f"这件事是你自己在做，不是他在做——别提「你先去」「你快点」这种把他当主角的说法；"
-                    "可以说说自己的感受，让他帮你搭把手，语气黏一点。"
-                )
-
-        try:
-            hint = self.engine.build_hint(event, elapsed)
-        except Exception:
-            hint = ""
-        return hint or fallback
+        if away_text:
+            # 组合提示：不在身边 + 正在做什么，两个状态都保留。
+            return f"{away_text}\n{scene}" if scene else away_text
+        return scene or fallback
 
     # ------------------------------------------------------------------
     # 生成与发送
@@ -2495,6 +2763,12 @@ class Runner:
             schedule = self.cfg.get("schedule_settings", {}) or {}
             # 睡眠免打扰：说「睡了」之后静音（智能时长：近起床点到起床、远则 N 小时）
             if self.is_sleeping(umo):
+                # 到点的约定不能静默丢掉：改排到起床后，醒来再补。
+                appt = self.appointment_shot_item(umo)
+                if appt and appt.get("shot") in ("due", "follow"):
+                    wake_at = float((self._sleep_state(umo) or {}).get("wake_at") or 0)
+                    if wake_at > time.time():
+                        self._defer_appointment(umo, appt.get("at"), wake_at)
                 logger.info(f"{TAG} 处于睡眠免打扰，跳过本次")
                 return
 
@@ -2759,7 +3033,6 @@ class Runner:
         return times
 
     @staticmethod
-    @staticmethod
     def _tool_groups(history: list) -> list[tuple[int, int]]:
         """把历史切成「组」：一组 = 一条带 tool_calls 的 assistant + 紧随其后的 tool 结果。
 
@@ -2790,48 +3063,66 @@ class Runner:
         """过滤后修复工具调用配对。
 
         规则：
-        - 孤立 `role=tool`（没有对应 assistant.tool_calls 里的 id）→ 删除；
-        - assistant.tool_calls 里某个 id 没有对应 tool 结果 → 补一条占位 tool。
-        只做结构修复，不删内容（带 tool_calls 但 content 为空的 assistant 仍保留，
-        与 `test_beta2::test_tool_calls_message_kept` 一致）。
+        - 只有「紧邻的那条 assistant 声明过」的 tool 结果才保留，孤儿删除；
+          以前用一个全局 declared 集合，跨组同 ID 会互相借用，A 组的结果被当成
+          B 组已返回。
+        - 每个 assistant 的 tool_calls 缺结果时，占位插在**该组 tool 结果之后**，
+          不能追加到整段历史末尾——否则 assistant/user 已经先出现，严格 provider
+          仍然 400。
+        只做结构修复，不删内容（带 tool_calls 但 content 为空的 assistant 仍保留）。
         """
         if not history:
             return history
-        # 收集所有被声明的 call id（按出现顺序去重）
-        declared: list[str] = []
+        # 1) 清孤儿：tool 结果必须匹配紧邻 assistant 声明的 id
+        kept: list = []
+        current_ids: set[str] = set()
         for message in history:
             if not isinstance(message, dict):
-                continue
-            for call in message.get("tool_calls") or []:
-                if isinstance(call, dict) and call.get("id"):
-                    declared.append(str(call["id"]))
-        result_ids = {
-            str(message.get("tool_call_id"))
-            for message in history
-            if isinstance(message, dict) and message.get("role") == "tool"
-            and message.get("tool_call_id")
-        }
-        # 1) 删除孤立 tool（id 不被任何 assistant 声明）
-        kept = []
-        for message in history:
-            if not isinstance(message, dict):
+                current_ids = set()
                 kept.append(message)
                 continue
-            if message.get("role") == "tool":
+            role = str(message.get("role") or "")
+            if role == "assistant":
+                current_ids = {
+                    str(call["id"])
+                    for call in (message.get("tool_calls") or [])
+                    if isinstance(call, dict) and call.get("id")
+                }
+                kept.append(message)
+                continue
+            if role == "tool":
                 tid = str(message.get("tool_call_id") or "")
-                if not tid or tid not in declared:
+                if not tid or tid not in current_ids:
                     continue
+                kept.append(message)
+                continue
+            current_ids = set()
             kept.append(message)
-        history = kept
-        # 2) 缺结果的 call id 补占位 tool
-        missing = [cid for cid in declared if cid not in result_ids]
-        if missing:
-            placeholders = [
-                {"role": "tool", "tool_call_id": cid, "content": "[内容已按设置过滤]"}
-                for cid in missing
+
+        # 2) 按组补占位。倒序遍历，插入点不会影响前面组的索引。
+        for i in range(len(kept) - 1, -1, -1):
+            message = kept[i]
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            ids = [
+                str(call["id"])
+                for call in (message.get("tool_calls") or [])
+                if isinstance(call, dict) and call.get("id")
             ]
-            history = history + placeholders
-        return history
+            if not ids:
+                continue
+            j = i + 1
+            returned: set[str] = set()
+            while j < len(kept) and isinstance(kept[j], dict) and kept[j].get("role") == "tool":
+                returned.add(str(kept[j].get("tool_call_id") or ""))
+                j += 1
+            missing = [cid for cid in dict.fromkeys(ids) if cid not in returned]
+            if missing:
+                kept[j:j] = [
+                    {"role": "tool", "tool_call_id": cid, "content": "[内容已按设置过滤]"}
+                    for cid in missing
+                ]
+        return kept
 
     @staticmethod
     def _tool_safe_start(history: list, start: int) -> int:
@@ -3281,8 +3572,10 @@ class Runner:
         """会话里单独选过的人格。
 
         `get_default_persona_v3()` 只认全局/UMO 默认，不认会话里 `/persona` 选的 B，
-        所以主动消息会用 A、正常回复用 B。这里按 AstrBot 的会话人格优先解析，
-        取不到就返回 None 交给调用方回退默认。
+        所以主动消息会用 A、正常回复用 B。这里按 AstrBot 的会话人格优先解析。
+
+        返回 persona 对象、None（没选/找不到，交给调用方回退默认），
+        或 `_PERSONA_DISABLED`（明确禁用，绝不能回退默认）。
         """
         persona_id = ""
         try:
@@ -3294,35 +3587,56 @@ class Runner:
                     persona_id = str(getattr(conv, "persona_id", "") or "") if conv else ""
         except Exception:
             persona_id = ""
-        if not persona_id:
-            return None
-        if persona_id == "[%None]":
-            # 显式禁用：会话里选了「无」人格，不该去查一个叫 [%None] 的条目
-            return None
+
         # AstrBot 真实契约：resolve_selected_persona 是 keyword-only，
         # 需要 umo / conversation_persona_id / platform_name，返回四元组
         # (selected_id, persona_obj, force_id, use_webchat_default)。
-        for name in ("resolve_selected_persona", "get_persona_v3_by_id", "get_persona"):
+        # 空 persona_id 也要调：UMO 级别的强制人格在这一层生效。
+        resolver = getattr(persona_mgr, "resolve_selected_persona", None)
+        if resolver is not None:
+            try:
+                try:
+                    result = resolver(umo=umo, conversation_persona_id=persona_id,
+                                      platform_name="aiocqhttp")
+                except TypeError:
+                    result = resolver(conversation_persona_id=persona_id)
+                if inspect.isawaitable(result):
+                    result = await result
+                if isinstance(result, tuple):
+                    selected_id = str(result[0] or "") if len(result) > 0 else ""
+                    persona = result[1] if len(result) > 1 else None
+                    force_id = str(result[2] or "") if len(result) > 2 else ""
+                    if force_id == "[%None]" or selected_id == "[%None]":
+                        return _PERSONA_DISABLED
+                    if persona is not None:
+                        return persona
+                    lookup_id = force_id or selected_id
+                    if lookup_id and lookup_id != "[%None]":
+                        by_id = getattr(persona_mgr, "get_persona_v3_by_id", None)
+                        if by_id is not None:
+                            found = by_id(lookup_id)
+                            if inspect.isawaitable(found):
+                                found = await found
+                            if found is not None:
+                                return found
+                    return None
+                if result is not None:
+                    return result
+            except Exception:
+                pass
+
+        if persona_id == "[%None]":
+            return _PERSONA_DISABLED
+        if not persona_id:
+            return None
+        for name in ("get_persona_v3_by_id", "get_persona"):
             fn = getattr(persona_mgr, name, None)
             if fn is None:
                 continue
             try:
-                if name == "resolve_selected_persona":
-                    try:
-                        result = fn(umo=umo, conversation_persona_id=persona_id,
-                                    platform_name="aiocqhttp")
-                    except TypeError:
-                        # 旧版/桩没有这些参数：退回 keyword 单参
-                        result = fn(conversation_persona_id=persona_id)
-                    if inspect.isawaitable(result):
-                        result = await result
-                    if isinstance(result, tuple):
-                        # (selected_id, persona, force_id, use_webchat_default)
-                        result = result[1]
-                else:
-                    result = fn(persona_id)
-                    if inspect.isawaitable(result):
-                        result = await result
+                result = fn(persona_id)
+                if inspect.isawaitable(result):
+                    result = await result
                 if result is not None:
                     return result
             except Exception:
@@ -3334,7 +3648,11 @@ class Runner:
             persona_mgr = getattr(self.context, "persona_manager", None)
             if persona_mgr is None:
                 return ""
-            text = self._persona_text(await self._session_persona(persona_mgr, umo))
+            picked = await self._session_persona(persona_mgr, umo)
+            if picked is _PERSONA_DISABLED:
+                # 明确禁用（force_id 或会话选中值为 [%None]）：绝不回退默认人格。
+                return ""
+            text = self._persona_text(picked)
             if text:
                 return text
             return self._persona_text(await persona_mgr.get_default_persona_v3(umo))
@@ -3446,12 +3764,20 @@ class Runner:
             if conv is None:
                 return
             raw = getattr(conv, "history", None)
-            if not raw:
+            # 空会话（history 是 [] 或空字符串）也要能写第一条主动消息；
+            # 以前 `if not raw: return` 会把「第一次主动开口」直接吞掉。
+            if raw is None:
                 return
-            try:
-                history = json.loads(raw) if isinstance(raw, str) else raw
-            except Exception:
-                return
+            if isinstance(raw, str):
+                if not raw.strip():
+                    history = []
+                else:
+                    try:
+                        history = json.loads(raw)
+                    except Exception:
+                        return
+            else:
+                history = raw
             if not isinstance(history, list):
                 return
             # 避免与正常回复流程重复写入（正常回复会自己写 assistant 记录）

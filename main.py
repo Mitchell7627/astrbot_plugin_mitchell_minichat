@@ -144,10 +144,23 @@ class ProactiveMiniPlugin(star.Star):
         await self.runner.start()
 
     async def terminate(self) -> None:
+        # 消息入口把语义识别任务放在插件自己的 _bg_tasks 里，
+        # runner.stop() 只回收 runner._bg_tasks；不在这里取消，
+        # 卸载/重载后旧任务仍会跑完并写回旧 Store（覆盖新实例的数据）。
+        await self._cancel_bg_tasks()
         if self.runner:
             await self.runner.stop()
             self.runner = None
         await self._stop_panel()
+
+    async def _cancel_bg_tasks(self) -> None:
+        """取消并等待插件入口创建的后台识别任务。"""
+        tasks = [task for task in list(self._bg_tasks) if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._bg_tasks.difference_update(tasks)
 
     # ------------------------------------------------------------------
     # 面板
