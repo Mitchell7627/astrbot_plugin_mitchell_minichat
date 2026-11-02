@@ -126,6 +126,9 @@ class Runner:
         self.engine = plugin.engine
         self.timers: dict[str, asyncio.Task] = {}
         self.started = False
+        self._stopped = False
+        self._sleep_hit: tuple[int, int] | None = None
+        self._sleep_seen_in_message = False
         self._schedule_log: dict[str, list[dict]] = {}
         # 正在发送中的会话，避免定时器与面板重复触发导致双发
         self._firing: set[str] = set()
@@ -164,10 +167,27 @@ class Runner:
     def sessions(self) -> list[str]:
         return [s for s in (self.cfg.get("session_list") or []) if str(s).strip()]
 
+    def _result_current(self, umo: str, seq: int | None = None) -> bool:
+        """异步结果只有在原会话、原消息和运行实例仍有效时才能落地。"""
+        return (
+            not self._stopped and bool(self.cfg.get("enable", False))
+            and umo in self.sessions()
+            and (seq is None or _as_int(self.store.get(umo, "turn_seq"), 0) == seq)
+        )
+
+    def invalidate_session(self, umo: str) -> None:
+        # 删除后立刻重加也不能复活删除前发起的识别请求。
+        self.store.set(umo, "turn_seq", _as_int(self.store.get(umo, "turn_seq"), 0) + 1)
+        task = self.timers.pop(umo, None)
+        if task is not None:
+            task.cancel()
+        self.store.save()
+
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
     async def start(self) -> None:
+        self._stopped = False
         self.started = True
         delay = None
         if bool(self.cfg.get("enable_auto_start", True)):
@@ -181,6 +201,7 @@ class Runner:
         logger.info(f"{TAG} 已启动，监听 {len(self.sessions())} 个会话")
 
     async def stop(self) -> None:
+        self._stopped = True
         self.started = False
         for task in list(self.timers.values()):
             task.cancel()
@@ -216,7 +237,7 @@ class Runner:
         old = self.timers.pop(umo, None)
         if old is not None:
             old.cancel()
-        if not self.started:
+        if not self.started or not self._result_current(umo):
             self._trace_schedule(umo, "stopped")
             return
 
@@ -772,10 +793,8 @@ class Runner:
             return None
         raw = str(eng.get("return_soon_keywords") or "")
         keywords = [k.strip() for k in raw.replace("，", ",").split(",") if k.strip()]
-        for kw in keywords:
-            if kw and kw in text:
-                return kw
-        return None
+        hit = self.engine.match_words_ex(text, keywords, "return")["hit"]
+        return hit["kw"] if hit else None
 
     def _apply_return_soon(self, umo: str, text: str) -> bool:
         """「加速事件消息」= 给「在路上/出门办事」叠加更猛、更短的加成。
@@ -1111,6 +1130,7 @@ class Runner:
         if new_at <= time.time():
             return False
         item["at"] = new_at
+        item.setdefault("original_at", float(at))
         item["stage"] = "pending"
         item["lead_sent_at"] = 0
         item["due_sent_at"] = 0
@@ -1357,6 +1377,80 @@ class Runner:
                 return cut
         return end
 
+    _APPOINTMENT_ALIASES = {
+        "开会": ("开会", "会议"), "下课": ("下课", "上课", "课程"),
+        "上课": ("上课", "课程"), "下班": ("下班", "上班"),
+        "吃饭": ("吃饭", "饭局", "聚餐"), "约会": ("约会", "约定"),
+    }
+
+    def _cancel_appointments_from_message(self, umo: str, text: str) -> tuple[bool, str]:
+        """只撤销本人明确取消的匹配条目；不把第三方、疑问或反取消当指令。"""
+        items = self._appointments(umo)
+        pending = [item for item in items if item.get("stage") != "done"]
+        if not pending:
+            return False, text
+        all_words = {w for words in DEFAULT_EVENTS.values() for w in words}
+        all_words.update(w for words in self._APPOINTMENT_ALIASES.values() for w in words)
+        for clause in re.finditer(r"[^，,。！？!?；;\n]+", text):
+            value = clause.group()
+            marker = re.search(r"取消|不(?:去|开|上|办|参加|举行|回|到)", value)
+            if marker is None or re.search(r"(?:不要|别|不|没|没有|不必)取消", value):
+                continue
+            anchor = clause.start() + marker.start()
+            previous = rules.prev_clause(text, clause.start(), 48)
+            if (previous.startswith(rules.CONDITIONAL_LEADS) or previous.rstrip().endswith("的话")) and not value.lstrip().startswith(("不过", "但是", "但", "然而", "现在", "实际上", "事实上")):
+                continue
+            if (rules.is_reported_clause(text, anchor)
+                    or rules.is_dream_clause(text, anchor)
+                    or rules.is_conditional_clause(text, anchor)
+                    or rules.is_question_clause(text, anchor, kw_len=len(marker.group()))
+                    or rules.is_third_person_clause(text, anchor)
+                    or rules.is_second_person_clause(text, anchor)
+                    or rules.is_future_clause(text, anchor)
+                    or rules.is_far_past_clause(text, anchor)):
+                continue
+            clock = find_appointment_clock(value)
+            described = any(word in value for word in all_words)
+            cancel_all = bool(re.search(r"(?:全部|所有)(?:的)?(?:约定|安排|提醒)", value))
+            cancelled_ids = set()
+            for position, item in enumerate(items):
+                if item.get("stage") == "done":
+                    continue
+                if clock:
+                    moment = datetime.fromtimestamp(_as_float_safe(item.get("original_at") or item.get("at")))
+                    hour = clock["h"]
+                    if clock.get("period") == "pm" and hour < 12:
+                        hour += 12
+                    elif clock.get("period") == "am" and hour == 12:
+                        hour = 0
+                    if moment.minute != clock["m"] or moment.hour != hour:
+                        # 裸「三点」与下午三点仍可匹配，但明确时段不可混淆。
+                        if clock.get("period") or moment.minute != clock["m"] or moment.hour % 12 != hour % 12:
+                            continue
+                label = str(item.get("label") or "")
+                aliases = self._APPOINTMENT_ALIASES.get(label, (label,))
+                if described and not any(word and word in value for word in aliases) and not cancel_all:
+                    continue
+                if not clock and not described and not cancel_all and len(pending) != 1:
+                    continue
+                if not clock and not described and not cancel_all and not re.fullmatch(
+                    r"(?:我)?(?:(?:这个|那个|这件事|原来的安排))?(?:取消了?|不去了)[呀啊啦 ]*", value.strip()
+                ):
+                    continue
+                cancelled_ids.add(position)
+            if len(cancelled_ids) > 1 and not clock and not cancel_all:
+                # 多条同类约定没有钟点时不猜，避免一句「会议取消」全删。
+                continue
+            if not cancelled_ids:
+                continue
+            self._save_appointments(umo, [item for i, item in enumerate(items) if i not in cancelled_ids])
+            self._note("appointment", {"hit": {
+                "kw": marker.group(), "verdict": "accept", "gate_rule": "CANCEL",
+                "reason": f"取消 {len(cancelled_ids)} 条匹配约定",
+            }})
+            return True, self._mask_span(text, clause.start(), clause.end())
+        return False, text
+
     def _handle_appointment_words(self, umo: str, text: str):
         """识别约定。返回 `(是否处理, 剩余文本|None)`。
 
@@ -1510,6 +1604,7 @@ class Runner:
         - 「等会睡」→ 一次性提醒：归「晚睡提醒」管，它关着就不排。
         """
         cfg = self._sleep_cfg()
+        self._sleep_hit = None
         if not text:
             return False
 
@@ -1525,6 +1620,8 @@ class Runner:
         self._note("sleep", sleep)
         if sleep["hit"]:
             sleep_kw = sleep["hit"]["kw"]
+            self._sleep_hit = (sleep["hit"]["idx"], len(sleep_kw))
+            self._sleep_seen_in_message = True
             wake_at = self._sleep_wake_at(now, cfg)
             prev = self._sleep_state(umo) or {}
             store.set(umo, SLEEP_KEY, {
@@ -1553,6 +1650,7 @@ class Runner:
         self._note("wait", wait)
         if wait["hit"]:
             wait_kw = wait["hit"]["kw"]
+            self._sleep_hit = (wait["hit"]["idx"], len(wait_kw))
             prev = self._sleep_state(umo) or {}
             lo, hi = cfg["wait_lo"], cfg["wait_hi"]
             if lo > hi:
@@ -1960,6 +2058,18 @@ class Runner:
         if not kw:
             return
         self.store.pop(umo, SLEEP_KEY)
+        # 延期 at 是预测起床时间；明确提前醒来后，改为下一分钟补说。
+        items = self._appointments(umo)
+        changed = False
+        now = time.time()
+        for item in items:
+            if (item.get("deferred") and item.get("stage") != "done"
+                    and _as_float_safe(item.get("at")) > now + 60):
+                item.update(at=now + 60, stage="pending", lead_sent_at=0,
+                            due_sent_at=0, follow_up_at=0, follow_ups=0)
+                changed = True
+        if changed:
+            self._save_appointments(umo, items)
         self.store.save()
         logger.info(f"{TAG} 用户说「{kw}」，解除睡眠免打扰")
 
@@ -2198,6 +2308,9 @@ class Runner:
         text = str(cand.get("text") or "")
         kw = str(cand.get("kw") or "")
         name = str(cand.get("name") or "")
+        seq = _as_int(cand.get("turn_seq"), _as_int(self.store.get(umo, "turn_seq"), 0))
+        if not self._result_current(umo, seq):
+            return
         rule = self.engine.get_rule(name) if name else None
         if rule is None:
             return
@@ -2214,6 +2327,8 @@ class Runner:
         verdict = await self._verify_use(
             umo, text, kw, dialogue=dialogue, provider=provider
         )
+        if not self._result_current(umo, seq) or self.is_sleeping(umo):
+            return
         if verdict != "yes":
             logger.info(
                 f"{TAG} 灰区未采信（{verdict}）：「{text[:16]}」命中「{kw}」"
@@ -2300,6 +2415,9 @@ class Runner:
     async def review_appointment_gray(self, umo: str, cand: dict) -> None:
         """问一次 YES/NO：说是才落约定，其余一律不记。"""
         text = str(cand.get("text") or "")
+        seq = _as_int(cand.get("turn_seq"), _as_int(self.store.get(umo, "turn_seq"), 0))
+        if not self._result_current(umo, seq):
+            return
         if not text or not self._appt_gray_check():
             return
         provider = await self._resolve_provider(umo)
@@ -2325,6 +2443,8 @@ class Runner:
         raw = str(getattr(resp, "completion_text", "") or "").strip().upper()
         if not raw.startswith("YES"):
             logger.info(f"{TAG} 约定灰度未采信（{raw[:4] or 'empty'}）：「{text[:16]}」")
+            return
+        if not self._result_current(umo, seq):
             return
         if cand.get("snapshot") != self.store.get(umo, APPOINTMENT_KEY):
             logger.info(f"{TAG} 约定灰度放弃：等模型期间约定已经变了")
@@ -2379,11 +2499,16 @@ class Runner:
         before = self._snapshot(umo)
         self._dec_buffer = []
         self._gray_candidate = None
+        self._appt_candidate = None
+        self._sleep_seen_in_message = False
         handled = False
         try:
             handled = self._update_inner(umo, text)
         finally:
             handled = self._flush_decisions(umo, text, before, handled)
+            for candidate in (self._gray_candidate, self._appt_candidate):
+                if isinstance(candidate, dict):
+                    candidate["turn_seq"] = _as_int(self.store.get(umo, "turn_seq"), 0)
         return handled
 
     # 一句话最多回炉几次：每轮至少遮掉一个分句，防止遮罩不收敛导致死循环。
@@ -2428,10 +2553,16 @@ class Runner:
         # 睡眠状态优先：比事件开关、回归/离开/事件都更早判断，
         # 一方面「睡觉」不能被误当别的活动，另一方面睡眠功能独立于事件功能开关。
         if self._handle_sleep_words(umo, text):
-            return None, True
+            idx, length = self._sleep_hit
+            rest = self._mask_span(text, idx, idx + length)
+            return (rest if rest.strip() else None), True
 
         # 用户说话了：若之前处于 sleeping，只有明确说「醒了」才解除免打扰
         self._wake_if_sleeping(umo, text)
+
+        cancelled, rest = self._cancel_appointments_from_message(umo, text)
+        if cancelled:
+            return (rest if rest.strip() else None), True
 
         # 约定时间点：独立于事件开关（说了「上到十二点」就该记住）
         appt_hit, appt_rest = self._handle_appointment_words(umo, text)
@@ -2456,10 +2587,18 @@ class Runner:
         # 没有出门事件时照常落到下面的回归分支（真的到家了）。
         soon_kw = self._return_soon_kw(text)
         if soon_kw and self._apply_return_soon(umo, text):
-            return None, True
+            idx = text.find(soon_kw)
+            rest = self._mask_span(text, idx, idx + len(soon_kw))
+            return (rest if rest.strip() else None), True
 
         # 回归优先
-        ret = self.engine.match_return_ex(text)
+        # 能否加速与是否已到家无关；遮掉将要到达的那一处，后面真正的
+        # 「到家了」仍能识别，不能因为缺 commute 就提前清掉 away。
+        return_text = text
+        if soon_kw:
+            idx = text.find(soon_kw)
+            return_text = self._mask_span(text, idx, idx + len(soon_kw))
+        ret = self.engine.match_return_ex(return_text)
         self._note("return", {"hit": ret["hit"], "dropped": ret["dropped"]})
         return_kw = ret["hit"]["kw"] if ret["hit"] else None
         if return_kw:
@@ -2674,6 +2813,9 @@ class Runner:
         # 是为了让「下班了，我正在吃饭，下午三点开会」先有机会在回炉时认出约定。
         text = self._mask_future_clock(text, datetime.now())
 
+        if self._sleep_seen_in_message and self.is_sleeping(umo):
+            return None, True
+
         md = self.engine.match_detail(text)
         self._note("event", {"hit": md if md.get("rule") else None, "dropped": md.get("dropped") or []})
         rule = md["rule"]
@@ -2835,9 +2977,11 @@ class Runner:
         # 记下这句属于第几条消息：模型慢的时候，后面的消息可能已经更新了状态，
         # 旧结果回来不能把它盖掉（「准备冲个凉」的结果晚于「我在吃饭」，就是这种）。
         start_seq = int(seq) if seq is not None else _as_int(self.store.get(umo, "turn_seq"), 0)
+        if not self._result_current(umo, start_seq):
+            return
         result = await self.classify_text(umo, text)
         now_seq = _as_int(self.store.get(umo, "turn_seq"), 0)
-        if now_seq != start_seq:
+        if now_seq != start_seq or not self._result_current(umo, start_seq):
             logger.info(
                 f"{TAG} 语义识别结果已过期（第 {start_seq} 条，当前第 {now_seq} 条），丢弃：{text[:12]}"
             )
@@ -3044,6 +3188,10 @@ class Runner:
     async def _fire(self, umo: str) -> dict:
         result = {"sent": False, "delivery_status": "not_sent", "reason": "busy",
                   "planned_segments": 0, "delivered_segments": 0}
+        if self._stopped or umo not in self.sessions():
+            result["reason"] = "session_removed"
+            return result
+        seq = _as_int(self.store.get(umo, "turn_seq"), 0)
         if umo in self._firing:
             logger.info(f"{TAG} 该会话正在发送中，忽略重复触发")
             return result
@@ -3140,8 +3288,18 @@ class Runner:
                     self._appointment_fail(umo, shot, appt_at, appt_id)
                 return result
 
+            if not self._result_current(umo, seq) or self.is_sleeping(umo):
+                # 面板 fire 不属于 timers；用户新消息不会自动取消它，必须在
+                # 模型 await 返回后复核。新消息已经排过时间，旧任务不再重排。
+                reschedule_needed = False
+                result["reason"] = "sleeping" if self.is_sleeping(umo) else "stale_generation"
+                return result
+
             try:
-                sent_text = await self._send_split(umo, text, sent_out=delivered, report=result)
+                sent_text = await self._send_split(
+                    umo, text, sent_out=delivered, report=result,
+                    guard=lambda: self._result_current(umo, seq) and not self.is_sleeping(umo),
+                )
             except asyncio.CancelledError:
                 # 用户开口会取消定时器，CancelledError 会从这里穿出去、写历史的代码根本到不了。
                 # 已经发出去的那几段不能白丢，另起一个任务补写，然后把取消继续往上抛。
@@ -3154,7 +3312,12 @@ class Runner:
             result["sent"] = ok
             result["reason"] = "delivery"
             if ok:
-                if shot:
+                current = self._result_current(umo, seq)
+                if not current:
+                    # 已送达部分仍记历史，但别把用户刚清零的未回复计数加回去，
+                    # 或者推进新消息已取消/修改的约定。
+                    reschedule_needed = False
+                elif shot:
                     self._advance_appointment(umo, shot, appt_at, appt_id)
                     count = self.store.bump_unanswered(umo)
                     logger.info(
@@ -3167,13 +3330,17 @@ class Runner:
                     count = self.store.bump_unanswered(umo)
                     logger.info(f"{TAG} 已发送，当前未回复计数 {count}")
                 # 事件期间开过口：事件结束时按「插队已发生」处理（恢复原排程）
-                if self._active_event(umo) is not None:
+                if current and self._active_event(umo) is not None:
                     self.store.set(umo, "event_hit", True)
                 self.store.save()
                 # 只把真正送达的内容写回历史：分段中途失败时，剩下的不能当成「她已经说过」
                 await self._append_assistant_history(umo, sent_text)
             elif shot:
                 self._appointment_fail(umo, shot, appt_at, appt_id)
+        except asyncio.CancelledError:
+            # 生成阶段也可能被用户消息取消，不能在 finally 覆盖新排程。
+            reschedule_needed = False
+            raise
         except Exception as e:
             result["reason"] = "error"
             logger.error(f"{TAG} 发送流程异常: {e}")
@@ -3181,7 +3348,7 @@ class Runner:
             if held and lock.locked():
                 lock.release()
             self._firing.discard(umo)
-            if self.started and reschedule_needed:
+            if self.started and reschedule_needed and self._result_current(umo, seq):
                 self._finish_cycle(umo)
         return result
 
@@ -4006,7 +4173,7 @@ class Runner:
         return cleaned
 
     async def _send_split(self, umo: str, text: str, sent_out: list | None = None,
-                          report: dict | None = None) -> str:
+                          report: dict | None = None, guard=None) -> str:
         """分段发送。返回**实际送达**的文本（空串表示一段都没发出去）。
 
         以前返回 bool，只要第一段成功就为 True，调用方随后把整段原文写进历史——
@@ -4043,6 +4210,8 @@ class Runner:
         # 它才能在 CancelledError 里补写历史（返回值到不了那一步）。
         sent: list[str] = []
         for index, segment in enumerate(segments):
+            if guard is not None and not guard():
+                break
             try:
                 result = await self.context.send_message(
                     umo, MessageChain([Plain(segment)])

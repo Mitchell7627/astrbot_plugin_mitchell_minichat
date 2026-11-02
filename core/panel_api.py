@@ -770,9 +770,7 @@ class PanelService:
             self.plugin.config.save_config()
             runner = getattr(self.plugin, "runner", None)
             if runner is not None:
-                task = getattr(runner, "timers", {}).pop(umo, None)
-                if task is not None:
-                    task.cancel()
+                runner.invalidate_session(umo)
         elif action == "reset_unanswered":
             umo = self._validate_umo(umo)
             self.store.reset_unanswered(umo)

@@ -231,9 +231,11 @@ def is_third_person_subject(text: str, idx: int, extra_names=()) -> bool:
         if not who or not head.startswith(who):
             continue
         rest = head[len(who):]
+        # 时间/程度副词不改变主语；「我妈现在正在」仍是在说别人。
+        rest = re.sub(r"^(?:(?:现在|目前|此刻|当下|这会儿?|今天|刚刚|已经|一直|仍然|马上|快要|就要|快|也|才|就|都)\s*)+", "", rest)
         if not rest:
             return True
-        if rest[:2].startswith(PREDICATE_LEADS) or rest[:1] in "在正还又刚已说要去":
+        if rest.startswith(PREDICATE_LEADS):
             return True
     return False
 

@@ -37,7 +37,7 @@ class Config(dict):
 def plugin(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(StarTools, "get_data_dir", lambda *a: tmp_path)
-    cfg = Config(schema_defaults(json.loads((ROOT / "_conf_schema.json").read_text())))
+    cfg = Config(schema_defaults(json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))))
     cfg.saves = 0
     cfg["friend_settings"]["session_list"] = ["test:FriendMessage:1"]
     cfg["friend_settings"]["segmented_reply_settings"].update(
@@ -57,6 +57,12 @@ def plugin(tmp_path, monkeypatch):
 @pytest.fixture
 def umo(plugin):
     return plugin.runner.sessions()[0]
+
+
+@pytest.fixture(autouse=True)
+async def cleanup_plugin(plugin):
+    yield
+    await plugin.terminate()
 
 
 @pytest.fixture

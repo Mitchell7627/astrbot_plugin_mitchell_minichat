@@ -655,6 +655,7 @@ class EventRuleStore:
                 if (rules.is_third_person_clause(text, idx)
                         or rules.is_question_clause(text, idx, len(kw))
                         or rules.is_reported_clause(text, idx)
+                        or rules.is_dream_clause(text, idx)
                         or rules.is_conditional_clause(text, idx)
                         or rules.is_far_past_clause(text, idx, kw_len=len(kw))):
                     continue

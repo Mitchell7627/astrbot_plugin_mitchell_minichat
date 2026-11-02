@@ -202,24 +202,24 @@ def resolve_at(hour: int, minute: int, period: str | None,
 def _find_event(text: str, clock: dict, keywords: dict):
     """在时间附近找事件词，返回 (label, kind, idx, length) 或 None。"""
     start, end = clock["idx"], clock["idx"] + clock["length"]
+    left = rules.clause_start(text, start, None)
+    right = rules.clause_end(text, end)
 
-    up = _UP_TO_RE.search(text)
+    up = _UP_TO_RE.search(text, left, right)
     if up and abs(up.start() - start) <= _MAX_GAP:
         return ("结束", "end", up.start(), len(up.group(0)))
 
     best = None
     for kind, words in keywords.items():
         for word in words:
-            idx = text.find(word)
-            if idx < 0:
-                continue
-            gap = start - (idx + len(word)) if idx + len(word) <= start else idx - end
-            if gap < 0 or gap > _MAX_GAP:
-                continue
-            # 长词优先，其次离时间近的
-            score = (len(word), -gap)
-            if best is None or score > best[0]:
-                best = (score, word, kind, idx)
+            idx = text.find(word, left, right)
+            while idx >= 0:
+                gap = start - (idx + len(word)) if idx + len(word) <= start else idx - end
+                if 0 <= gap <= _MAX_GAP:
+                    score = (len(word), -gap)
+                    if best is None or score > best[0]:
+                        best = (score, word, kind, idx)
+                idx = text.find(word, idx + 1, right)
     if best:
         return (best[1], best[2], best[3], len(best[1]))
     return None
