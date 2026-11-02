@@ -9,6 +9,7 @@ import json
 import random
 import re
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -865,6 +866,7 @@ class Runner:
                 logger.info(f"{TAG} 这个点已经有约定了，跳过：{item.get('time_text')} {item.get('label')}")
                 return False
         record = {
+            "id": uuid.uuid4().hex[:12],
             "at": at,
             "label": str(hit.get("label") or ""),
             "kind": str(hit.get("kind") or "end"),
@@ -903,23 +905,38 @@ class Runner:
         self.store.save()
 
     def _pick_appointment(self, items: list, shot: str, now: float, cfg: dict,
-                          at: float | None) -> dict | None:
-        """定位要推进的那条：优先按时刻，其次按「当前这一拍」。"""
-        if at:
+                          at: float | None, item_id: str | None = None) -> dict | None:
+        """定位要推进的那条：优先按稳定 ID，其次按时刻 + 当前这一拍。
+
+        多条约定被睡眠统一顺延到同一时刻时，单靠 `at` 会反复命中同一条；
+        ID 能区分它们，`stage != done` 的兜底则兼容旧数据（老条目没有 id）。
+        """
+        if item_id:
             for item in items:
-                if abs(_as_float_safe(item.get("at")) - float(at)) < 1:
+                if str(item.get("id") or "") == str(item_id):
+                    return item
+        if at:
+            # 同一时刻可能有多条，先找「当前这一拍正好匹配」的
+            for item in items:
+                if (abs(_as_float_safe(item.get("at")) - float(at)) < 1
+                        and appointment_stage(item, now, cfg) == shot):
+                    return item
+            for item in items:
+                if (abs(_as_float_safe(item.get("at")) - float(at)) < 1
+                        and str(item.get("stage") or "") != "done"):
                     return item
         for item in items:
             if appointment_stage(item, now, cfg) == shot:
                 return item
         return None
 
-    def _advance_appointment(self, umo: str, shot: str, at: float | None = None) -> None:
+    def _advance_appointment(self, umo: str, shot: str, at: float | None = None,
+                             item_id: str | None = None) -> None:
         """一拍发出去之后推进状态。"""
         now = time.time()
         cfg = self._appointment_cfg()
         items = self._appointments(umo)
-        item = self._pick_appointment(items, shot, now, cfg, at)
+        item = self._pick_appointment(items, shot, now, cfg, at, item_id)
         if item is not None:
             if shot == "lead":
                 item["stage"] = "lead"
@@ -961,13 +978,14 @@ class Runner:
                         self._sync_together_until(umo, closing=True)
         self._save_appointments(umo, items)
 
-    def _defer_appointment(self, umo: str, at: float | None, wake_at: float) -> bool:
+    def _defer_appointment(self, umo: str, at: float | None, wake_at: float,
+                           item_id: str | None = None) -> bool:
         """睡眠中到点的约定：改排到起床后一分钟，别静默丢掉。"""
         if not at:
             return False
         items = self._appointments(umo)
         cfg = self._appointment_cfg()
-        item = self._pick_appointment(items, "due", time.time(), cfg, at)
+        item = self._pick_appointment(items, "due", time.time(), cfg, at, item_id)
         if item is None:
             return False
         new_at = float(wake_at) + 60
@@ -987,12 +1005,13 @@ class Runner:
         )
         return True
 
-    def _appointment_fail(self, umo: str, shot: str, at: float | None = None) -> None:
+    def _appointment_fail(self, umo: str, shot: str, at: float | None = None,
+                          item_id: str | None = None) -> None:
         """生成或发送失败：记一次，连续两次就放弃，别每分钟重试烧钱。"""
         now = time.time()
         cfg = self._appointment_cfg()
         items = self._appointments(umo)
-        item = self._pick_appointment(items, shot, now, cfg, at)
+        item = self._pick_appointment(items, shot, now, cfg, at, item_id)
         if item is not None:
             item["fails"] = _as_int(item.get("fails"), 0) + 1
             if item["fails"] >= 2:
@@ -1058,7 +1077,7 @@ class Runner:
         return best
 
     def appointment_shot_item(self, umo: str) -> dict | None:
-        """这次真正要发的那条约定：返回 {"item", "shot", "at"}；没有就 None。"""
+        """这次真正要发的那条约定：返回 {"item", "shot", "at", "id"}；没有就 None。"""
         cfg = self._appointment_cfg()
         if not cfg["enable"]:
             return None
@@ -1068,7 +1087,12 @@ class Runner:
                 continue
             shot = appointment_stage(item, now, cfg)
             if shot:
-                return {"item": item, "shot": shot, "at": _as_float_safe(item.get("at"))}
+                return {
+                    "item": item,
+                    "shot": shot,
+                    "at": _as_float_safe(item.get("at")),
+                    "id": str(item.get("id") or ""),
+                }
         return None
 
     def appointment_shot(self, umo: str):
@@ -1076,16 +1100,24 @@ class Runner:
         hit = self.appointment_shot_item(umo)
         return hit["shot"] if hit else None
 
-    def _appointment_item_for(self, umo: str, at: float | None) -> dict | None:
-        """按约定时刻定位条目（同一时刻只会有一条）。"""
+    def _appointment_item_for(self, umo: str, at: float | None,
+                              item_id: str | None = None) -> dict | None:
+        """定位约定条目：优先稳定 ID，其次按时刻（同一时刻可能有多条）。"""
+        items = self._appointments(umo)
+        if item_id:
+            for item in items:
+                if str(item.get("id") or "") == str(item_id):
+                    return item
         if not at:
             return None
-        for item in self._appointments(umo):
-            if abs(_as_float_safe(item.get("at")) - float(at)) < 1:
+        for item in items:
+            if (abs(_as_float_safe(item.get("at")) - float(at)) < 1
+                    and str(item.get("stage") or "") != "done"):
                 return item
         return None
 
-    def appointment_hint(self, umo: str, shot: str, at: float | None = None) -> str:
+    def appointment_hint(self, umo: str, shot: str, at: float | None = None,
+                         item_id: str | None = None) -> str:
         """约定描述 + 原有场景描述。
 
         必须追加而不是替换：event_hint 里带着「他在不在你这边」，
@@ -1094,24 +1126,42 @@ class Runner:
         两句拼在一起自相矛盾，改用固定场景。
         """
         now = time.time()
-        item = self._appointment_item_for(umo, at)
+        item = self._appointment_item_for(umo, at, item_id)
         if item is None:
             item = self._next_appointment(umo, now, executable=True) or {}
         cfg = self._appointment_cfg()
         template = cfg["hint"] if shot == "due" else ""
         body = build_appointment_hint(item, shot, datetime.now(), template)
         if item.get("deferred"):
-            note = (
-                "（这条是昨晚该发的，他睡着了，现在才补说；别提具体几点，"
-                "用「说好的事」带过，别让他觉得时间穿越了）"
-            )
-            body = f"{body}\n{note}" if body else note
+            # 延迟补发不能沿用「刚到点/刚开始」的模板，也别写死「昨晚」：
+            # 白天 12:00 的约定同样可能因为午睡延到 13:01。
+            when = str(item.get("time_text") or "").strip()
+            label = str(item.get("label") or "说好的事")
+            kind = str(item.get("kind") or "")
+            if kind == "start":
+                body = (
+                    f"之前说好{when}的{label}，他睡着了，现在才补说。"
+                    "别写「刚开始」，按已经进行了一会儿来接。"
+                )
+            elif kind == "end":
+                body = (
+                    f"之前说好{when}结束的{label}，他睡着了，现在才补说。"
+                    "别写「刚到点」。"
+                )
+            else:
+                body = (
+                    f"之前说好{when}的{label}，他睡着了，现在才补说；"
+                    "别提具体几点，用「说好的事」带过。"
+                )
         if shot == "due" and str(item.get("kind") or "") == "arrive":
             # 只有「到家/进门」才说她就在你身边；「到公司/到学校」是她去了别处，
             # 不能说成人回来了。
             label = str(item.get("label") or "")
             if any(w in label for w in ("到家", "进门", "回来")):
-                scene = "他已经按说好的时间到家了，人就在你旁边。"
+                if item.get("deferred"):
+                    scene = "他之前说好到家，现在确实回来了，人就在你旁边。"
+                else:
+                    scene = "他已经按说好的时间到家了，人就在你旁边。"
             else:
                 scene = f"他已经按说好的时间{label}了。"
             return f"{body}\n{scene}" if body else scene
@@ -1133,8 +1183,6 @@ class Runner:
         counter = self.store.get(umo, "appointment_counter") or {}
         today = datetime.now().strftime("%Y-%m-%d")
         used = _as_int(counter.get("n"), 0) if counter.get("date") == today else 0
-        if cfg["max_per_day"] and used >= cfg["max_per_day"]:
-            return False, None
 
         result = parse_appointment(text, datetime.now(), cfg)
         for item in result["dropped"]:
@@ -1162,18 +1210,10 @@ class Runner:
         hit = result["hit"]
         if not hit:
             return False, None
-        if not self._set_appointment(umo, hit):
-            return False, None
-        self.store.set(umo, "appointment_counter", {"date": today, "n": used + 1})
-        self._dec_buffer.append({
-            "kind": "appointment",
-            "kw": hit["time_text"],
-            "verdict": "accept",
-            "rule": "A1",
-            "reason": f"约定 {hit['label']}",
-        })
-        self.reschedule(umo)
 
+        # 先把「未来安排」这段消费掉，再决定要不要入队。
+        # 每天额度用尽、同一时刻重复、队列三条已满被淘汰，都是「没记成」，
+        # 不代表这句话是在说「我现在正在做」——不能让它落成当前事件。
         idx = int(hit.get("idx") or 0)
         length = int(hit.get("length") or 0)
         event_idx = hit.get("event_idx")
@@ -1182,6 +1222,20 @@ class Runner:
         start = rules.clause_start(text, min(idx, event_idx), None)
         end = rules.clause_end(text, max(idx + length, event_idx + event_len))
         rest = self._mask_span(text, start, end)
+
+        enqueued = False
+        if not (cfg["max_per_day"] and used >= cfg["max_per_day"]):
+            enqueued = bool(self._set_appointment(umo, hit))
+        if enqueued:
+            self.store.set(umo, "appointment_counter", {"date": today, "n": used + 1})
+            self.reschedule(umo)
+        self._dec_buffer.append({
+            "kind": "appointment",
+            "kw": hit["time_text"],
+            "verdict": "accept",
+            "rule": "A1",
+            "reason": f"约定 {hit['label']}" if enqueued else "未来安排（未入队）",
+        })
         return True, (rest if rest.strip() else None)
 
     # ------------------------------------------------------------------
@@ -2597,6 +2651,9 @@ class Runner:
             # 避免“做好咯”这类（event=none, done=true）把正在吃饭的状态误清掉。
             if isinstance(event, dict) and name != "none" and event.get("name") == name:
                 self.store.pop(umo, "active_event")
+                # 模型判完成也要和关键词结束/过期巡检一样收尾 together，
+                # 否则长约会结束后「在一起」还挂着 300 分钟长尾。
+                self._sync_together_until(umo, closing=True)
                 logger.info(f"{TAG} 语义识别：{event.get('label')} 已完成，事件清空")
                 self.store.save()
             else:
@@ -2633,9 +2690,20 @@ class Runner:
         if not isinstance(event, dict):
             return ""
         elapsed = max(1, int((now - float(event.get("started_at") or now)) // 60))
+        subject = str(event.get("subject") or "")
+        label = str(event.get("label") or "").strip()
+        # 人不在身边时，self 事件不能沿用内置提示里的「拽袖子 / 凑过去」这类
+        # 需要身体在场才有意义的动作，只保留「他在外面做什么」。
+        if not with_company and subject != "her":
+            if label:
+                return (
+                    f"他现在在{label}（已经 {elapsed} 分钟），人在外面，不在你这边。"
+                    "别提需要他伸手、凑近、递东西才能做的动作，"
+                    "可以说等他回来、给他留着、别太累这类话。"
+                )
+            return "他现在在外面忙，不在你这边。"
         # 主体是「她」：这件事是对方在做，别写成"他在做"
-        if str(event.get("subject") or "") == "her":
-            label = str(event.get("label") or "").strip()
+        if subject == "her":
             if label:
                 if not with_company:
                     return (
@@ -2661,6 +2729,7 @@ class Runner:
         # 「不在身边」和「当前事件」是两个正交的轴：以前 away 直接 return，
         # 人明明在通勤/在公司，提示词里完全看不到他在做什么。
         away_text = ""
+        returned_text = ""
         away = self.store.get(umo, "away")
         if isinstance(away, dict):
             if away.get("active") and now < float(away.get("expires_at") or 0):
@@ -2683,10 +2752,24 @@ class Runner:
                 if cleared and (now - cleared) < window * 60:
                     gap = int((now - cleared) // 60)
                     when = "刚刚" if gap < 1 else f"{gap} 分钟前"
-                    return f"他{when}回到你这边了，人就在旁边。"
+                    returned_text = f"他{when}回到你这边了，人就在旁边。"
 
         event = self._fresh_event(umo, now)
         scene = self._event_scene(umo, event, now, with_company=not away_text) if event else ""
+
+        # 「刚回来」是场景信息，不是新的状态：同句里的「我正在洗澡」不能被它吞掉。
+        if returned_text:
+            if isinstance(event, dict) and str(event.get("subject") or "") == "self":
+                label = str(event.get("label") or "").strip()
+                if label:
+                    elapsed = max(1, int((now - float(event.get("started_at") or now)) // 60))
+                    # 不用内置事件提示：它按「事件已经进行很久」写，刚到家会自相矛盾。
+                    scene = (
+                        f"他现在{label}（已经 {elapsed} 分钟），刚到家没多久。"
+                        "别提需要他立刻停下手里的事才能回应的要求，"
+                        "可以说先忙自己的、你在这儿等着。"
+                    )
+            return f"{returned_text}\n{scene}" if scene else returned_text
 
         together = self.store.get(umo, "together")
         together_alive = bool(
@@ -2697,12 +2780,20 @@ class Runner:
             if isinstance(event, dict):
                 label = str(event.get("label") or "").strip()
                 elapsed = max(1, int((now - float(event.get("started_at") or now)) // 60))
+                subject = str(event.get("subject") or "")
                 # 「你正在洗澡」的主体是她：不能写成「你们现在在洗澡」。
-                if str(event.get("subject") or "") == "her" and label:
+                if subject == "her" and label:
                     base = (
                         f"你现在{label}（已经 {elapsed} 分钟），他就在你旁边陪着你。"
                         "这件事是你自己在做，不是他在做；别提「你先去」「你快点」这种"
                         "把他当主角的说法，可以说说自己的感受，让他帮你搭把手。"
+                    )
+                elif subject == "self" and label:
+                    # 人在旁边 ≠ 两个人做同一件事：「我正在吃饭」是他在吃。
+                    base = (
+                        f"他现在在{label}（已经 {elapsed} 分钟），你就在他旁边，不是在外面。"
+                        "这是他自己的事，别说成「你们一起在做」；可以说你就在旁边看着、陪着，"
+                        "别提需要他停下手里的事才能回应的要求。"
                     )
                 elif label:
                     base = (
@@ -2768,7 +2859,8 @@ class Runner:
                 if appt and appt.get("shot") in ("due", "follow"):
                     wake_at = float((self._sleep_state(umo) or {}).get("wake_at") or 0)
                     if wake_at > time.time():
-                        self._defer_appointment(umo, appt.get("at"), wake_at)
+                        self._defer_appointment(umo, appt.get("at"), wake_at,
+                                                appt.get("id"))
                 logger.info(f"{TAG} 处于睡眠免打扰，跳过本次")
                 return
 
@@ -2779,6 +2871,7 @@ class Runner:
             appt = self.appointment_shot_item(umo)
             shot = appt["shot"] if appt else None
             appt_at = appt["at"] if appt else None
+            appt_id = appt.get("id") if appt else None
             if shot:
                 reminding = False
 
@@ -2808,13 +2901,14 @@ class Runner:
 
             # 待睡提醒：这次触发是「该睡了」的提醒，不是普通主动消息
             text = await self._generate(
-                umo, reminder=reminding, appointment=shot, appointment_at=appt_at
+                umo, reminder=reminding, appointment=shot, appointment_at=appt_at,
+                appointment_id=appt_id,
             )
             if not text:
                 logger.info(f"{TAG} 生成为空，重新排程")
                 if shot:
                     # 别让它每分钟重试：连续两次失败就放弃这条约定
-                    self._appointment_fail(umo, shot, appt_at)
+                    self._appointment_fail(umo, shot, appt_at, appt_id)
                 return
 
             try:
@@ -2830,7 +2924,7 @@ class Runner:
             ok = bool(sent_text)
             if ok:
                 if shot:
-                    self._advance_appointment(umo, shot, appt_at)
+                    self._advance_appointment(umo, shot, appt_at, appt_id)
                     count = self.store.bump_unanswered(umo)
                     logger.info(
                         f"{TAG} 已发送约定（{shot}），当前未回复计数 {count}"
@@ -2848,7 +2942,7 @@ class Runner:
                 # 只把真正送达的内容写回历史：分段中途失败时，剩下的不能当成「她已经说过」
                 await self._append_assistant_history(umo, sent_text)
             elif shot:
-                self._appointment_fail(umo, shot, appt_at)
+                self._appointment_fail(umo, shot, appt_at, appt_id)
         except Exception as e:
             logger.error(f"{TAG} 发送流程异常: {e}")
         finally:
@@ -2861,6 +2955,7 @@ class Runner:
     async def _generate(
         self, umo: str, reminder: bool = False,
         appointment: str | None = None, appointment_at: float | None = None,
+        appointment_id: str | None = None,
     ) -> str:
         cfg = self.cfg
         settings = self._context_settings()
@@ -2895,7 +2990,7 @@ class Runner:
 
         unanswered = int(self.store.get(umo, "unanswered", 0) or 0)
         if appointment:
-            hint = self.appointment_hint(umo, appointment, appointment_at)
+            hint = self.appointment_hint(umo, appointment, appointment_at, appointment_id)
         elif reminder:
             hint = self.reminder_hint(umo)
         else:

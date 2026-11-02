@@ -333,7 +333,15 @@ def _conditional_in_prev(text: str, idx: int) -> bool:
     """
     start = clause_start(text, idx, 14)
     prev = prev_clause(text, start, 24)
-    if not prev or not prev.startswith(CONDITIONAL_LEADS):
+    if not prev:
+        return False
+    # 条件也可以写成「下雨的话，我就去洗澡」：前句不以「如果」开头，
+    # 而是以「的话」收尾。先遮掉名词性的「我说的话 / 听你的话」再判结尾。
+    prev_view = _mask_possessive_de_hua(prev)
+    if not (
+        prev_view.startswith(CONDITIONAL_LEADS)
+        or prev_view.rstrip().endswith("的话")
+    ):
         return False
     head = clause_head(text, idx, window=14)
     return head.startswith(CONDITIONAL_THENS)
@@ -464,11 +472,15 @@ def negated_by_clause(text: str, idx: int, negations, window: int = 4) -> bool:
         return False
     tight = clause_head(text, idx, window=window)
     if tight:
-        if any(n in tight for n in negations):
+        # 「我现在不得不开会」的 tight 是「在不得不」，末尾就是「不」；
+        # 「我现在不得不去洗澡了」的 tight 里含「不去」。假否定词必须先剔除，
+        # 否则紧贴窗口会先把真实动作否掉，后面再剔已经来不及。
+        tight_clean = _strip_neg_false_friends(tight)
+        if any(n in tight_clean for n in negations):
             return True
-        if tight[-1] in ("不", "别", "没"):
+        if tight_clean and tight_clean[-1] in ("不", "别", "没"):
             return True
-        if _NEG_TAIL_RE.search(tight):
+        if _NEG_TAIL_RE.search(tight_clean):
             return True
     head = clause_head(text, idx, window=10)
     if not head:
