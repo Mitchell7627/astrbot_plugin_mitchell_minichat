@@ -126,6 +126,7 @@ class Runner:
         self.engine = plugin.engine
         self.timers: dict[str, asyncio.Task] = {}
         self.started = False
+        self._schedule_log: dict[str, list[dict]] = {}
         # 正在发送中的会话，避免定时器与面板重复触发导致双发
         self._firing: set[str] = set()
         # 每会话一把发送锁：定时器与面板「手动发送」共用，避免两条消息交错
@@ -199,30 +200,47 @@ class Runner:
                 pass
             self._bg_tasks.difference_update(bg)
 
+    def schedule_diagnostics(self, umo: str) -> list[dict]:
+        """只读快照；每会话最近 20 次决策，不保存消息或模型内容。"""
+        return copy.deepcopy(self._schedule_log.get(umo, []))
+
+    def _trace_schedule(self, umo: str, reason: str, steps=None, next_at=None) -> None:
+        rows = self._schedule_log.setdefault(umo, [])
+        rows.append({"at": time.time(), "reason": reason,
+                     "next_at": next_at, "steps": list(steps or [])[:8]})
+        del rows[:-20]
+
     def reschedule(self, umo: str, *, delay_minutes: float | None = None, keep_if_future: bool = False,
-                   after_send: bool = False) -> None:
+                   after_send: bool = False, source: str = "explicit_delay") -> None:
         """安排下一次主动消息。"""
         old = self.timers.pop(umo, None)
         if old is not None:
             old.cancel()
         if not self.started:
+            self._trace_schedule(umo, "stopped")
             return
 
+        steps = []
+        if delay_minutes is not None:
+            steps.append({"reason": source, "minutes": delay_minutes})
         if keep_if_future:
             next_at = float(self.store.get(umo, "next_at", 0) or 0)
             if next_at > time.time() + 5:
                 # 已有未到期的排程，沿用它
                 delay_minutes = (next_at - time.time()) / 60.0
+                steps.append({"reason": "restored_schedule", "minutes": delay_minutes})
                 # 但事件进行中不能沿用「事件结束之后」的旧排程：
                 # 那样重启一次，整段事件里她就一句都不会开口。
                 remain = self._event_remaining_minutes(umo)
                 if remain is not None and delay_minutes > remain:
                     delay_minutes = max(1.0, remain - 0.5)
+                    steps.append({"reason": "event_window", "minutes": delay_minutes})
             # 没有未到期排程时不清空 delay_minutes：
             # 调用方显式传了「启动后等待」就用它，没传才走加权采样。
 
         if delay_minutes is None:
             delay_minutes = self._sample_minutes(umo, after_send=after_send)
+            steps.append({"reason": "event_sample" if self._event_remaining_minutes(umo) is not None else "sample", "minutes": delay_minutes})
             # 待睡等待：把触发对准提醒窗口，而不是普通 5-240 间隔。
             # 但事件进行中不对齐：对齐点通常落在几小时后的夜窗，会把整段事件窗口盖掉，
             # 结果「在洗澡」这 40 分钟里一句都没有。事件结束后的下一次再对齐。
@@ -230,14 +248,19 @@ class Runner:
                 sleep_delay = self._sleep_reminder_delay_minutes(umo)
                 if sleep_delay is not None:
                     delay_minutes = sleep_delay
+                    steps.append({"reason": "sleep_alignment", "minutes": delay_minutes})
 
         # 约定必须无条件压过上面算出来的一切：采样、待睡、重启沿用的旧 next_at
         appt_delay = self._appointment_next_delay(umo, delay_minutes)
         if appt_delay is not None:
             delay_minutes = appt_delay
+            steps.append({"reason": "appointment", "minutes": delay_minutes})
 
         delay_seconds = max(60.0, float(delay_minutes) * 60.0)
+        if delay_seconds > float(delay_minutes) * 60.0:
+            steps.append({"reason": "minimum_delay", "minutes": delay_seconds / 60.0})
         self.store.set(umo, "next_at", time.time() + delay_seconds)
+        self._trace_schedule(umo, steps[-1]["reason"], steps, self.store.get(umo, "next_at"))
         self.store.save()
         self.timers[umo] = asyncio.create_task(self._wait_and_fire(umo, delay_seconds))
 
@@ -374,6 +397,7 @@ class Runner:
         if next_at >= now + gap - 5:
             return
         self.store.set(umo, "next_at", now + gap)
+        self._trace_schedule(umo, "bot_reply_gap", next_at=now + gap)
         self.store.save()
         old = self.timers.pop(umo, None)
         if old is not None:
@@ -433,6 +457,10 @@ class Runner:
             if appt is not None:
                 delay = max(60.0, appt * 60.0)
             self.store.set(umo, "next_at", now + delay)
+            steps = [{"reason": "event_restore", "minutes": max(60.0, base - now) / 60.0}]
+            if appt is not None:
+                steps.append({"reason": "appointment", "minutes": delay / 60.0})
+            self._trace_schedule(umo, steps[-1]["reason"], steps, now + delay)
             self.store.save()
             old = self.timers.pop(umo, None)
             if old is not None:
@@ -450,7 +478,7 @@ class Runner:
         logger.info(
             f"{TAG} 事件已过：重抽 {int(minutes)} 分钟（上限 {cap} 分钟{reason}）"
         )
-        self.reschedule(umo, delay_minutes=minutes)
+        self.reschedule(umo, delay_minutes=minutes, source="event_resample")
 
     # ------------------------------------------------------------------
     # 采样
@@ -1090,6 +1118,7 @@ class Runner:
         item["follow_ups"] = 0
         # 保留原来的 time_text（那是他昨晚说的时间），用标记让提示词别写成「到点了」
         item["deferred"] = True
+        self._trace_schedule(umo, "appointment_deferred", next_at=new_at)
         self._save_appointments(umo, items)
         logger.info(
             f"{TAG} 约定到点时在睡眠中，延后到起床后：{item.get('time_text')} {item.get('label')}"
@@ -2068,7 +2097,7 @@ class Runner:
         return rec
 
     # ------------------------------------------------------------------
-    # 灰区复核：只有「拿不准」的句子才问一次模型（默认关，开了有上限）
+    # 灰区复核：只有「拿不准」的句子才问一次模型（默认开，有小时/日上限）
     # ------------------------------------------------------------------
     JUDGE_SYS_PROMPT = (
         "你只判断一件事：一个词是不是在说「说话的人自己此刻正在做（或马上要做）」这件事。\n"
@@ -3012,17 +3041,19 @@ class Runner:
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
-    async def _fire(self, umo: str) -> None:
+    async def _fire(self, umo: str) -> dict:
+        result = {"sent": False, "delivery_status": "not_sent", "reason": "busy",
+                  "planned_segments": 0, "delivered_segments": 0}
         if umo in self._firing:
             logger.info(f"{TAG} 该会话正在发送中，忽略重复触发")
-            return
+            return result
         lock = self.session_lock(umo)
         if lock.locked():
             # 面板正在手动发：这条让路，但要照常排下一次，不能就此停摆
             logger.info(f"{TAG} 该会话正在手动发送，跳过本次触发")
             if self.started:
                 self._finish_cycle(umo)
-            return
+            return result
         self._firing.add(umo)
         await lock.acquire()
         held = True
@@ -3032,7 +3063,8 @@ class Runner:
         delivered: list[str] = []
         try:
             if not self.cfg.get("enable", False):
-                return
+                result["reason"] = "disabled"
+                return result
             schedule = self.cfg.get("schedule_settings", {}) or {}
             # 睡眠免打扰：说「睡了」之后静音（智能时长：近起床点到起床、远则 N 小时）
             if self.is_sleeping(umo):
@@ -3043,8 +3075,10 @@ class Runner:
                     if wake_at > time.time():
                         self._defer_appointment(umo, appt.get("at"), wake_at,
                                                 appt.get("id"))
+                result["reason"] = "sleeping"
+                self._trace_schedule(umo, "sleeping", next_at=(self._sleep_state(umo) or {}).get("wake_at"))
                 logger.info(f"{TAG} 处于睡眠免打扰，跳过本次")
-                return
+                return result
 
             # 待睡提醒先判定：它每晚最多一条，不受「连续未回复」上限影响，
             # 否则你整晚没回消息时，最该催睡觉的那条反而被拦掉。
@@ -3065,21 +3099,24 @@ class Runner:
                 # 暂停普通主动聊天，但「说好的事」不能跟着一起停：
                 # 12:00 的约定、该睡了的提醒都是独立承诺，被未回复上限一起掐掉就没意义了。
                 reschedule_needed = False
+                result["reason"] = "unanswered_limit"
                 wake = self._next_wake_minutes(umo)
                 if wake is None:
+                    self._trace_schedule(umo, "unanswered_limit")
                     logger.info(f"{TAG} 连续 {unanswered} 条未回复，暂停直到你说话")
-                    return
+                    return result
                 # wake 是分钟、这里换秒；1 分钟地板 = 最迟 1 分钟内补发，
                 # 不是「1 小时」（外部报告把单位看成了分钟）。
                 delay = max(60.0, wake * 60.0)
                 self.store.set(umo, "next_at", time.time() + delay)
+                self._trace_schedule(umo, "promise_wakeup", next_at=self.store.get(umo, "next_at"))
                 self.store.save()
                 self.timers[umo] = asyncio.create_task(self._wait_and_fire(umo, delay))
                 logger.info(
                     f"{TAG} 连续 {unanswered} 条未回复，暂停普通聊天；"
                     f"{int(delay // 60)} 分钟后为约定/催睡再醒一次"
                 )
-                return
+                return result
 
             # 结束类约定到点：先把对应事件收掉，再生成提示词，
             # 否则「18:00 下课」这一拍还会说「他还在学习」。
@@ -3096,14 +3133,15 @@ class Runner:
                 appointment_id=appt_id,
             )
             if not text:
+                result["reason"] = "empty_generation"
                 logger.info(f"{TAG} 生成为空，重新排程")
                 if shot:
                     # 别让它每分钟重试：连续两次失败就放弃这条约定
                     self._appointment_fail(umo, shot, appt_at, appt_id)
-                return
+                return result
 
             try:
-                sent_text = await self._send_split(umo, text, sent_out=delivered)
+                sent_text = await self._send_split(umo, text, sent_out=delivered, report=result)
             except asyncio.CancelledError:
                 # 用户开口会取消定时器，CancelledError 会从这里穿出去、写历史的代码根本到不了。
                 # 已经发出去的那几段不能白丢，另起一个任务补写，然后把取消继续往上抛。
@@ -3113,6 +3151,8 @@ class Runner:
                     self._spawn_bg(self._append_assistant_history(umo, "\n".join(delivered)))
                 raise
             ok = bool(sent_text)
+            result["sent"] = ok
+            result["reason"] = "delivery"
             if ok:
                 if shot:
                     self._advance_appointment(umo, shot, appt_at, appt_id)
@@ -3135,6 +3175,7 @@ class Runner:
             elif shot:
                 self._appointment_fail(umo, shot, appt_at, appt_id)
         except Exception as e:
+            result["reason"] = "error"
             logger.error(f"{TAG} 发送流程异常: {e}")
         finally:
             if held and lock.locked():
@@ -3142,6 +3183,7 @@ class Runner:
             self._firing.discard(umo)
             if self.started and reschedule_needed:
                 self._finish_cycle(umo)
+        return result
 
     async def _generate(
         self, umo: str, reminder: bool = False,
@@ -3963,7 +4005,8 @@ class Runner:
                 cleaned.append(text)
         return cleaned
 
-    async def _send_split(self, umo: str, text: str, sent_out: list | None = None) -> str:
+    async def _send_split(self, umo: str, text: str, sent_out: list | None = None,
+                          report: dict | None = None) -> str:
         """分段发送。返回**实际送达**的文本（空串表示一段都没发出去）。
 
         以前返回 bool，只要第一段成功就为 True，调用方随后把整段原文写进历史——
@@ -3990,6 +4033,9 @@ class Runner:
                 segments, str(conf.get("content_cleanup_rule") or "")
             )
 
+        if report is not None:
+            report.update(planned_segments=len(segments), delivered_segments=0,
+                          delivery_status="not_sent")
         if not segments:
             return ""
 
@@ -4005,6 +4051,9 @@ class Runner:
                     logger.warning(f"{TAG} 分段 {index + 1} 未送达")
                     break
                 sent.append(segment)
+                if report is not None:
+                    report.update(delivered_segments=len(sent),
+                                  delivery_status="sent" if len(sent) == len(segments) else "partial")
                 if sent_out is not None:
                     sent_out.append(segment)
             except Exception as e:

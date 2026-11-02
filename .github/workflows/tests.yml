@@ -1,0 +1,21 @@
+name: Offline regression
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m playwright install --with-deps chromium
+      - run: python -m pytest -q
+      - run: python -m ruff check --select F tests tools
+      - run: python -m ruff check --select F --ignore F401 core/runner.py core/panel_api.py
+      - run: node --check views/mini/app.js

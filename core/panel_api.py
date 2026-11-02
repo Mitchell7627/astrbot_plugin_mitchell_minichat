@@ -359,6 +359,7 @@ class PanelService:
 
         return {
             "umo": umo,
+            "schedule_diagnostics": runner.schedule_diagnostics(umo) if runner else [],
             "phase": phase,
             "next_at": next_at or None,
             "next_in_seconds": max(0, int(next_at - now)) if alive and next_at > now else None,
@@ -424,6 +425,7 @@ class PanelService:
                 "unanswered": sum(t["unanswered"] for t in tasks),
                 "appointments": sum(1 for t in tasks if t.get("appointment")),
             },
+            "schedule_diagnostics": {umo: runner.schedule_diagnostics(umo) if runner else [] for umo in self.sessions()},
             "inflight": sorted(self._inflight.keys()),
             "last_reload": dict(self._last_reload),
         }
@@ -671,8 +673,9 @@ class PanelService:
                     if not text:
                         raise PanelError("E_UPSTREAM", "生成为空，未发送")
                 delivered: list[str] = []
+                report = {}
                 try:
-                    sent_text = await runner._send_split(umo, text, sent_out=delivered)
+                    sent_text = await runner._send_split(umo, text, sent_out=delivered, report=report)
                     ok = bool(sent_text)
                 except asyncio.CancelledError:
                     # 分段中途被取消：已送达的段落仍要写回历史，再往上抛
@@ -703,6 +706,7 @@ class PanelService:
 
         return {
             "sent": bool(ok),
+            **report,
             "text": text,
             "unanswered": count,
             "next_at": _as_float(state.get("next_at"), 0.0) or None,
@@ -711,13 +715,12 @@ class PanelService:
     async def fire(self, payload: dict) -> dict:
         umo = self._validate_umo((payload or {}).get("umo"))
         runner = self._require_runner()
-        before = _as_int((self.store.data.get(umo, {}) or {}).get("unanswered"), 0)
         # _fire 自己会加锁；这里先看一眼，避免用户点了按钮却静默什么都没发生
         if runner.session_lock(umo).locked():
             raise PanelError("E_BUSY", "该会话正在发送，请稍后再试")
         with _Busy(self, umo, "fire"):
             try:
-                await asyncio.wait_for(runner._fire(umo), timeout=120)
+                result = await asyncio.wait_for(runner._fire(umo), timeout=120)
             except asyncio.TimeoutError:
                 raise PanelError("E_UPSTREAM", "发送超时（120 秒）")
             except Exception as e:
@@ -726,7 +729,7 @@ class PanelService:
         after = _as_int(state.get("unanswered"), 0)
         return {
             "fired": True,
-            "sent": after > before,
+            **result,
             "unanswered": after,
             "next_at": _as_float(state.get("next_at"), 0.0) or None,
         }

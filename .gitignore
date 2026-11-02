@@ -5,3 +5,7 @@ __pycache__/
 .idea/
 .vscode/
 data/
+
+.venv/
+.pytest_cache/
+replay.json

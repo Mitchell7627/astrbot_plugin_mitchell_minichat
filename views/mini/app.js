@@ -312,6 +312,24 @@
             </div>`;
           }).join("")
         : `<div class="muted" style="font-size:12px">还没有判定记录</div>`;
+      const reasonNames = {
+        explicit_delay: "指定等待时间", restored_schedule: "恢复原排程",
+        event_window: "压入事件剩余时间", event_sample: "事件窗口内采样",
+        sample: "按频率采样", sleep_alignment: "对齐睡眠提醒",
+        appointment: "约定优先调整", minimum_delay: "最短等待一分钟",
+        stopped: "运行器已停止", sleeping: "睡眠免打扰",
+        bot_reply_gap: "正常回复后推迟主动消息", event_restore: "事件插队后恢复原排程",
+        event_resample: "事件结束后按上限重抽",
+        unanswered_limit: "未回复达到上限", promise_wakeup: "暂停闲聊，等待约定或催睡",
+        appointment_deferred: "约定顺延至起床后"
+      };
+      const scheduleRows = (it.schedule_diagnostics || []).slice().reverse();
+      const scheduleBlock = `<details class="task-log"><summary>排程原因（最近 ${scheduleRows.length} 次）</summary>
+        <div class="stack gap8">${scheduleRows.map((d) => `<div class="muted">
+          ${esc(L.fmtClock(d.at))} · ${esc(reasonNames[d.reason] || d.reason)}
+          ${d.next_at ? ` → ${esc(L.fmtClock(d.next_at))}` : ""}
+          ${(d.steps || []).map((step) => `<div>${esc(reasonNames[step.reason] || step.reason)}：${esc(Number(step.minutes).toFixed(1))} 分钟</div>`).join("")}
+        </div>`).join("") || "尚无记录；排程记录保留在本次运行内"}</div></details>`;
       const logBlock = `
         <details class="task-log" data-log-umo="${esc(it.umo)}"${state.logOpen.has(it.umo) ? " open" : ""}>
           <summary>最近判定 ${logs.length ? `<span class="badge warn">${logs.length}</span>` : ""}</summary>
@@ -347,6 +365,7 @@
             ? `<button class="btn sm ghost" data-act="task" data-op="clear-away" data-umo="${esc(it.umo)}">回到身边</button>`
             : ""}
         </div>
+        ${scheduleBlock}
         ${logBlock}
       </div>`;
     }).join("");
@@ -1257,6 +1276,17 @@
   });
 
   // ---------------------------------------------------------------- 动作
+  function deliveryToast(r) {
+    const blocked = {sleeping: "睡眠免打扰", unanswered_limit: "未回复达到上限", disabled: "插件已关闭", busy: "该会话正在发送", empty_generation: "生成为空", error: "发送流程异常"};
+    if (r.delivery_status === "partial") {
+      toast(`部分发送：${r.delivered_segments}/${r.planned_segments} 段`, "warn");
+    } else if (r.sent) {
+      toast(`已发送，未回复计数 ${r.unanswered}`, "ok");
+    } else {
+      toast(`没有发出：${blocked[r.reason] || "发送接口未确认送达"}`, "err");
+    }
+  }
+
   async function quickAction(op, umo, btn) {
     await withBusy(btn, async () => {
       if (op === "reload-plugin") return doReload();
@@ -1266,7 +1296,7 @@
         toast(r.text ? `预览：${r.text}` : "生成为空", r.text ? "ok" : "err");
       } else if (op === "fire") {
         const r = await api("POST", "fire", { umo });
-        toast(r.sent ? `已发送，未回复计数 ${r.unanswered}` : "本次没有发出（可能被静默或上限拦下）", r.sent ? "ok" : "err");
+        deliveryToast(r);
       } else if (op === "resched") {
         const r = await api("POST", "reschedule", { umo });
         toast(`已重排：${L.fmtDuration(r.next_in_seconds)}后`, "ok");
@@ -1280,7 +1310,7 @@
       if (op === "preview") return quickAction("preview", umo, null);
       if (op === "send") {
         const r = await api("POST", "fire", { umo });
-        toast(r.sent ? `已发送，未回复 ${r.unanswered}` : "没有发出（静默时段或达到上限）", r.sent ? "ok" : "err");
+        deliveryToast(r);
       } else if (op === "resched") {
         const r = await api("POST", "reschedule", { umo });
         toast(`已重排：${L.fmtDuration(r.next_in_seconds)}后`, "ok");
