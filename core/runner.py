@@ -66,6 +66,8 @@ APPOINTMENT_KEY = "appointments"
 APPOINTMENT_GRACE_MINUTES = 20
 # 事件结束后「在一起」再保留一小段：人还在旁边，但别一直挂到过期。
 TOGETHER_TAIL_MINUTES = 15
+# 下课/下班只结束事件，人还在外面；给离开状态至少再留 2 小时走到家。
+PERIOD_END_AWAY_GRACE_HOURS = 2
 # 队列上限：一天说三个时间点够用了，再多就是噪音
 APPOINTMENT_MAX_SLOTS = 3
 
@@ -2290,36 +2292,44 @@ class Runner:
             return rest, True
 
         # 阶段性结束词（下课 / 放学 / 下班 / 散会 / 收工 / 考完）：
-        # 只解除「离开」，不碰事件、不碰「在一起」。
-        # 放回归之后：说「下课了，我回来了」仍按回到身边处理（会清事件）。
-        # 放离开之前：否则「下班了，我先走了」会被 away 词抢先建新的离开状态。
+        # 结束对应事件，但不代表「回到身边」——人可能还在学校/公司，
+        # 只是这节课/这班结束了。真正回到身边要等「到家 / 回来了」的回归词。
         away_state = store.get(umo, "away")
-        if isinstance(away_state, dict) and away_state.get("active"):
-            end_ex = self.engine.match_period_end_ex(text)
-            self._note("end", {"hit": end_ex["hit"], "dropped": end_ex["dropped"]})
-            if end_ex["hit"]:
-                end_kw = end_ex["hit"]["kw"]
+        end_ex = self.engine.match_period_end_ex(text)
+        self._note("end", {"hit": end_ex["hit"], "dropped": end_ex["dropped"]})
+        if end_ex["hit"]:
+            end_kw = end_ex["hit"]["kw"]
+            if isinstance(away_state, dict) and away_state.get("active"):
+                # 保留离开状态，只把原因改成「下课了 / 下班了」；
+                # 时间从这一刻重新算，提示词才不会说「三小时前说去上课」。
                 store.set(umo, "away", {
-                    "active": False,
-                    "reason": away_state.get("reason") or "",
+                    **away_state,
+                    "active": True,
+                    "reason": f"{end_kw}了",
                     "keyword": end_kw,
-                    "cleared_at": now,
+                    "reason_at": now,
+                    "expires_at": max(
+                        float(away_state.get("expires_at") or 0),
+                        now + PERIOD_END_AWAY_GRACE_HOURS * 3600,
+                    ),
+                    "cleared_at": None,
                 })
-                # 下课/下班/散会也意味着对应事件结束：以前只改 away，
-                # 事件还挂着「在上班」，提示词会继续按上班写。
-                if isinstance(event, dict) and event.get("name") in self.PERIOD_END_EVENTS:
-                    store.pop(umo, "active_event")
-                    event = None
-                    self._sync_together_until(umo, closing=True)
-                logger.info(f"{TAG} 阶段性结束（命中「{end_kw}」），解除离开")
-                # 旧的解除之后，同句里可能还有一件新的事：
-                # 「下班了，我正在洗澡」要能继续往下认出洗澡。离开词还按整句判，
-                # 没有新离开词就遮掉这个结束词分句，交回外层继续看有没有别的事件。
-                if not self.engine.match_away_ex(text)["hit"]:
-                    rest = self._mask_clause(text, end_ex["hit"]["idx"])
-                    if not rest.strip():
-                        return None, True
-                    return rest, True
+                logger.info(
+                    f"{TAG} 阶段性结束（命中「{end_kw}」），仍在外面，等他真正到家"
+                )
+            # 下课/下班/散会也意味着对应事件结束：以前只改 away，
+            # 事件还挂着「在上班」，提示词会继续按上班写。
+            if isinstance(event, dict) and event.get("name") in self.PERIOD_END_EVENTS:
+                store.pop(umo, "active_event")
+                event = None
+                self._sync_together_until(umo, closing=True)
+            # 同句里可能还有一件新的事：「下班了，我正在洗澡」要能继续往下认出洗澡。
+            # 离开词还按整句判，没有新离开词就遮掉这个结束词分句，交回外层继续。
+            if not self.engine.match_away_ex(text)["hit"]:
+                rest = self._mask_clause(text, end_ex["hit"]["idx"])
+                if not rest.strip():
+                    return None, True
+                return rest, True
 
         away_ex = self.engine.match_away_ex(text)
         self._note("away", {"hit": away_ex["hit"], "dropped": away_ex["dropped"]})
@@ -2741,7 +2751,10 @@ class Runner:
                         "别提「想你」「等你回来」这种像人还在外地的说法，"
                         "也别问「到哪了」；可以说去门口接、把拖鞋摆好、饭别凉了这类眼前的事。"
                     )
-                mins = max(1, int((now - float(away.get("started_at") or now)) // 60))
+                since = float(
+                    away.get("reason_at") or away.get("started_at") or now
+                )
+                mins = max(1, int((now - since) // 60))
                 away_text = (
                     f"他 {mins} 分钟前说{away.get('reason') or '出门'}，"
                     "现在还没回来，不在你这边。"
