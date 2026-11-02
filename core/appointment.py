@@ -282,6 +282,13 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
         return drop("N1", "否定了，这件事不会发生")
     if rules.is_future_clause(text, idx) and not re.search(r"今天|今早|今晚|今儿", text):
         return drop("F1", "说的是别的日子")
+    # 「如果我十二点下课」「示例：'十二点下课'」「我十二点下课的安排取消了」都不是有效约定
+    if rules.is_reported_clause(text, idx):
+        return drop("R1", "是转述/示例，不是本人约定")
+    if rules.is_conditional_clause(text, idx):
+        return drop("C1", "是假设，不是真实安排")
+    if rules.is_cancelled_clause(text, idx, kw_len=kw_len, window=None):
+        return drop("X1", "这个安排取消了")
     if re.search(r"(下课|放学|下班|收工|散会|考完|结束|到家|到了)[了啦咯喽]", text):
         return drop("D1", "已经发生了")
 
@@ -310,6 +317,8 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
         "time_text": moment.strftime("%H:%M"),
         "raw": text.strip()[:20],
         "source": "gray" if force else "kw",
+        "idx": idx,
+        "length": kw_len,
     }
     return out
 

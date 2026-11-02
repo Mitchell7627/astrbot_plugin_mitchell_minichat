@@ -229,7 +229,10 @@ def dual_forecast(*, schedule: dict, engine_cfg: dict, active_event,
             "boost": float(active_event.get("boost") or 0) or None,
             "boost_left": bool(event_on),
             "boost_used": int(active_event.get("boost_used") or 0),
-            "boost_budget": int(active_event.get("boost_budget") or 1),
+            # boost_budget=0 表示「不限次数」，是合法值，不能用 `or 1` 吃掉
+            "boost_budget": (int(active_event["boost_budget"])
+                             if active_event.get("boost_budget") is not None
+                             else 1),
             "ttl_minutes": ttl,
             "remaining_minutes": int(round(remaining)),
             "bucket_minutes": bucket,

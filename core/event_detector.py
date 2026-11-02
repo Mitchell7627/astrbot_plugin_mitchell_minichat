@@ -274,7 +274,12 @@ class EventRuleStore:
                 self._normalize_rule(r) for r in rules
                 if isinstance(r, dict) and r.get("name")
             ]
-            self._negations = [str(p) for p in (data.get("negation_prefixes") or []) if p]
+            # UI 里配了否定词就以 UI 为准（用户清空 event_rules 后落到文件模式时，
+            # 面板上改的否定词原来会被静默忽略）
+            cfg_negs = self._split_kw(self._engine.get("negation_prefixes"))
+            self._negations = cfg_negs or [
+                str(p) for p in (data.get("negation_prefixes") or []) if p
+            ]
             self._away_keywords = [str(k) for k in (data.get("away_keywords") or []) if k]
             self._return_keywords = [str(k) for k in (data.get("return_keywords") or []) if k]
             self._mtime = self.path.stat().st_mtime
@@ -418,6 +423,14 @@ class EventRuleStore:
             return self._filtered()
         if self._is_future(text, idx):
             return self._filtered()
+        # 「如果我去洗澡」「要是明天下雨」：假设句里的动作不算发生
+        if rules.is_conditional_clause(text, idx):
+            return self._filtered()
+        if kind == "away":
+            # 「出差结束」「上班完了」：这是在说这件事收尾，不是现在要出门
+            tail = text[idx + len(kw): rules.clause_end(text, idx + len(kw))]
+            if tail.startswith(("结束", "完了", "完", "回来了")):
+                return self._filtered()
         if kind in ("away", "return", "end"):
             if rules.is_far_past_clause(
                 text, idx, kw_len=len(kw),
@@ -428,7 +441,10 @@ class EventRuleStore:
             return self._filtered()
         if self._is_question(text, idx, len(kw)):
             return self._filtered()
-        if kind not in ("away", "return") and self._is_third_person(text, idx):
+        # 以前这里给 away/return 开了豁免，结果「我妈出门了」会标成本人离开、
+        # 「我妈到家了」会清掉本人的 away。_scan_list 会继续试下一个候选，
+        # 「我妈出门了，我也出门了」仍能命中后一个。
+        if self._is_third_person(text, idx):
             return self._filtered()
 
         d = self._gate(text, idx, kw, kind)
@@ -614,6 +630,14 @@ class EventRuleStore:
                 # 结束词同样要看时态/是否取消：「明天开饭再说」「开饭取消了」
                 # 不是「这顿饭现在结束了」——以前这里只过滤否定，会把做饭直接结束掉。
                 if self._is_future(text, idx) or rules.is_cancelled_clause(text, idx, len(kw)):
+                    continue
+                # 结束词本身是完成体，不能用 is_past_clause（会把「吃完了」全挡掉），
+                # 只挡明确过去；其余按分句判别人称/疑问/转述/假设。
+                if (rules.is_third_person_subject(text, idx)
+                        or rules.is_question_clause(text, idx, len(kw))
+                        or rules.is_reported_clause(text, idx)
+                        or rules.is_conditional_clause(text, idx)
+                        or rules.is_far_past_clause(text, idx, kw_len=len(kw))):
                     continue
                 d = self._gate(text, idx, kw, "stop")
                 if d["verdict"] == utterance.VERDICT_REJECT:

@@ -670,9 +670,18 @@ class PanelService:
                         raise PanelError("E_UPSTREAM", "生成超时（90 秒）")
                     if not text:
                         raise PanelError("E_UPSTREAM", "生成为空，未发送")
+                delivered: list[str] = []
                 try:
-                    sent_text = await runner._send_split(umo, text)
+                    sent_text = await runner._send_split(umo, text, sent_out=delivered)
                     ok = bool(sent_text)
+                except asyncio.CancelledError:
+                    # 分段中途被取消：已送达的段落仍要写回历史，再往上抛
+                    if delivered:
+                        try:
+                            await runner._append_assistant_history(umo, "\n".join(delivered))
+                        except Exception:
+                            pass
+                    raise
                 except Exception as e:
                     raise PanelError("E_UPSTREAM", f"发送失败: {e}")
 

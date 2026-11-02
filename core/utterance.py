@@ -201,6 +201,11 @@ def _judge_cached(
     ):
         return hit("R2", VERDICT_REJECT)
 
+    # R2d：「洗澡水放好了」「开会的水还没倒」——命中词是名词短语的定语。
+    # 「水果」是另一个词，别一起挡掉。
+    if "R2" in scope and tail[:1] == "水" and tail[1:2] != "果":
+        return hit("R2", VERDICT_REJECT)
+
     if "R2b" in scope and (
         tail.startswith(_DE_NOUNS)
         or tail_bare.startswith(_DE_NOUNS)

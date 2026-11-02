@@ -44,6 +44,14 @@ PAST_FAR = (
 )
 # 单字「刚」的误伤保护：刚好 / 刚巧 不是时间
 _RECENT_GUARD = ("刚好", "刚巧", "刚想")
+# 「回头」既是将来（回头再说）又是字面回头（回头一看），后者要剔掉再判
+_FUTURE_GUARDS = ("回头一看", "回头一瞅", "回头看了眼", "回头看了", "等了一会儿", "过了一会儿")
+
+# ---------------------------------------------------------------- 假设/条件
+# 「如果我去洗澡，你就等我」「要是我在洗澡就好了」不是在陈述事实。
+CONDITIONAL_MARKERS = ("如果", "要是", "假如", "万一", "除非", "倘若", "如若", "的话")
+# 「梦见我起床了」：梦里的事不算发生
+DREAM_MARKERS = ("梦见", "梦到", "做梦", "梦里")
 
 # ---------------------------------------------------------------- 疑问
 # 事件路径只认「吗/嘛/问号」：中文里「我在吃饭呢」的「呢」是陈述语气，
@@ -51,6 +59,8 @@ _RECENT_GUARD = ("刚好", "刚巧", "刚想")
 QUESTION_MARKS = ("吗", "嘛", "？", "?")
 # 谓语后面的特殊疑问词：「开会开到几点」「下课要多久」——没有问号也是在问
 _INTERROGATIVE_RE = re.compile(r"(几|多少|多久|多长时间|啥|什么|哪|怎么)")
+# 前置特殊疑问：「什么时候去开会」「几点洗澡」——疑问词在谓语前面
+_Q_HEAD_RE = re.compile(r"(什么时候|啥时候|几点|几时|谁|哪里|哪儿|哪个|怎么|咋)")
 
 # ---------------------------------------------------------------- 人称
 # 第三人称主语（只在这些词出现在**分句开头**、且后面跟谓语时才认）
@@ -63,7 +73,7 @@ THIRD_PERSON_SUBJECTS = (
 PREDICATE_LEADS = ("在", "正", "还", "又", "刚", "已", "说", "要", "去", "想", "准备", "忙", "做", "睡", "吃", "玩", "觉得", "嫌", "夸")
 
 # 转述/引用：这句话是在复述别人说的，不是用户自己正在做
-_REPORTED_WORDS = ("他说", "她说", "听说", "据说", "别人说", "转述")
+_REPORTED_WORDS = ("他说", "她说", "听说", "据说", "别人说", "转述", "示例", "例如")
 # 成对引号：只有「命中词落在引号内部」才算转述。以前只要句子里出现引号就整句判转述，
 # 「他说“我去洗澡了”，我在吃饭」把自己的动作也一起挡掉了。
 _QUOTE_PAIRS = {"「": "」", "『": "』", "“": "”"}
@@ -131,6 +141,10 @@ def _has_recent_past(head: str) -> bool:
 
 
 def is_future_head(head: str) -> bool:
+    if not head:
+        return False
+    for guard in _FUTURE_GUARDS:
+        head = head.replace(guard, "")
     return bool(head) and (_has_marker(head, FUTURE_MARKERS) or bool(FUTURE_RE.search(head)))
 
 
@@ -177,10 +191,16 @@ def is_question_clause(text: str, idx: int, kw_len: int = 0, window: int = 14) -
     if any(m in clause for m in QUESTION_MARKS):
         return True
     tail = text[idx + kw_len:end].strip()
-    if tail[:1] == "没":
+    # 「吃饭了没」「睡了没」：体标记「了」把「没」推到了句尾
+    if tail[:1] == "没" or tail.endswith("没"):
         return True
     # 特殊疑问词跟在谓语后面：「开会开到几点」「下课要多久」
-    return bool(_INTERROGATIVE_RE.search(tail))
+    if _INTERROGATIVE_RE.search(tail):
+        return True
+    # 前置特殊疑问：「什么时候去开会」「几点洗澡」——疑问词在命中词前面
+    head = clause_head(text, idx, window=14)
+    match = _Q_HEAD_RE.search(head)
+    return bool(match) and (match.end() == len(head) or head[match.end()] in "去在要能会想")
 
 
 def is_third_person_subject(text: str, idx: int, extra_names=()) -> bool:
@@ -203,7 +223,11 @@ def is_third_person_subject(text: str, idx: int, extra_names=()) -> bool:
 
 
 def _quote_spans(text: str) -> list[tuple[int, int]]:
-    """成对引号覆盖的区间（左引号位置, 右引号位置）。没闭合的算到句尾。"""
+    """成对引号覆盖的区间（左引号位置, 右引号位置）。没闭合的中文引号算到句尾。
+
+    ASCII 直引号（" 和 '）只能按出现顺序两两配对：落单的不认，避免
+    「don't」「5'10"」这类把后半句整段吞进引号里。
+    """
     spans: list[tuple[int, int]] = []
     start = -1
     opener = ""
@@ -215,6 +239,11 @@ def _quote_spans(text: str) -> list[tuple[int, int]]:
             start, opener = -1, ""
     if start >= 0:
         spans.append((start, len(text)))
+
+    for mark in ('"', "'"):
+        positions = [i for i, ch in enumerate(text) if ch == mark]
+        for a, b in zip(positions[0::2], positions[1::2]):
+            spans.append((a, b))
     return spans
 
 
@@ -233,18 +262,46 @@ def is_reported_clause(text: str, idx: int) -> bool:
     return any(w in head for w in _REPORTED_WORDS)
 
 
+def is_conditional_clause(text: str, idx: int, window: int = 14, prev_max: int = 4) -> bool:
+    """命中词所在分句是不是假设/条件（「如果我去洗澡」「要是明天下雨」）。
+
+    「的话」通常在句尾，所以 head 和 tail 都要看；同时允许并上紧邻的短分句
+    （「如果明天，我就去洗澡」）。
+    """
+    if not text:
+        return False
+    head = clause_head(text, idx, window=window, prev_max=prev_max)
+    if any(w in head for w in CONDITIONAL_MARKERS):
+        return True
+    tail = text[idx: clause_end(text, idx)]
+    return any(w in tail for w in CONDITIONAL_MARKERS)
+
+
+def is_dream_clause(text: str, idx: int, window: int = 14) -> bool:
+    """「梦见/梦到/做梦」里的动作不算真实发生。"""
+    if not text:
+        return False
+    head = clause_head(text, idx, window=window)
+    if any(w in head for w in DREAM_MARKERS):
+        return True
+    return any(w in text[idx: clause_end(text, idx)] for w in DREAM_MARKERS)
+
+
 def is_cancelled_clause(text: str, idx: int, kw_len: int = 0, window: int = 6) -> bool:
     """命中词所在分句是不是在说「这件事取消了」。
 
     「取消去开会」「会不开了」「开会取消了」都算；「取消」和事件词隔得远近不论，
-    但只看本分句，不跨逗号。
+    但只看本分句，不跨逗号。window=None 表示看整个分句（约定里「取消」可能在时钟
+    后面好几个字）。
     """
     if not text or not CANCEL_WORDS:
         return False
-    head = clause_head(text, idx, window=window)
+    head = clause_head(text, idx, window=window if window is not None else len(text))
     if any(w in head for w in CANCEL_WORDS):
         return True
-    tail = text[idx + kw_len: clause_end(text, idx + kw_len)][:window]
+    tail = text[idx + kw_len: clause_end(text, idx + kw_len)]
+    if window is not None:
+        tail = tail[:window]
     return any(w in tail for w in CANCEL_WORDS)
 
 
@@ -259,6 +316,8 @@ def drop_keyword(text: str, idx: int, kw_len: int) -> str:
 # 判断「这是用户本人在做」时用的否定词表。比事件词表窄：只要紧贴的否定就够，
 # 太长的词（「不打算」）交给 is_future_clause 处理。
 SELF_NEGATIONS = ("不想", "不要", "不用", "不必", "没空", "没时间", "没心情", "还没", "没在")
+# 命中词前的否定尾巴：「没有在」「不是我在」「不在」「别在」……
+_NEG_TAIL_RE = re.compile(r"(?:(?:没有|没|不|别)(?:在|正|是)?|不是)(?:我)?(?:在|正)?$")
 
 
 def is_self_action_clause(text: str, idx: int, kw_len: int = 0) -> bool:
@@ -275,11 +334,17 @@ def is_self_action_clause(text: str, idx: int, kw_len: int = 0) -> bool:
         return False
     if is_cancelled_clause(text, idx, kw_len):
         return False
-    if is_future_clause(text, idx):
+    if is_conditional_clause(text, idx):
+        return False
+    if is_dream_clause(text, idx):
+        return False
+    if is_future_clause(text, idx, prev_max=4):
         return False
     if is_question_clause(text, idx, kw_len):
         return False
     if is_third_person_subject(text, idx):
+        return False
+    if is_far_past_clause(text, idx, kw_len):
         return False
     return True
 
@@ -298,6 +363,6 @@ def negated_by_clause(text: str, idx: int, negations, window: int = 4) -> bool:
         return True
     if head[-1] in ("不", "别", "没"):
         return True
-    # 「没在开会」「不在洗澡」：否定词被「在/正」隔开一个字（「没」不在否定词表里，
-    # 单字否定太容易误伤，只在紧贴「在/正」时才认）
-    return len(head) >= 2 and head[-1] in ("在", "正") and head[-2] in ("没", "不", "别")
+    # 「没在开会」「不在洗澡」「我没有在吃饭」「不是我在打游戏」：
+    # 否定词和「在/正」之间可能隔了「有/是/我」，统一用尾部正则收。
+    return bool(_NEG_TAIL_RE.search(head))

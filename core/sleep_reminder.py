@@ -306,6 +306,13 @@ def match_sleep_detail(
             continue
         if _is_past_at(text, kw, idx):
             continue
+        # 「示例：'我睡了'」是转述、「我梦见自己睡了」「要是我睡了就好了」不是真实入睡
+        if rules.is_reported_clause(text, idx):
+            continue
+        if rules.is_dream_clause(text, idx):
+            continue
+        if rules.is_conditional_clause(text, idx):
+            continue
         ok, d = _gate_ok(text, kw, idx, "sleep", enable_judge, strict, nicknames)
         if ok:
             return {
