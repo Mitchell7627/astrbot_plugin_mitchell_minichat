@@ -2,7 +2,7 @@
 
 # 主动私聊 Mini
 
-### 让 AstrBot 想起你，也主动找你聊一句。
+### 让 他/她 想起你，也主动找你聊一句。
 
 加权主动聊天 · 事件感知 · 跨日约定 · 睡眠免打扰
 
@@ -10,8 +10,6 @@
   <a href="https://github.com/Mitchell7627/astrbot_plugin_mitchell_minichat/releases/latest"><img src="https://img.shields.io/github/v/release/Mitchell7627/astrbot_plugin_mitchell_minichat?style=flat-square&amp;label=version&amp;color=8b7cf6" alt="最新正式版本"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-69c9a5?style=flat-square" alt="MIT license"></a>
   <a href="https://github.com/AstrBotDevs/AstrBot"><img src="https://img.shields.io/badge/AstrBot-%3E%3D4.29.0-5ca9ef?style=flat-square" alt="AstrBot >= 4.29.0"></a>
-  <img src="https://img.shields.io/badge/platform-QQ%20%E7%A7%81%E8%81%8A-f1b3ce?style=flat-square" alt="平台：QQ 私聊，aiocqhttp">
-  <a href="https://github.com/Mitchell7627/astrbot_plugin_mitchell_minichat/actions/workflows/tests.yml"><img src="https://github.com/Mitchell7627/astrbot_plugin_mitchell_minichat/actions/workflows/tests.yml/badge.svg?branch=main" alt="离线回归 CI"></a>
 </p>
 
 <p>
@@ -25,13 +23,9 @@
 
 <img src="docs/assets/minichat-banner.svg" width="960" alt="Mini 主动陪伴：知道你在忙，也记得什么时候找你">
 
-<p><strong>你来过的每一次，都让这里热闹一点。</strong></p>
-
 <a href="https://count.getloli.com/@mitchell7627-minichat">
-  <img src="https://count.getloli.com/@mitchell7627-minichat?theme=moebooru&amp;padding=6&amp;offset=0&amp;align=bottom&amp;scale=0.85&amp;pixelated=1&amp;darkmode=auto" width="520" alt="猫娘举牌访问计数，由 Moe Counter 提供">
+  <img src="https://count.getloli.com/@mitchell7627-minichat?theme=moebooru&amp;padding=6&amp;offset=0&amp;align=bottom&amp;scale=0.85&amp;pixelated=1&amp;darkmode=auto" width="680" alt="猫娘举牌访问计数">
 </a>
-
-<sub>猫娘举牌随计数变化。统计第三方计数图片的加载次数；受 GitHub 缓存影响，不等同于独立访客、下载量或每刷新必加一。</sub>
 
 </div>
 
@@ -40,6 +34,19 @@
 Mini 是 AstrBot 的 QQ 私聊主动消息插件。它根据聊天间隔、当前活动、在场状态和约定时间安排下一次开口，再结合你配置的人格与上下文生成消息。
 
 **当前仅支持 aiocqhttp（QQ）私聊**，只服务 `session_list` 中指定的会话。群聊不生效，其他适配器尚未验证。首次使用建议选「默认」频率，先看生成预览，再调整语气。
+
+<details>
+<summary><strong>免责声明与用户协议</strong></summary>
+
+使用本插件前，请阅读并理解以下说明：
+
+1. 本项目用于学习、研究与合法的个人聊天陪伴。请遵守当地法律法规和平台服务条款，不得用于骚扰、滥发消息或侵犯他人隐私。
+2. 监听、保存和处理聊天消息前，使用者应取得必要授权；启用模型功能时，相关消息与上下文可能发送至你配置的模型服务，请自行确认其数据处理方式。
+3. 事件识别、时间理解与模型生成可能出错，提醒也可能受网络、模型服务或平台连接影响。重要事项请同时使用独立提醒工具。
+4. 本项目按“原样”提供，不承诺持续可用或完全无误；相关担保与责任限制以 MIT License 及适用法律为准。
+5. 使用者应对自己的部署、配置与使用行为负责。本说明可能随版本更新，代码的使用、修改与分发以仓库中的 MIT License 为准。
+
+</details>
 
 ## 功能一览
 
@@ -221,6 +228,18 @@ Mini 是 AstrBot 的 QQ 私聊主动消息插件。它根据聊天间隔、当�
 - [开发验证说明](docs/validation.md)：仓库回归、历史回归、真实浏览器面板检查和离线回放。
 - 模型 / 发送替身用于验证流程，不能证明任意自然语言的识别质量或真实 QQ 投递；以固定提交的 [CI](https://github.com/Mitchell7627/astrbot_plugin_mitchell_minichat/actions) 记录为准。
 
+## SHA-256 校验文件的用途
+
+Release 中的 `.zip.sha256` 是对应 ZIP 安装包的校验文件，记录该文件的 SHA-256 摘要。它用于检查下载是否完整、内容是否与发布包一致，**不需要安装，也不需要放进插件目录**。
+
+下载 ZIP 和同名 `.zip.sha256` 后，用文本编辑器打开校验文件，再计算 ZIP 的摘要进行比较。例如在 Windows PowerShell 中：
+
+```powershell
+Get-FileHash .\astrbot_plugin_mitchell_minichat_v0.2.21.zip -Algorithm SHA256
+```
+
+将输出的 `Hash` 与校验文件中的摘要比较（大小写不影响结果）；一致表示校验通过，不一致则应重新下载并核对版本。
+
 ## 鸣谢与许可
 
-插件代码使用 [MIT License](LICENSE)。首页猫娘访问计数由 [Moe Counter](https://github.com/journey-ad/Moe-Counter) 提供，主题图像权利归各自权利人；本仓库未将第三方主题素材纳入插件的 MIT 授权。访问计数服务与插件运行互相独立，不消耗插件模型 token。
+插件代码使用 [MIT License](LICENSE)。

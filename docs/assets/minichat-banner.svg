@@ -31,10 +31,12 @@
     <text x="1097" y="83" fill="#777f98" font-size="12" text-anchor="end">a little everyday chat</text>
     <rect x="921" y="107" width="175" height="44" rx="13" fill="#332c50"/>
     <text x="1008" y="135" fill="#ebe5ff" font-size="17" text-anchor="middle">我去洗澡啦</text>
-    <circle cx="739" cy="185" r="15" fill="#25483f"/>
-    <path d="m731 183 1-8 6 5 6-5 2 8m-14 5q7 6 13 0" fill="none" stroke="#96e5d4" stroke-width="1.8" stroke-linecap="round"/>
-    <rect x="766" y="163" width="261" height="44" rx="13" fill="#203f3d"/>
-    <text x="896" y="191" fill="#b0f0df" font-size="17" text-anchor="middle">慢慢洗，别着凉</text>
+    <g transform="translate(724 163)">
+      <circle cx="15" cy="22" r="15" fill="#25483f"/>
+      <path d="m7 20 1-8 7 5 7-5 1 8m-15 5q7 6 14 0" fill="none" stroke="#96e5d4" stroke-width="1.8" stroke-linecap="round"/>
+      <rect x="42" y="0" width="261" height="44" rx="13" fill="#203f3d"/>
+      <text x="172.5" y="22" fill="#b0f0df" font-size="17" text-anchor="middle" dominant-baseline="central">慢慢洗，别着凉喵</text>
+    </g>
     <circle cx="780" cy="240" r="3" fill="#96e5d4"/>
     <text x="793" y="244" fill="#8995ae" font-size="12">EVENT AWARE · CONTEXT MATTERS</text>
   </g>
