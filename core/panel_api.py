@@ -196,6 +196,18 @@ def _deep_merge(base: dict, patch: dict, prefix: str = "") -> list[str]:
     return changed
 
 
+def _restore_mapping(target: dict, snapshot: dict) -> None:
+    """回滚失败的配置写入，保留运行器引用的嵌套字典。"""
+    for key in list(target):
+        if key not in snapshot:
+            del target[key]
+    for key, value in snapshot.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _restore_mapping(target[key], value)
+        else:
+            target[key] = copy.deepcopy(value)
+
+
 class _Busy:
     """同一会话的动作互斥，避免连点导致双发。"""
 
@@ -222,6 +234,7 @@ class PanelService:
     def __init__(self, plugin) -> None:
         self.plugin = plugin
         self._inflight: dict[str, tuple[str, float]] = {}
+        self._config_lock = asyncio.Lock()
         self._reloading = False
         self._restarting = False
         self._last_reload = {"at": 0, "ok": True, "error": None, "by": ""}
@@ -473,11 +486,18 @@ class PanelService:
         return data
 
     async def config_save(self, payload: dict) -> dict:
-        patch = (payload or {}).get("patch") or {}
+        # 同一面板的保存串行执行，失败回滚不能覆盖另一个已成功的保存。
+        async with self._config_lock:
+            return await self._config_save(payload)
+
+    async def _config_save(self, payload: dict) -> dict:
+        patch = copy.deepcopy((payload or {}).get("patch") or {})
         if not isinstance(patch, dict) or not patch:
             raise PanelError("E_BAD_REQUEST", "没有可保存的内容")
 
         config = self.plugin.config
+        before = copy.deepcopy(dict(config))
+        before_sessions = set(self.sessions())
         clamped: list[str] = []
         for section in ("friend_settings", "custom_engine", "web_panel"):
             sub = patch.get(section)
@@ -525,7 +545,10 @@ class PanelService:
                 await saver()
             else:
                 config.save_config()
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
+            _restore_mapping(config, before)
+            if isinstance(e, asyncio.CancelledError):
+                raise
             raise PanelError("E_CONFIG_SAVE", f"写盘失败: {e}")
 
         need_reload = any(
@@ -540,6 +563,15 @@ class PanelService:
         enable_changed = any(c == "friend_settings.enable" for c in changed)
         started_now = False
         runner = getattr(self.plugin, "runner", None)
+        if runner is not None:
+            current_sessions = set(self.sessions())
+            # 停用/重新启用或移除会话是明确边界，不能让旧识别在恢复后生效。
+            invalidated = before_sessions | current_sessions if enable_changed else before_sessions - current_sessions
+            for session in invalidated:
+                runner.invalidate_session(session)
+            if bool(self.cfg.get("enable")) and runner.started:
+                for session in current_sessions if enable_changed else current_sessions - before_sessions:
+                    runner.reschedule(session, delay_minutes=1)
         if enable_changed and runner is None and bool(self.cfg.get("enable")):
             try:
                 from .runner import Runner
@@ -658,6 +690,12 @@ class PanelService:
         umo = self._validate_umo(payload.get("umo"))
         runner = self._require_runner()
         text = str(payload.get("text") or "").strip()
+        if umo not in runner.sessions():
+            raise PanelError("E_NOT_FOUND", "该会话不在列表里")
+        seq = _as_int(self.store.get(umo, "turn_seq"), 0)
+
+        def current():
+            return runner._result_current(umo, seq)
 
         # 与定时器共用同一把会话锁：否则自动发送正在分段时，手动发送会插进去交错
         lock = runner.session_lock(umo)
@@ -676,7 +714,9 @@ class PanelService:
                 delivered: list[str] = []
                 report = {}
                 try:
-                    sent_text = await runner._send_split(umo, text, sent_out=delivered, report=report)
+                    sent_text = await runner._send_split(
+                        umo, text, sent_out=delivered, report=report, guard=current,
+                    )
                     ok = bool(sent_text)
                 except asyncio.CancelledError:
                     # 分段中途被取消：已送达的段落仍要写回历史，再往上抛
@@ -691,7 +731,9 @@ class PanelService:
 
                 state = self.store.data.get(umo, {}) or {}
                 if ok:
-                    count = self.store.bump_unanswered(umo)
+                    # 已送达内容照常记历史，较新的消息/面板校正保留其计数和排程。
+                    count = (self.store.bump_unanswered(umo) if current()
+                             else _as_int(state.get("unanswered"), 0))
                     self.store.save()
                     # 只写真正送达的内容：分段中途失败时，没送到的不该被当成「她已经说过」
                     try:
@@ -701,7 +743,7 @@ class PanelService:
                 else:
                     count = _as_int(state.get("unanswered"), 0)
 
-        if ok and payload.get("reschedule"):
+        if ok and payload.get("reschedule") and current():
             runner.reschedule(umo)
         state = self.store.data.get(umo, {}) or {}
 
@@ -760,7 +802,11 @@ class PanelService:
         if action in ('clear_event', 'clear_away', 'clear_sleep', 'clear_appointment',
                       'clear_together', 'mark_together', 'mark_away', 'undo_decision'):
             self._validate_umo(umo)
-            self.store.set(umo, 'turn_seq', _as_int(self.store.get(umo, 'turn_seq'), 0) + 1)
+            runner = getattr(self.plugin, "runner", None)
+            if runner is not None:
+                runner.invalidate_turn(umo)
+            else:
+                self.store.set(umo, 'turn_seq', _as_int(self.store.get(umo, 'turn_seq'), 0) + 1)
 
 
         if action == "add":

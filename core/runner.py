@@ -59,6 +59,7 @@ from .appointment import (
     next_delay as appointment_next_delay,
     parse as parse_appointment,
     resolve_at as resolve_appointment_at,
+    resolve_clock as resolve_appointment_clock,
     stage_of as appointment_stage,
     wake_target_is_self,
     _alternative_clock as appointment_alternative_clock,
@@ -211,9 +212,15 @@ class Runner:
         return (state.get('latest') == _as_int(self.store.get(umo, 'turn_seq'), 0)
                 and state.get('neutral') is True)
 
+    def invalidate_turn(self, umo: str) -> None:
+        """手动校正、停用或移除会话后，后续确认句不能复活旧后台请求。"""
+        self.store.set(umo, "turn_seq", _as_int(self.store.get(umo, "turn_seq"), 0) + 1)
+        self._semantic_turns.pop(umo, None)
+        self.store.save()
+
     def invalidate_session(self, umo: str) -> None:
         # 删除后立刻重加也不能复活删除前发起的识别请求。
-        self.store.set(umo, "turn_seq", _as_int(self.store.get(umo, "turn_seq"), 0) + 1)
+        self.invalidate_turn(umo)
         task = self.timers.pop(umo, None)
         if task is not None:
             task.cancel()
@@ -1387,8 +1394,8 @@ class Runner:
                 # 报当前钟点只跳过这个候选，不能放过后面的未来日期。
                 if any(w in head for w in ("现在", "已经", "都", "刚")):
                     continue
-                at = resolve_appointment_at(
-                    clock["h"], clock["m"], clock.get("period"), now,
+                at = resolve_appointment_clock(
+                    clock, now,
                     max(1, _as_int(self.engine_cfg.get("appointment_max_hours"), 14)),
                 )
                 if at is None or at <= now.timestamp() + 60:
@@ -1540,7 +1547,7 @@ class Runner:
                     anchor_day = moment.replace(hour=0, minute=0, second=0, microsecond=0)
                     if clock.get("period") == "night" and (clock["h"] == 12 or clock["h"] <= 5):
                         anchor_day -= timedelta(days=1)
-                    resolved = resolve_appointment_at(clock["h"], clock["m"], clock.get("period"), anchor_day, 48)
+                    resolved = resolve_appointment_clock(clock, anchor_day, 48)
                     target = datetime.fromtimestamp(resolved) if resolved is not None else None
                     hour = target.hour if target else clock["h"]
                     if moment.minute != clock["m"] or moment.hour != hour:
@@ -2809,11 +2816,12 @@ class Runner:
             handled = self._flush_decisions(umo, text, before, handled)
             seq = _as_int(self.store.get(umo, 'turn_seq'), 0)
             after = self._snapshot(umo)
-            neutral = (self.is_confirmation(text) and not self._gray_candidate
+            previous = self._semantic_turns.get(umo) or {}
+            neutral = (previous.get('latest') == seq - 1
+                       and self.is_confirmation(text) and not self._gray_candidate
                        and not self._appt_candidate and not self._llm_candidate
                        and all(before.get(k) == after.get(k) for k in
                                ('active_event', 'away', 'together', 'sleep_state', 'appointments')))
-            previous = self._semantic_turns.get(umo) or {}
             self._semantic_turns[umo] = {
                 'latest': seq, 'intent': previous.get('intent', seq - 1) if neutral else seq,
                 'neutral': neutral,

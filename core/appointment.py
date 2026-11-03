@@ -311,7 +311,7 @@ def _selected_day(text: str, idx: int, length: int = 0, *, now: datetime) -> _Da
     markers = _day_markers(clause, now)
     for left, right in zip(markers, markers[1:]):
         if (left.target != right.target
-                and re.fullmatch(r"[\s的（(]*", clause[left.end:right.start])):
+                and re.fullmatch(r"[\s的（(]*(?:(?:也就是|也即|即|是)[\s的（(]*)?", clause[left.end:right.start])):
             # 「11月4日（周一）」等互相矛盾的同一日期描述不能猜。
             return _DayMarker(left.start, right.end, False, None)
     changes = [m for m in markers if re.search(r"(?:改到|改为|改成|挪到|推迟到|安排在)\s*$", clause[:m.start])]
@@ -339,13 +339,15 @@ def _dated_at(clock: dict, marker: _DayMarker, now: datetime, days: int, max_hou
     if marker.target is None or not 0 <= (marker.target - now.date()).days <= days:
         return None
     if marker.is_today:
-        at = resolve_at(clock['h'], clock['m'], clock.get('period'), now, max_hours)
+        at = resolve_clock(clock, now, max_hours, anchored=bool(clock.get('reverse')))
+        if at is not None and at <= now.timestamp() - 300:
+            return None
         if at is not None and clock.get('period') != 'night' and datetime.fromtimestamp(at).date() != now.date():
             return None
         return at
     anchor = now.replace(year=marker.target.year, month=marker.target.month, day=marker.target.day,
                          hour=0, minute=0, second=0, microsecond=0)
-    at = resolve_at(clock['h'], clock['m'], clock.get('period'), anchor, (days + 2) * 24)
+    at = resolve_clock(clock, anchor, (days + 2) * 24, anchored=bool(clock.get('reverse')))
     if at is None or at <= now.timestamp() - 300:
         return None
     if (datetime.fromtimestamp(at).date() - now.date()).days > days:
@@ -377,19 +379,22 @@ def find_clock(text: str):
             "period": _find_period(text, match.start()),
         }
 
-    match = _DIFF_RE.search(scan)
-    if match:
+    for match in _DIFF_RE.finditer(scan):
         # 差一刻五点 = 4:45；差五分五点 = 4:55
         offset = _MINUTE_WORDS.get(match.group(1))
         if offset is None:
             offset = cn_to_int(match.group(2))
         hour = cn_to_int(match.group(3))
-        if offset and hour:
+        if hour is not None and offset is not None and 0 <= hour <= 23 and 0 <= offset <= 59:
             return {
-                "h": (hour - 1) % 24, "m": 60 - offset, "idx": match.start(),
+                "h": (hour - 1) % 24 if offset else hour, "m": 60 - offset if offset else 0,
+                "idx": match.start(),
                 "length": match.end() - match.start(),
                 "period": _find_period(text, match.start()),
+                "reverse": {"hour": hour, "minutes": offset},
             }
+    # 非法差分短语不能再从内部捡出「五点」；后续独立的合法钟点仍可识别。
+    scan = _DIFF_RE.sub(lambda m: ' ' * len(m.group()), scan)
 
     for match in _POINT_RE.finditer(scan):
         if _degree_point(text, match):
@@ -413,9 +418,8 @@ def find_clock(text: str):
     return None
 
 
-def resolve_at(hour: int, minute: int, period: str | None,
-               now: datetime, max_hours: int):
-    """把「几点几分」落成时间戳；过去 / 太远 / 非法都返回 None。"""
+def _clock_base(hour: int, minute: int, period: str | None, now: datetime):
+    """先转换原始钟点的时段，再做差分，避免跨午夜/中午时错换十二小时。"""
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         return None
 
@@ -441,7 +445,11 @@ def resolve_at(hour: int, minute: int, period: str | None,
         if hour <= 11:
             hour += 12
 
-    base = now.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=day_offset)
+    return now.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=day_offset)
+
+
+def _resolve_base(base: datetime, period: str | None, now: datetime, max_hours: int):
+    hour = base.hour
     floor = now - timedelta(minutes=5)
     if base <= floor:
         passed = (now - base).total_seconds()
@@ -459,6 +467,27 @@ def resolve_at(hour: int, minute: int, period: str | None,
     if (base - now).total_seconds() > max_hours * 3600:
         return None
     return base.timestamp()
+
+
+def resolve_at(hour: int, minute: int, period: str | None,
+               now: datetime, max_hours: int):
+    """把普通钟点落成时间戳；过去 / 太远 / 非法返回 None。"""
+    base = _clock_base(hour, minute, period, now)
+    return _resolve_base(base, period, now, max_hours) if base is not None else None
+
+
+def resolve_clock(clock: dict, now: datetime, max_hours: int, *, anchored: bool = False):
+    reverse = clock.get('reverse')
+    if not reverse:
+        return resolve_at(clock['h'], clock['m'], clock.get('period'), now, max_hours)
+    base = _clock_base(reverse['hour'], 0, clock.get('period'), now)
+    if base is None:
+        return None
+    base -= timedelta(minutes=reverse['minutes'])
+    if anchored:
+        # 明确日期以目标钟点为锚；「明天凌晨差一刻零点」落在今天23:45。
+        return base.timestamp() if base <= now + timedelta(hours=max_hours) else None
+    return _resolve_base(base, clock.get('period'), now, max_hours)
 
 
 def _find_event(text: str, clock: dict, keywords: dict):
@@ -692,6 +721,23 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
             return drop('X1', '安排已取消')
     if rules.negated_by_clause(text, _event_idx, NEGATIONS, window=4):
         return drop("N1", "否定了，这件事不会发生")
+    # 否定计划/否认说过可以隔着完整日期与钟点，不受四字窗口限制。
+    # 只去掉时间片段后检查紧邻谓语的否定，避免否定其他活动时牵连本约定。
+    prefix_start = rules.clause_start(text, _event_idx)
+    intent = text[prefix_start:_event_idx]
+    if prefix_start <= idx < _event_idx:
+        pos = idx - prefix_start
+        intent = intent[:pos] + ' ' * kw_len + intent[pos + kw_len:]
+    for marker in sorted(_day_markers(intent, now), reverse=True):
+        intent = intent[:marker.start] + ' ' * (marker.end - marker.start) + intent[marker.end:]
+    for words, _ in _PERIOD_WORDS:
+        for word in words:
+            intent = intent.replace(word, ' ' * len(word))
+    if re.search(r'(?<!不是)(?:不打算|没(?:有)?打算|不准备|没(?:有)?准备|不计划|没(?:有)?计划|没(?:有)?说(?:过)?|从未说(?:过)?|不曾说(?:过)?)[\s我自己在要会再就]*$', intent):
+        return drop('N1', '否定计划或否认说过，不建立约定')
+    suffix = text[_event_idx + _event_len:rules.clause_end(text, _event_idx + _event_len)].strip()
+    if re.match(r'(?:不成了|办不成了|开不成了|行不通了)', suffix):
+        return drop('N1', '安排未能成立，不建立约定')
     # 唤醒的裸十二小时钟点取接下来最近一次，不影响普通约定的保守规则。
     if kind == 'wake' and day is None and clock.get('period') is None and clock['h'] <= 12:
         choices = [now.replace(hour=h, minute=clock['m'], second=0, microsecond=0)
@@ -702,7 +748,7 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
         if nearest.date() != now.date():
             day = _DayMarker(0, 0, False, nearest.date())
     at = (_dated_at(clock, day, now, future_days, max_hours) if day is not None
-          else resolve_at(clock["h"], clock["m"], clock["period"], now, max_hours))
+          else resolve_clock(clock, now, max_hours))
     if at is None:
         return drop("T1", "这个时刻已经过去，或者太远")
 

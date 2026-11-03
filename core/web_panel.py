@@ -11,8 +11,11 @@ import hmac
 import secrets
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from astrbot.api import logger
+
+from .panel_api import PanelError
 
 try:
     import uvicorn
@@ -59,6 +62,7 @@ class PanelHttpServer:
         self._task = None
         self._tokens: dict[str, float] = {}
         self._fails: dict[str, list[float]] = {}
+        self._token_password = self._password()
         self._app = self._build_app() if uvicorn else None
 
     # ------------------------------------------------------------------
@@ -87,6 +91,7 @@ class PanelHttpServer:
         return str(cfg.get("password") or "")
 
     def _issue_token(self, ip: str) -> str:
+        self._sync_auth()
         if len(self._tokens) >= MAX_TOKENS:
             oldest = min(self._tokens.items(), key=lambda kv: kv[1])[0]
             self._tokens.pop(oldest, None)
@@ -94,14 +99,21 @@ class PanelHttpServer:
         self._tokens[token] = time.time() + TOKEN_TTL
         return token
 
-    def _valid_token(self, request: Request) -> bool:
-        if not self._password():
-            return True
-        raw = request.cookies.get(COOKIE_NAME) or ""
-        if not raw:
-            auth = request.headers.get("authorization") or ""
-            if auth.lower().startswith("bearer "):
-                raw = auth[7:].strip()
+    def _sync_auth(self) -> None:
+        current = self._password()
+        if current != self._token_password:
+            # 修改密码后，旧登录凭据不能继续修改配置或读取私聊状态。
+            self._tokens.clear()
+            self._fails.clear()
+            self._token_password = current
+
+    @staticmethod
+    def _bearer_token(request: Request) -> str:
+        auth = request.headers.get("authorization") or ""
+        return auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+
+    def _token_alive(self, raw: str) -> bool:
+        self._sync_auth()
         exp = self._tokens.get(raw)
         if exp is None:
             return False
@@ -109,6 +121,35 @@ class PanelHttpServer:
             self._tokens.pop(raw, None)
             return False
         return True
+
+    def _valid_token(self, request: Request) -> bool:
+        self._sync_auth()
+        if not self._password():
+            return True
+        raw = self._bearer_token(request) or request.cookies.get(COOKIE_NAME) or ""
+        return self._token_alive(raw)
+
+    def _safe_origin(self, request: Request) -> bool:
+        """浏览器写操作校验来源；显式有效 Bearer 不依赖环境 cookie。"""
+        bearer = self._bearer_token(request)
+        if bearer and self._token_alive(bearer):
+            return True
+        origin = request.headers.get("origin")
+        if not origin:
+            # 命令行客户端没有 Origin；浏览器明确标为跨站的请求仍拒绝。
+            return request.headers.get("sec-fetch-site", "").lower() != "cross-site"
+        try:
+            source = urlsplit(origin)
+            if (source.scheme not in ("http", "https") or not source.hostname
+                    or source.username is not None or source.password is not None
+                    or source.path or source.query or source.fragment):
+                return False
+            # 比较外部 Host 的 authority；TLS 终止代理可把 HTTPS 转给本机 HTTP。
+            target = urlsplit(source.scheme + "://" + request.headers.get("host", ""))
+            default = 443 if source.scheme == "https" else 80
+            return (source.hostname, source.port or default) == (target.hostname, target.port or default)
+        except ValueError:
+            return False
 
     def _rate_limited(self, ip: str) -> int:
         now = time.time()
@@ -130,7 +171,13 @@ class PanelHttpServer:
 
         @app.middleware("http")
         async def security_headers(request: Request, call_next):
-            response = await call_next(request)
+            if (request.url.path.startswith("/api/") and request.method in ("POST", "PUT", "PATCH", "DELETE")
+                    and not self._safe_origin(request)):
+                response = JSONResponse(
+                    {"status": "error", "message": "E_ORIGIN: 不允许跨来源修改面板"}, status_code=403
+                )
+            else:
+                response = await call_next(request)
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["Referrer-Policy"] = "no-referrer"
             response.headers["Cache-Control"] = "no-store"
@@ -149,6 +196,7 @@ class PanelHttpServer:
 
         @app.post("/api/login")
         async def login(request: Request):
+            self._sync_auth()
             ip = request.client.host if request.client else "?"
             wait = self._rate_limited(ip)
             if wait > 0:
@@ -157,7 +205,10 @@ class PanelHttpServer:
                     status_code=429,
                     headers={"Retry-After": str(wait)},
                 )
-            body = await self._json(request)
+            try:
+                body = await self._json(request)
+            except PanelError as e:
+                return JSONResponse({"status": "error", "message": f"{e.code}: {e.message}"}, status_code=400)
             given = str((body or {}).get("password") or "")
             expected = self._password()
             if not expected:
@@ -181,8 +232,9 @@ class PanelHttpServer:
 
         @app.post("/api/logout")
         async def logout(request: Request):
-            token = request.cookies.get(COOKIE_NAME) or ""
-            self._tokens.pop(token, None)
+            self._sync_auth()
+            for token in (self._bearer_token(request), request.cookies.get(COOKIE_NAME) or ""):
+                self._tokens.pop(token, None)
             resp = JSONResponse({"status": "ok", "data": {"ok": True}})
             resp.delete_cookie(COOKIE_NAME, path="/")
             return resp
@@ -207,10 +259,19 @@ class PanelHttpServer:
 
     @staticmethod
     async def _json(request: Request):
-        try:
-            return await request.json()
-        except Exception:
+        raw = await request.body()
+        if not raw:
             return {}
+        media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media != "application/json" and not (media.startswith("application/") and media.endswith("+json")):
+            raise PanelError("E_BAD_REQUEST", "请求体必须使用 application/json")
+        try:
+            body = await request.json()
+        except Exception:
+            raise PanelError("E_BAD_REQUEST", "请求体不是有效 JSON") from None
+        if not isinstance(body, dict):
+            raise PanelError("E_BAD_REQUEST", "请求体必须是对象")
+        return body
 
     def _file(self, rel: str):
         target = (self.views_dir / rel).resolve()
