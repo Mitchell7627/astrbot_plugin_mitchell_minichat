@@ -1117,7 +1117,7 @@ class Runner:
             elif shot == "due":
                 item["stage"] = "due"
                 item["due_sent_at"] = now
-                if cfg["followup_enabled"] and cfg["max_followups"] > 0:
+                if item.get("kind") != "wake" and cfg["followup_enabled"] and cfg["max_followups"] > 0:
                     item["follow_up_at"] = now + cfg["followup_minutes"] * 60
                 else:
                     # 不补发就没有下一拍了：直接收尾，否则这条永远是队首、永远发不了也退不出，
@@ -1417,6 +1417,8 @@ class Runner:
         return end
 
     _APPOINTMENT_ALIASES = {
+        "起床": ("起床", "起来", "叫醒", "喊醒"), "起来": ("起床", "起来", "叫醒", "喊醒"),
+        "叫醒": ("起床", "起来", "叫醒", "喊醒"), "喊醒": ("起床", "起来", "叫醒", "喊醒"),
         "开会": ("开会", "会议"), "下课": ("下课", "上课", "课程"),
         "上课": ("上课", "课程"), "下班": ("下班", "上班"),
         "吃饭": ("吃饭", "饭局", "聚餐"), "约会": ("约会",),
@@ -2174,6 +2176,9 @@ class Runner:
         """睡眠免打扰只在明确说「醒了/起床/睡不着」时解除，睡前闲聊不误触。"""
         state = self._sleep_state(umo)
         if not state or state.get("state") != STATE_SLEEPING:
+            return
+        planned = parse_appointment(text, datetime.now(), self._appointment_cfg()).get('hit')
+        if planned and planned.get('kind') == 'wake' and planned['at'] > time.time():
             return
         kw = self._match_wake(text)
         if not kw:
@@ -3416,6 +3421,13 @@ class Runner:
                 result["reason"] = "disabled"
                 return result
             schedule = self.cfg.get("schedule_settings", {}) or {}
+            wake_due = next((item for item in self._appointments(umo)
+                             if item.get('kind') == 'wake' and not item.get('due_sent_at')
+                             and item.get('at', 0) <= time.time()
+                             and appointment_stage(item, time.time(), self._appointment_cfg()) == 'due'), None)
+            if wake_due:
+                self.store.pop(umo, SLEEP_KEY)
+                self.store.save()
             # 睡眠免打扰：说「睡了」之后静音（智能时长：近起床点到起床、远则 N 小时）
             if self.is_sleeping(umo):
                 # 到点的约定不能静默丢掉：改排到起床后，醒来再补。
@@ -3435,6 +3447,8 @@ class Runner:
             reminding = self.should_remind_sleep(umo)
             # 约定优先：同一时刻只发一条，别和催睡抢
             appt = self.appointment_shot_item(umo)
+            if wake_due:
+                appt = {'item': wake_due, 'shot': 'due', 'at': wake_due['at'], 'id': wake_due.get('id')}
             shot = appt["shot"] if appt else None
             appt_at = appt["at"] if appt else None
             appt_id = appt.get("id") if appt else None

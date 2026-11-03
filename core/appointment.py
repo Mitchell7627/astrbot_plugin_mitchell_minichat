@@ -78,6 +78,7 @@ _WHEN_ASK_RE = re.compile(r"(几|啥|什么|哪)\s*点")
 
 # ---------------------------------------------------------------- 事件词
 DEFAULT_EVENTS = {
+    "wake": ["起床", "起来", "叫醒", "喊醒"],
     "end": [
         "下课", "放学", "下班", "收工", "散会", "考完", "结束", "完事",
     ],
@@ -178,6 +179,8 @@ _RELATIVE_DAY_RE = re.compile(
     rf"(?:(?:再过|过)\s*(?P<after>{_DATE_NUMBER}|几)\s*(?:天|日)(?:以后|之后|后)?"
     rf"|(?P<count>{_DATE_NUMBER}|几)\s*(?:天|日)(?:以后|之后|后))"
 )
+_EXTRA_RELATIVE_RE = re.compile(rf"(?:(?:前)(?P<past>{_DATE_NUMBER})(?:天|日)|(?P<n>{_DATE_NUMBER})(?P<unit>天|日|周|星期)(?P<direction>前|后))")
+_UNKNOWN_DATE_RE = re.compile(r"(?<![\d/])\d{2}/\d{1,2}/\d{1,2}(?![\d/])")
 _DATE_PATTERNS = (_CALENDAR_RE, _NUMERIC_DATE_RE, _MONTH_DAY_RE, _RELATIVE_DAY_RE)
 _CHANGE_RE = re.compile(r"改到|改为|改成|挪到|推迟到")
 # 必须带星期单位，避免把普通「一」当作日期；允许「下周星期一」。
@@ -221,6 +224,7 @@ def _day_markers(text: str, now: datetime) -> list[_DayMarker]:
     offsets = {w: 0 for w in _TODAY_WORDS}
     offsets.update({w: 1 for w in ('明天', '明日', '明早', '明晚', '明晨', '明儿', '明个')})
     offsets.update({'后天': 2, '大后天': 3, '昨天': -1, '昨日': -1, '昨晚': -1, '昨儿': -1, '昨夜': -1, '前天': -2, '大前天': -3})
+    text = text.translate(str.maketrans("／．－", "/.-"))
     found = [_DayMarker(m.start(), m.end(), m.group() in _TODAY_WORDS,
                         now.date() + timedelta(days=offsets[m.group()]) if m.group() in offsets else None)
              for m in _DAY_RE.finditer(text)]
@@ -247,6 +251,18 @@ def _day_markers(text: str, now: datetime) -> list[_DayMarker]:
             except (ValueError, KeyError, OverflowError):
                 target = None
             found.append(_DayMarker(match.start(), match.end(), target == now.date(), target))
+    for match in _EXTRA_RELATIVE_RE.finditer(text):
+        try:
+            count = _date_number(match['past'] or match['n'])
+            delta = count * (7 if match['unit'] in ('周', '星期') else 1)
+            if match['past'] or match['direction'] == '前':
+                delta = -delta
+            target = now.date() + timedelta(days=delta)
+        except (ValueError, OverflowError):
+            target = None
+        found.append(_DayMarker(match.start(), match.end(), target == now.date(), target))
+    for match in _UNKNOWN_DATE_RE.finditer(text):
+        found.append(_DayMarker(match.start(), match.end(), False, None))
     weekdays = {c: i for i, c in enumerate("一二三四五六日")}
     weekdays.update({str(i + 1): i for i in range(7)})
     weekdays['天'] = 6
@@ -339,6 +355,7 @@ def _dated_at(clock: dict, marker: _DayMarker, now: datetime, days: int, max_hou
 
 def _date_safe_text(text: str) -> str:
     # 日期里的小数点不是分句边界；保持字符串长度及索引不变。
+    text = text.translate(str.maketrans('／．－', '/.-'))
     return _NUMERIC_DATE_RE.sub(lambda m: m.group().replace('.', '/'), text)
 
 
@@ -571,6 +588,8 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
     if rules.negated_by_clause(text, idx, NEGATIONS, window=4):
         return drop("N1", "否定了，这件事不会发生")
     clause = text[rules.clause_start(text, idx):rules.clause_end(text, idx + kw_len)]
+    if re.search(r'或者|或是|或|二选一', clause):
+        return drop('A2', '备选时间尚未确定，不登记')
     day = _selected_day(text, idx, kw_len, now=now)
     future_days = max(0, min(365, int(cfg.get('future_days', 0))))
     if ((day is not None and (day.target is None or not 0 <= (day.target - now.date()).days <= future_days))
@@ -591,6 +610,9 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
         return drop("E1", "有时间但没有对应的事")
 
     label, kind, _event_idx, _event_len = event
+    if kind == 'wake' and label == '起来' and _event_idx > 0:
+        if text[_event_idx - 1] not in '再才就要会先我点分整半 ，,：:0123456789':
+            return drop('E1', '不是起床语境，不建立唤醒预约')
     if rules.clause_start(text, _event_idx) != rules.clause_start(text, idx):
         action_start = rules.clause_start(text, _event_idx)
         action_clause = text[action_start:rules.clause_end(text, _event_idx + _event_len)]
@@ -618,13 +640,22 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
             return drop('X1', '安排已取消')
     if rules.negated_by_clause(text, _event_idx, NEGATIONS, window=4):
         return drop("N1", "否定了，这件事不会发生")
+    # 唤醒的裸十二小时钟点取接下来最近一次，不影响普通约定的保守规则。
+    if kind == 'wake' and day is None and clock.get('period') is None and clock['h'] <= 12:
+        choices = [now.replace(hour=h, minute=clock['m'], second=0, microsecond=0)
+                   for h in sorted({clock['h'] % 12, clock['h'] % 12 + 12})]
+        choices += [v + timedelta(days=1) for v in choices]
+        nearest = min(v for v in choices if v.timestamp() > now.timestamp())
+        clock = {**clock, 'h': nearest.hour}
+        if nearest.date() != now.date():
+            day = _DayMarker(0, 0, False, nearest.date())
     at = (_dated_at(clock, day, now, future_days, max_hours) if day is not None
           else resolve_at(clock["h"], clock["m"], clock["period"], now, max_hours))
     if at is None:
         return drop("T1", "这个时刻已经过去，或者太远")
 
     seconds = _day_seconds(at, now)
-    if kind not in ("end", "arrive") and (seconds >= 23 * 3600 or seconds < 7 * 3600):
+    if kind not in ("end", "arrive", "wake") and (seconds >= 23 * 3600 or seconds < 7 * 3600):
         return drop("M1", "深夜，不吵醒他")
 
     clause = text[rules.clause_start(text, idx):rules.clause_end(text, idx + kw_len)]
@@ -660,6 +691,9 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
 # ---------------------------------------------------------------- 调度
 def stage_of(ap, now: float, cfg: dict):
     """这次该按哪一拍走：lead / due / follow / None。纯读。"""
+    if isinstance(ap, dict) and ap.get('kind') == 'wake':
+        if now < float(ap.get('at') or 0) or ap.get('due_sent_at'):
+            return None
     if not isinstance(ap, dict):
         return None
     at = float(ap.get("at") or 0)
@@ -698,6 +732,8 @@ def next_delay(ap, now: float, current_minutes: float, cfg: dict):
     if now > at + grace:
         return None
 
+    if ap.get('kind') == 'wake':
+        return None if ap.get('due_sent_at') else max(1.0, (at - now) / 60.0)
     stage = str(ap.get("stage") or "pending")
 
     # 到点了但还没发：不管之前排了多久，直接对准
@@ -731,6 +767,7 @@ def next_delay(ap, now: float, current_minutes: float, cfg: dict):
 # 到点那一拍按约定类型分口径：以前一律「当成已经结束」，
 # 「十二点开会」到点就说「会开完了」，跟事实正好相反。
 DUE_HINTS_BY_KIND = {
+    "wake": "现在 {hhmm}，他约好 {time_text} 叫醒。温柔叫他起床，不要声称他已经醒了。",
     "start": (
         "现在 {hhmm}，{label}的点到了。他之前说「{raw}」。"
         "按这件事**刚**开始来接：别说结束、别问进行到哪一步，可以说开始了、让他安心去忙。"

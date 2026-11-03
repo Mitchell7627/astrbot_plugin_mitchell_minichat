@@ -753,6 +753,15 @@ class PanelService:
         action = str(payload.get("action") or "")
         umo = str(payload.get("umo") or "").strip()
         sessions = self.sessions()
+        if action == 'undo_decision' and not umo:
+            runner = getattr(self.plugin, 'runner', None)
+            record = runner.decisions.get(payload.get('id')) if runner else None
+            umo = str((record or {}).get('umo') or '')
+        if action in ('clear_event', 'clear_away', 'clear_sleep', 'clear_appointment',
+                      'clear_together', 'mark_together', 'mark_away', 'undo_decision'):
+            self._validate_umo(umo)
+            self.store.set(umo, 'turn_seq', _as_int(self.store.get(umo, 'turn_seq'), 0) + 1)
+
 
         if action == "add":
             umo = self._validate_umo(umo)
