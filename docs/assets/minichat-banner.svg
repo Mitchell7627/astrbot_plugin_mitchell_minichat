@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-labelledby="title desc">
+  <title id="title">Mini：不用等你开口</title>
+  <desc id="desc">深蓝色夜空、猫耳聊天图标和两条聊天气泡，表达在日常生活中主动陪伴。</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#10162b"/><stop offset="1" stop-color="#1b1836"/></linearGradient>
+    <linearGradient id="accent" x2="1" y2="1"><stop stop-color="#b7a0ff"/><stop offset="1" stop-color="#71d8ca"/></linearGradient>
+    <radialGradient id="glow"><stop stop-color="#8b7cf6" stop-opacity=".21"/><stop offset="1" stop-color="#8b7cf6" stop-opacity="0"/></radialGradient>
+  </defs>
+  <rect width="1200" height="320" rx="24" fill="url(#bg)"/>
+  <circle cx="980" cy="80" r="265" fill="url(#glow)"/>
+  <rect x="1" y="1" width="1198" height="318" rx="23" fill="none" stroke="#ffffff" stroke-opacity=".08"/>
+  <g fill="#c3b8ef" opacity=".6"><circle cx="663" cy="51" r="2"/><circle cx="1108" cy="238" r="2"/><circle cx="573" cy="264" r="2"/><circle cx="1145" cy="64" r="2"/></g>
+  <path d="M647 243h10m-5-5v10M1080 40h10m-5-5v10" stroke="#71d8ca" stroke-width="2" opacity=".7"/>
+  <g transform="translate(52 40)" fill="none" stroke="url(#accent)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 25V3l17 12a35 35 0 0 1 27 0L65 3v23c11 21-1 40-30 40H10L0 75l4-21C-3 43-2 33 4 25Z"/>
+    <path d="M20 35v4m28-4v4m-20 9 6 4 6-4"/>
+  </g>
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei','Noto Sans CJK SC',sans-serif">
+    <text x="140" y="65" fill="#bdaaf8" font-size="15" letter-spacing="3">MINI · PROACTIVE COMPANION</text>
+    <text x="140" y="101" fill="#b8bdd0" font-size="16">主动一点，陪你过好每个日常</text>
+    <text x="52" y="177" fill="#f6f4ff" font-size="40" font-weight="700">不用等你开口</text>
+    <text x="52" y="217" fill="#b8bdd0" font-size="19">知道你在忙，也记得什么时候找你。</text>
+    <rect x="52" y="254" width="89" height="27" rx="13" fill="#292541"/>
+    <text x="96" y="272" fill="#d6c9ff" font-size="12" text-anchor="middle">事件感知</text>
+    <rect x="153" y="254" width="89" height="27" rx="13" fill="#173937"/>
+    <text x="197" y="272" fill="#96e5d4" font-size="12" text-anchor="middle">约定提醒</text>
+    <rect x="254" y="254" width="103" height="27" rx="13" fill="#302438"/>
+    <text x="305" y="272" fill="#edbdd7" font-size="12" text-anchor="middle">睡眠免打扰</text>
+    <rect x="700" y="55" width="420" height="219" rx="19" fill="#111525" stroke="#ffffff" stroke-opacity=".1"/>
+    <circle cx="724" cy="78" r="4" fill="#f1b3ce"/><circle cx="740" cy="78" r="4" fill="#b7a0ff"/><circle cx="756" cy="78" r="4" fill="#71d8ca"/>
+    <text x="1097" y="83" fill="#777f98" font-size="12" text-anchor="end">a little everyday chat</text>
+    <rect x="921" y="107" width="175" height="44" rx="13" fill="#332c50"/>
+    <text x="1008" y="135" fill="#ebe5ff" font-size="17" text-anchor="middle">我去洗澡啦</text>
+    <circle cx="739" cy="185" r="15" fill="#25483f"/>
+    <path d="m731 183 1-8 6 5 6-5 2 8m-14 5q7 6 13 0" fill="none" stroke="#96e5d4" stroke-width="1.8" stroke-linecap="round"/>
+    <rect x="766" y="163" width="261" height="44" rx="13" fill="#203f3d"/>
+    <text x="896" y="191" fill="#b0f0df" font-size="17" text-anchor="middle">慢慢洗，别着凉</text>
+    <circle cx="780" cy="240" r="3" fill="#96e5d4"/>
+    <text x="793" y="244" fill="#8995ae" font-size="12">EVENT AWARE · CONTEXT MATTERS</text>
+  </g>
+</svg>

@@ -1,0 +1,53 @@
+name: 报告错误 / 识别问题
+description: 反馈功能异常、识别冲突、约定未生效或面板问题。
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢帮助改进 Mini！提交前请搜索已有 Issues。
+        请删除 API Key、密码、QQ 号、会话 ID 和私人聊天内容，不必提供完整配置或整份日志。
+  - type: input
+    id: versions
+    attributes:
+      label: 插件与 AstrBot 版本
+      placeholder: "例如：Mini v0.2.21 / AstrBot 4.29.x；若为修改版请注明"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 平台、部署方式与宿主时区
+      placeholder: "例如：aiocqhttp QQ 私聊 / Linux Docker / UTC+8"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤和脱敏原句
+      description: 按顺序写清消息及间隔；时间问题请给出消息发送时间和目标时间。
+      placeholder: |
+        1. 当前时间、已有活动 / 约定 / 睡眠状态……
+        2. 发送「……」
+        3. 间隔多久，再发送「……」
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+      description: 你期望插件怎么处理？
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 面板判定、状态变化和消息发送有什么异常？
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 相关判定 / 日志 / 截图（可选，先脱敏）
+      description: 只贴复现时段的相关内容；可附识别开关、额度、提醒配置和模型类型，不要提供密钥或私人提示词。

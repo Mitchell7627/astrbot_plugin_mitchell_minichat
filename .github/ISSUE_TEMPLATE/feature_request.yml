@@ -1,0 +1,27 @@
+name: 功能建议
+description: 提出新的使用场景、体验改进或 token 优化建议。
+title: "[建议] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先搜索已有建议，说明实际场景即可。示例请脱敏，不要包含密钥、QQ 号和私人聊天。
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 使用场景与目前的不便
+      placeholder: "当我……时，现在插件……"
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 希望怎样改进
+      description: 可以附一两句示例，以及你希望它产生的行为。
+    validations:
+      required: true
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: 可能的影响或补充（可选）
+      description: 例如对现有识别、提醒频率、配置复杂度或 token 消耗的影响。
