@@ -124,6 +124,8 @@ def _degree_point(text: str, match: re.Match) -> bool:
         return True
     if any(head.endswith(word) for words, _ in _PERIOD_WORDS for word in words):
         return False
+    if tail.startswith(("时间", "小事", "要求", "东西", "事情", "机会", "心意", "钱")):
+        return True
     return head.endswith((
         "快", "慢", "轻", "重", "早", "晚", "多", "少", "大", "小",
         "好", "坏", "高", "低", "远", "近", "深", "浅", "长", "短",
@@ -133,11 +135,10 @@ def _degree_point(text: str, match: re.Match) -> bool:
 
 def find_clock(text: str):
     """返回 {"h","m","idx","length","period"} 或 None。冒号写法优先。"""
-    match = _COLON_RE.search(text)
-    if match:
+    for match in _COLON_RE.finditer(text):
         hour, minute = int(match.group(1)), int(match.group(2))
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            return None
+            continue
         return {
             "h": hour, "m": minute, "idx": match.start(),
             "length": match.end() - match.start(),
@@ -249,6 +250,26 @@ def _day_seconds(ts: float, now: datetime) -> int:
 
 
 def parse(text: str, now: datetime, cfg: dict, force: bool = False):
+    """逐个尝试钟点；拒绝一个候选不能吞掉其他分句的有效约定。"""
+    work, clocks = text, []
+    while clock := find_clock(work):
+        clocks.append(clock)
+        start, length = clock["idx"], clock["length"]
+        work = work[:start] + " " * length + work[start + length:]
+    if not clocks:
+        return _parse_one(text, now, cfg, force)
+    dropped, gray = [], None
+    for clock in sorted(clocks, key=lambda c: c["idx"]):
+        result = _parse_one(text, now, cfg, force, clock)
+        dropped.extend(result["dropped"])
+        if result["hit"]:
+            result["dropped"] = dropped
+            return result
+        gray = gray or result["gray"]
+    return {"hit": None, "gray": gray, "dropped": dropped}
+
+
+def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candidate=None):
     """解析一句话。
 
     返回 {"hit": {...}|None, "gray": {...}|None, "dropped": [{rule, reason}]}。
@@ -271,7 +292,7 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
     keywords = cfg.get("events") or DEFAULT_EVENTS
     max_hours = int(cfg.get("max_hours") or 8)
 
-    clock = find_clock(text)
+    clock = candidate or find_clock(text)
     if clock is None:
         if _WHEN_ASK_RE.search(text):
             return drop("Q1", "问的是几点，不是约定")
@@ -302,7 +323,8 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
         return drop("P1", "说的是别人的事")
     if rules.negated_by_clause(text, idx, NEGATIONS, window=4):
         return drop("N1", "否定了，这件事不会发生")
-    if rules.is_future_clause(text, idx) and not re.search(r"今天|今早|今晚|今儿", text):
+    clause = text[rules.clause_start(text, idx):rules.clause_end(text, idx + kw_len)]
+    if rules.is_future_clause(text, idx) and not re.search(r"今天|今早|今晚|今儿", clause):
         return drop("F1", "说的是别的日子")
     # 「如果我十二点下课」「示例：'十二点下课'」「我十二点下课的安排取消了」都不是有效约定
     if rules.is_reported_clause(text, idx):
@@ -311,7 +333,7 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
         return drop("C1", "是假设，不是真实安排")
     if rules.is_cancelled_clause(text, idx, kw_len=kw_len, window=None):
         return drop("X1", "这个安排取消了")
-    if re.search(r"(下课|放学|下班|收工|散会|考完|结束|到家|到了)[了啦咯喽]", text):
+    if re.search(r"(下课|放学|下班|收工|散会|考完|结束|到家|到了)[了啦咯喽]", clause):
         return drop("D1", "已经发生了")
 
     event = _find_event(text, clock, keywords)

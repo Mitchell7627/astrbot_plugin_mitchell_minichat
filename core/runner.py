@@ -1384,7 +1384,7 @@ class Runner:
     _APPOINTMENT_ALIASES = {
         "开会": ("开会", "会议"), "下课": ("下课", "上课", "课程"),
         "上课": ("上课", "课程"), "下班": ("下班", "上班"),
-        "吃饭": ("吃饭", "饭局", "聚餐"), "约会": ("约会", "约定"),
+        "吃饭": ("吃饭", "饭局", "聚餐"), "约会": ("约会",),
     }
 
     def _cancel_appointments_from_message(self, umo: str, text: str) -> tuple[bool, str]:
@@ -1398,7 +1398,7 @@ class Runner:
         for clause in re.finditer(r"[^，,。！？!?；;\n]+", text):
             value = clause.group()
             marker = re.search(r"取消|不(?:去|开|上|办|参加|举行|回|到)", value)
-            if marker is None or re.search(r"(?:不要|别|不|没|没有|不必)取消", value):
+            if marker is None or re.search(r"(?:不要|别|不|没|没有|不必|不是|并非|不是要)取消", value):
                 continue
             anchor = clause.start() + marker.start()
             previous = rules.prev_clause(text, clause.start(), 48)
@@ -1415,18 +1415,27 @@ class Runner:
                 continue
             clock = find_appointment_clock(value)
             described = any(word in value for word in all_words)
+            # 明说另一件未知事项不能退化成「只按钟点取消」。
+            named = value[clock["idx"] + clock["length"]:] if clock else ""
+            named = re.sub(r"(?:取消了?|不去了)[呀啊啦 ]*$", "", named).strip().lstrip("的").strip()
+            unknown_item = bool(named and named not in ("约定", "安排", "提醒")
+                                and not any(w in named for w in all_words))
             cancel_all = bool(re.search(r"(?:全部|所有)(?:的)?(?:约定|安排|提醒)", value))
             cancelled_ids = set()
             for position, item in enumerate(items):
+                if unknown_item:
+                    continue
                 if item.get("stage") == "done":
                     continue
                 if clock:
                     moment = datetime.fromtimestamp(_as_float_safe(item.get("original_at") or item.get("at")))
-                    hour = clock["h"]
-                    if clock.get("period") == "pm" and hour < 12:
-                        hour += 12
-                    elif clock.get("period") == "am" and hour == 12:
-                        hour = 0
+                    # 与登记共用时段与日期归一；以登记日零点为锚点。
+                    anchor_day = moment.replace(hour=0, minute=0, second=0, microsecond=0)
+                    if clock.get("period") == "pm" and clock["h"] == 12:
+                        anchor_day -= timedelta(days=1)
+                    resolved = resolve_appointment_at(clock["h"], clock["m"], clock.get("period"), anchor_day, 48)
+                    target = datetime.fromtimestamp(resolved) if resolved is not None else None
+                    hour = target.hour if target else clock["h"]
                     if moment.minute != clock["m"] or moment.hour != hour:
                         # 裸「三点」与下午三点仍可匹配，但明确时段不可混淆。
                         if clock.get("period") or moment.minute != clock["m"] or moment.hour % 12 != hour % 12:
@@ -1455,6 +1464,19 @@ class Runner:
             return True, self._mask_span(text, clause.start(), clause.end())
         return False, text
 
+    def _register_appointment(self, umo: str, hit: dict) -> bool:
+        """所有登记路径在最终同步提交时共享每日额度与计数。"""
+        counter = self.store.get(umo, "appointment_counter") or {}
+        today = datetime.now().strftime("%Y-%m-%d")
+        used = _as_int(counter.get("n"), 0) if counter.get("date") == today else 0
+        limit = self._appointment_cfg()["max_per_day"]
+        if limit and used >= limit:
+            return False
+        if not self._set_appointment(umo, hit):
+            return False
+        self.store.set(umo, "appointment_counter", {"date": today, "n": used + 1})
+        return True
+
     def _handle_appointment_words(self, umo: str, text: str):
         """识别约定。返回 `(是否处理, 剩余文本|None)`。
 
@@ -1464,10 +1486,6 @@ class Runner:
         cfg = self._appointment_cfg()
         if not cfg["enable"] or not text or not text.strip():
             return False, None
-
-        counter = self.store.get(umo, "appointment_counter") or {}
-        today = datetime.now().strftime("%Y-%m-%d")
-        used = _as_int(counter.get("n"), 0) if counter.get("date") == today else 0
 
         result = parse_appointment(text, datetime.now(), cfg)
         for item in result["dropped"]:
@@ -1518,11 +1536,8 @@ class Runner:
         end = self._action_tail_start(text, max(idx + length, event_idx + event_len), end)
         rest = self._mask_span(text, start, end)
 
-        enqueued = False
-        if not (cfg["max_per_day"] and used >= cfg["max_per_day"]):
-            enqueued = bool(self._set_appointment(umo, hit))
+        enqueued = self._register_appointment(umo, hit)
         if enqueued:
-            self.store.set(umo, "appointment_counter", {"date": today, "n": used + 1})
             self.reschedule(umo)
         self._dec_buffer.append({
             "kind": "appointment",
@@ -2194,6 +2209,9 @@ class Runner:
     def _offer_llm_candidate(self, umo: str, remaining: str) -> None:
         """拒绝只保护所在分句；已消费部分不再送回模型。索引始终对齐原消息。"""
         original = self._message_text
+        # 只消解「不是没在做」的肯定结构，保持位置和其他否定防护。
+        polarity = re.sub(r"(?:并)?不是(?:没有|没)(?=在)",
+                          lambda m: " " * len(m.group()), original)
         clauses = []
         rejected = [
             d for d in self._dec_buffer
@@ -2212,13 +2230,13 @@ class Runner:
                 continue
             hint = re.search("|".join(map(re.escape, self.ACTIVE_HINTS)), remaining[start:end])
             anchor = min(end - 1, start + hint.end()) if hint else end - 1
-            if (not rules.is_self_action_clause(original, anchor)
+            if (not rules.is_self_action_clause(polarity, anchor)
                     or rules.is_second_person_clause(original, anchor)
                     or rules.is_third_person_subject(
                         original, anchor, _split_nicknames(self.engine_cfg.get("bot_nicknames"))
                     )
                     or rules.negated_by_clause(
-                        original, end, self.engine._negations, window=end - start
+                        polarity, end, self.engine._negations, window=end - start
                     )):
                 continue
             clauses.append(value)
@@ -2234,8 +2252,13 @@ class Runner:
         if not candidate or candidate["umo"] != umo:
             return None
         self._llm_candidate = None
-        if self._gray_candidate or not self._result_current(umo, candidate["turn_seq"]):
+        if not self._result_current(umo, candidate["turn_seq"]):
             return None
+        # 已筛选出的独立当前活动优先于不确定的灰区提及。
+        # 灰区所在分句本身已在 _offer_llm_candidate 中排除，不重复提交。
+        if self._gray_candidate:
+            candidate["gray_fallback"] = self._gray_candidate
+        self._gray_candidate = None
         return candidate
 
     def undo_decision(self, did) -> dict:
@@ -2512,7 +2535,7 @@ class Runner:
             logger.info(f"{TAG} 约定灰度答 YES 但落不出时刻：「{text[:16]}」")
             return
         before = self._snapshot(umo)
-        if not self._set_appointment(umo, hit):
+        if not self._register_appointment(umo, hit):
             return
         after = self._snapshot(umo)
         touched = [
@@ -3030,7 +3053,8 @@ class Runner:
             "model": str(getattr(provider, "get_model", lambda: "")() or ""),
         }
 
-    async def classify_with_llm(self, umo: str, text: str, seq: int | None = None) -> None:
+    async def classify_with_llm(self, umo: str, text: str, seq: int | None = None,
+                                gray_fallback: dict | None = None) -> None:
         """关键词没认出时，让模型判断属于哪一类。
 
         seq 由调用方在**收到消息时**捕获：任务排队期间可能已经来了新消息，
@@ -3076,6 +3100,8 @@ class Runner:
 
         rule = self.engine.get_rule(name) if name != "none" else None
         if rule is None:
+            if gray_fallback:
+                await self.review_gray(umo, gray_fallback)
             return
         self._set_event(umo, rule, "语义:" + name, source_text=text)
         self.store.save()

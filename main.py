@@ -22,7 +22,7 @@ from .core.store import Store
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.2.13"
+VERSION = "v0.2.14"
 
 
 class ProactiveMiniPlugin(star.Star):
@@ -224,7 +224,11 @@ class ProactiveMiniPlugin(star.Star):
         if pending:
             try:
                 task = asyncio.create_task(
-                    self.runner.classify_with_llm(umo, pending["text"], pending["turn_seq"])
+                    self.runner.classify_with_llm(
+                        umo, pending["text"], pending["turn_seq"],
+                        **({"gray_fallback": pending["gray_fallback"]}
+                           if pending.get("gray_fallback") else {}),
+                    )
                 )
                 self._bg_tasks.add(task)
                 task.add_done_callback(self._bg_tasks.discard)
