@@ -167,9 +167,22 @@ _CALENDAR_RE = re.compile(
     rf"(?<![0-9{_CN_CHARS}])(?:(?P<year>{_DATE_NUMBER})年)?"
     rf"(?P<month>{_DATE_NUMBER})月(?P<day>{_DATE_NUMBER})(?:日|号)"
 )
+_NUMERIC_DATE_RE = re.compile(
+    r"(?<![\d./-])(?:(?P<year>\d{4})[-/.])?"
+    r"(?P<month>\d{1,2})[-/.](?P<day>\d{1,2})(?![\d./-])"
+)
+_MONTH_DAY_RE = re.compile(
+    rf"(?<![0-9{_CN_CHARS}])(?:(?:本|这个|这)月)?(?P<day>{_DATE_NUMBER})(?:号|日)"
+)
+_RELATIVE_DAY_RE = re.compile(
+    rf"(?:(?:再过|过)\s*(?P<after>{_DATE_NUMBER}|几)\s*(?:天|日)(?:以后|之后|后)?"
+    rf"|(?P<count>{_DATE_NUMBER}|几)\s*(?:天|日)(?:以后|之后|后))"
+)
+_DATE_PATTERNS = (_CALENDAR_RE, _NUMERIC_DATE_RE, _MONTH_DAY_RE, _RELATIVE_DAY_RE)
+_CHANGE_RE = re.compile(r"改到|改为|改成|挪到|推迟到")
 # 必须带星期单位，避免把普通「一」当作日期；允许「下周星期一」。
 _WEEKDAY_RE = re.compile(
-    r"(?:(?P<week>上|下|这|本)(?:一?个|一)?)?"
+    r"(?:(?P<week>上+|下+|这|本)(?:一?个|一)?)?"
     r"(?:周|星期|礼拜)(?:(?:周|星期|礼拜))?(?P<weekday>[一二三四五六日天1-7末])"
 )
 
@@ -180,7 +193,7 @@ def _pure_period(text: str):
         for word in words:
             if text.endswith(word):
                 date = text[:-len(word)].strip()
-                if not date or any(p.fullmatch(date) for p in (_DAY_RE, _CALENDAR_RE, _WEEKDAY_RE)):
+                if not date or any(p.fullmatch(date) for p in (_DAY_RE, *_DATE_PATTERNS, _WEEKDAY_RE)):
                     return period
     return None
 
@@ -220,6 +233,20 @@ def _day_markers(text: str, now: datetime) -> list[_DayMarker]:
             today = False
             target = None
         found.append(_DayMarker(match.start(), match.end(), today, target))
+    for pattern in (_NUMERIC_DATE_RE, _MONTH_DAY_RE, _RELATIVE_DAY_RE):
+        for match in pattern.finditer(text):
+            try:
+                parts = match.groupdict()
+                if pattern is _RELATIVE_DAY_RE:
+                    days = _date_number(parts.get('after') or parts['count'])
+                    target = now.date() + timedelta(days=days)
+                else:
+                    target = CalendarDate(int(parts.get('year') or now.year),
+                                          int(parts.get('month') or now.month),
+                                          _date_number(parts['day']))
+            except (ValueError, KeyError, OverflowError):
+                target = None
+            found.append(_DayMarker(match.start(), match.end(), target == now.date(), target))
     weekdays = {c: i for i, c in enumerate("一二三四五六日")}
     weekdays.update({str(i + 1): i for i in range(7)})
     weekdays['天'] = 6
@@ -228,10 +255,10 @@ def _day_markers(text: str, now: datetime) -> list[_DayMarker]:
         target = None
         if weekday is not None:
             offset = weekday - now.weekday()
-            if match['week'] == '下':
-                offset += 7
-            elif match['week'] == '上':
-                offset -= 7
+            if match['week'] and match['week'].startswith('下'):
+                offset += 7 * len(match['week'])
+            elif match['week'] and match['week'].startswith('上'):
+                offset -= 7 * len(match['week'])
             elif match['week'] is None:
                 offset %= 7  # 裸星期取最近一次，含今天；本/这周不滚动。
             target = now.date() + timedelta(days=offset)
@@ -244,17 +271,24 @@ def _day_markers(text: str, now: datetime) -> list[_DayMarker]:
 
 
 def _previous_day_markers(text: str, start: int, now: datetime) -> list[_DayMarker]:
-    previous = rules.prev_clause(text, start, 32).strip()
-    markers = _day_markers(previous, now)
-    if len(markers) == 1 and (
-        markers[0].start == 0 and markers[0].end == len(previous) or _pure_period(previous) is not None
-    ):
-        return markers
+    # 只穿过连续的纯时间短句，不跨过另一个活动或完整句号。
+    for _ in range(4):
+        if start <= 0 or text[start - 1] not in '，,、 ':
+            break
+        previous = rules.prev_clause(text, start, 32).strip()
+        markers = _day_markers(previous, now)
+        if len(markers) == 1 and (markers[0].start == 0 and markers[0].end == len(previous)
+                                  or _pure_period(previous) is not None):
+            return markers
+        if _pure_period(previous) is None:
+            break
+        start = rules.clause_start(text, start - 1)
     return []
 
 
 def _selected_day(text: str, idx: int, length: int = 0, *, now: datetime) -> _DayMarker | None:
     """日期绑定钟点所在分句，优先取钟点前最近的日期；不把其他日子改记今天。"""
+    text = _date_safe_text(text)
     start = rules.clause_start(text, idx, None)
     end = rules.clause_end(text, idx + length)
     clause = text[start:end]
@@ -303,11 +337,17 @@ def _dated_at(clock: dict, marker: _DayMarker, now: datetime, days: int, max_hou
     return at
 
 
+def _date_safe_text(text: str) -> str:
+    # 日期里的小数点不是分句边界；保持字符串长度及索引不变。
+    return _NUMERIC_DATE_RE.sub(lambda m: m.group().replace('.', '/'), text)
+
+
 def find_clock(text: str):
     """返回 {"h","m","idx","length","period"} 或 None。冒号写法优先。"""
     # 「周一一点」不能把星期中的「一」吞进小时；遮罩保持原索引。
+    text = _date_safe_text(text)
     scan = text
-    for pattern in (_CALENDAR_RE, _WEEKDAY_RE):
+    for pattern in (*_DATE_PATTERNS, _WEEKDAY_RE):
         for date in pattern.finditer(text):
             scan = scan[:date.start()] + " " * (date.end() - date.start()) + scan[date.end():]
     for match in _COLON_RE.finditer(scan):
@@ -363,6 +403,8 @@ def resolve_at(hour: int, minute: int, period: str | None,
         return None
 
     day_offset = 0
+    if period in ('am', 'dawn') and hour > 12:
+        return None
     if period == "dawn" and hour == 12:
         hour = 0
     elif period == "noon" and hour <= 2:
@@ -408,6 +450,18 @@ def _find_event(text: str, clock: dict, keywords: dict):
     left = rules.clause_start(text, start, None)
     right = rules.clause_end(text, end)
 
+    # 「明天，下午三点，我要开会」只允许纯时间短句连接紧邻活动。
+    temporal = text[left:right]
+    for marker in sorted(_day_markers(temporal, datetime.now()), reverse=True):
+        temporal = temporal[:marker.start] + ' ' * (marker.end - marker.start) + temporal[marker.end:]
+    local_start, local_end = start - left, end - left
+    temporal = temporal[:local_start] + ' ' * (local_end - local_start) + temporal[local_end:]
+    for words, _ in _PERIOD_WORDS:
+        for word in words:
+            temporal = temporal.replace(word, ' ')
+    if not temporal.strip() and right < len(text) and text[right] in '，,、':
+        right = rules.clause_end(text, right + 1)
+
     up = _UP_TO_RE.search(text, left, right)
     if up and abs(up.start() - start) <= _MAX_GAP:
         return ("结束", "end", up.start(), len(up.group(0)))
@@ -435,6 +489,7 @@ def _day_seconds(ts: float, now: datetime) -> int:
 
 def parse(text: str, now: datetime, cfg: dict, force: bool = False):
     """逐个尝试钟点；拒绝一个候选不能吞掉其他分句的有效约定。"""
+    text = _date_safe_text(text)
     work, clocks = text, []
     while clock := find_clock(work):
         clocks.append(clock)
@@ -444,6 +499,12 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
         return _parse_one(text, now, cfg, force)
     dropped, gray = [], None
     for clock in sorted(clocks, key=lambda c: c["idx"]):
+        left = rules.clause_start(text, clock['idx'])
+        right = rules.clause_end(text, clock['idx'] + clock['length'])
+        changes = list(_CHANGE_RE.finditer(text, left, right))
+        if changes and any(c['idx'] > changes[-1].end() and c['idx'] < right for c in clocks):
+            if clock['idx'] < changes[-1].start():
+                continue
         result = _parse_one(text, now, cfg, force, clock)
         dropped.extend(result["dropped"])
         if result["hit"]:
@@ -530,6 +591,31 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
         return drop("E1", "有时间但没有对应的事")
 
     label, kind, _event_idx, _event_len = event
+    if rules.clause_start(text, _event_idx) != rules.clause_start(text, idx):
+        action_start = rules.clause_start(text, _event_idx)
+        action_clause = text[action_start:rules.clause_end(text, _event_idx + _event_len)]
+        action_days = _day_markers(action_clause, now)
+        target_day = day.target if day else now.date()
+        if any(m.target != target_day for m in action_days):
+            return drop('F1', '相邻活动日期不同，不借用钟点')
+        if find_clock(action_clause) or re.search(r'现在|正在|此刻|刚才|刚刚|已经', action_clause):
+            return drop('E1', '相邻活动另有时间，不借用钟点')
+        if not action_days and rules.is_future_clause(action_clause, _event_idx - action_start):
+            return drop('F1', '相邻活动另有未来安排')
+        if re.search(r'(下课|放学|下班|收工|散会|考完|结束|到家|到了)[了啦咯喽]', action_clause):
+            return drop('D1', '相邻活动已经发生')
+    # 跨分句时必须检查活动所在片段，不能借纯时间短句绕过语义保护。
+    for anchor, width in ((idx, kw_len), (_event_idx, _event_len)):
+        if rules.is_question_clause(text, anchor, kw_len=width):
+            return drop('Q1', '疑问句，不登记')
+        if rules.is_third_person_clause(text, anchor) or rules.is_second_person_clause(text, anchor):
+            return drop('P1', '说的是别人的事')
+        if rules.is_reported_clause(text, anchor) or rules.is_dream_clause(text, anchor):
+            return drop('R1', '引用或梦境，不是本人约定')
+        if rules.is_conditional_clause(text, anchor):
+            return drop('C1', '是假设，不是真实安排')
+        if rules.is_cancelled_clause(text, anchor, kw_len=width, window=None):
+            return drop('X1', '安排已取消')
     if rules.negated_by_clause(text, _event_idx, NEGATIONS, window=4):
         return drop("N1", "否定了，这件事不会发生")
     at = (_dated_at(clock, day, now, future_days, max_hours) if day is not None
@@ -562,6 +648,12 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
         "event_idx": _event_idx,
         "event_len": _event_len,
     }
+    change = list(_CHANGE_RE.finditer(clause))
+    if change:
+        out['hit']['reschedule'] = True
+        original = _parse_one(clause[:change[-1].start()], now, cfg, True)
+        if original.get('hit'):
+            out['hit']['replace_at'] = original['hit']['at']
     return out
 
 

@@ -155,6 +155,8 @@ class Runner:
         self._appt_candidate: dict | None = None
         # 约定灰度独立配额，不吃事件灰度的额度
         self._appt_gray_calls: list[float] = []
+        # 只允许完整确认短句延续同一次语义意图，所有改口仍使旧结果失效。
+        self._semantic_turns: dict[str, dict] = {}
         # 灰区复核（默认开：只对判不准的句子问一次，有小时/日上限兜着，
         # 配置里关掉就退回纯关键词，一句都不问）
         self._gray_candidate: dict | None = None
@@ -181,6 +183,28 @@ class Runner:
             and umo in self.sessions()
             and (seq is None or _as_int(self.store.get(umo, "turn_seq"), 0) == seq)
         )
+
+    @staticmethod
+    def is_confirmation(text: str) -> bool:
+        return text.strip().strip('。！!～~ ') in (
+            '我知道了', '知道了', '知道啦', '收到啦', '收到', '明白了',
+            '好的', '好哒', '嗯嗯', '嗯', '你好',
+        )
+
+    def _semantic_current(self, umo: str, seq: int) -> bool:
+        if not self._result_current(umo):
+            return False
+        current = _as_int(self.store.get(umo, 'turn_seq'), 0)
+        if seq == current:
+            return True
+        state = self._semantic_turns.get(umo) or {}
+        return (state.get('latest') == current
+                and state.get('intent', current) <= seq < current)
+
+    def neutral_turn(self, umo: str) -> bool:
+        state = self._semantic_turns.get(umo) or {}
+        return (state.get('latest') == _as_int(self.store.get(umo, 'turn_seq'), 0)
+                and state.get('neutral') is True)
 
     def invalidate_session(self, umo: str) -> None:
         # 删除后立刻重加也不能复活删除前发起的识别请求。
@@ -998,19 +1022,20 @@ class Runner:
                 logger.info(f"{TAG} 约定到点（{label}），仍在外面，改按「{base}了」计时")
         return matched
 
-    def _set_appointment(self, umo: str, hit: dict) -> bool:
+    def _set_appointment(self, umo: str, hit: dict, replace_id: str | None = None) -> bool:
         now = time.time()
         at = _as_float_safe(hit.get("at"))
         if at <= 0:
             return False
-        items = [x for x in self._appointments(umo) if str(x.get("stage")) != "done"]
+        items = [x for x in self._appointments(umo) if str(x.get("stage")) != "done"
+                 and x.get('id') != replace_id]
         for item in items:
             if abs(_as_float_safe(item.get("at")) - at) < 60:
                 # 同一时刻只留一条：不然一分钟里会开口两次
                 logger.info(f"{TAG} 这个点已经有约定了，跳过：{item.get('time_text')} {item.get('label')}")
                 return False
         record = {
-            "id": uuid.uuid4().hex[:12],
+            "id": replace_id or uuid.uuid4().hex[:12],
             "at": at,
             "label": str(hit.get("label") or ""),
             "kind": str(hit.get("kind") or "end"),
@@ -1509,7 +1534,7 @@ class Runner:
                 aliases = self._APPOINTMENT_ALIASES.get(label, (label,))
                 if described and not any(word and word in value for word in aliases):
                     continue
-                if not clock and not described and not cancel_all and len(pending) != 1:
+                if not clock and not described and not cancel_all and day is None and len(pending) != 1:
                     continue
                 cancelled_ids.add(position)
             if len(cancelled_ids) > 1 and not cancel_all:
@@ -1533,7 +1558,19 @@ class Runner:
         limit = self._appointment_cfg()["max_per_day"]
         if limit and used >= limit:
             return False
-        if not self._set_appointment(umo, hit):
+        replacement = None
+        if hit.get('reschedule'):
+            choices = [x for x in self._appointments(umo)
+                       if x.get('stage') != 'done' and x.get('label') == hit.get('label')
+                       and (not hit.get('replace_at') or
+                            abs(_as_float_safe(x.get('original_at') or x.get('at')) - hit['replace_at']) < 60)]
+            if len(choices) > 1:
+                return False
+            if choices:
+                if abs(_as_float_safe(choices[0].get('at')) - hit['at']) < 60:
+                    return False
+                replacement = choices[0].get('id')
+        if not self._set_appointment(umo, hit, replace_id=replacement):
             return False
         self.store.set(umo, "appointment_counter", {"date": today, "n": used + 1})
         return True
@@ -1607,6 +1644,7 @@ class Runner:
             "verdict": "accept",
             "rule": "A1",
             "reason": f"约定 {hit['label']}" if enqueued else "未来安排（未入队）",
+            "applied": enqueued,
         })
         return True, (rest if rest.strip() else None)
 
@@ -2286,6 +2324,8 @@ class Runner:
             value = match.group().strip()
             if not value or not self._looks_active(value):
                 continue
+            if self.is_confirmation(value):
+                continue
             start = match.start() + len(match.group()) - len(match.group().lstrip())
             end = match.end()
             if any(start <= int(d["idx"]) < end for d in rejected):
@@ -2451,7 +2491,7 @@ class Runner:
         kw = str(cand.get("kw") or "")
         name = str(cand.get("name") or "")
         seq = _as_int(cand.get("turn_seq"), _as_int(self.store.get(umo, "turn_seq"), 0))
-        if not self._result_current(umo, seq):
+        if not self._semantic_current(umo, seq):
             return
         rule = self.engine.get_rule(name) if name else None
         if rule is None:
@@ -2469,7 +2509,7 @@ class Runner:
         verdict = await self._verify_use(
             umo, text, kw, dialogue=dialogue, provider=provider
         )
-        if not self._result_current(umo, seq) or self.is_sleeping(umo):
+        if not self._semantic_current(umo, seq) or self.is_sleeping(umo):
             return
         if verdict != "yes":
             logger.info(
@@ -2558,7 +2598,7 @@ class Runner:
         """问一次 YES/NO：说是才落约定，其余一律不记。"""
         text = str(cand.get("text") or "")
         seq = _as_int(cand.get("turn_seq"), _as_int(self.store.get(umo, "turn_seq"), 0))
-        if not self._result_current(umo, seq):
+        if not self._semantic_current(umo, seq):
             return
         if not text or not self._appt_gray_check():
             return
@@ -2586,7 +2626,7 @@ class Runner:
         if not raw.startswith("YES"):
             logger.info(f"{TAG} 约定灰度未采信（{raw[:4] or 'empty'}）：「{text[:16]}」")
             return
-        if not self._result_current(umo, seq):
+        if not self._semantic_current(umo, seq):
             return
         if cand.get("snapshot") != self.store.get(umo, APPOINTMENT_KEY):
             logger.info(f"{TAG} 约定灰度放弃：等模型期间约定已经变了")
@@ -2651,6 +2691,17 @@ class Runner:
             handled = self._update_inner(umo, text)
         finally:
             handled = self._flush_decisions(umo, text, before, handled)
+            seq = _as_int(self.store.get(umo, 'turn_seq'), 0)
+            after = self._snapshot(umo)
+            neutral = (self.is_confirmation(text) and not self._gray_candidate
+                       and not self._appt_candidate and not self._llm_candidate
+                       and all(before.get(k) == after.get(k) for k in
+                               ('active_event', 'away', 'together', 'sleep_state', 'appointments')))
+            previous = self._semantic_turns.get(umo) or {}
+            self._semantic_turns[umo] = {
+                'latest': seq, 'intent': previous.get('intent', seq - 1) if neutral else seq,
+                'neutral': neutral,
+            }
             for candidate in (self._gray_candidate, self._appt_candidate):
                 if isinstance(candidate, dict):
                     candidate["turn_seq"] = _as_int(self.store.get(umo, "turn_seq"), 0)
@@ -3126,11 +3177,11 @@ class Runner:
         # 记下这句属于第几条消息：模型慢的时候，后面的消息可能已经更新了状态，
         # 旧结果回来不能把它盖掉（「准备冲个凉」的结果晚于「我在吃饭」，就是这种）。
         start_seq = int(seq) if seq is not None else _as_int(self.store.get(umo, "turn_seq"), 0)
-        if not self._result_current(umo, start_seq):
+        if not self._semantic_current(umo, start_seq):
             return
         result = await self.classify_text(umo, text)
         now_seq = _as_int(self.store.get(umo, "turn_seq"), 0)
-        if now_seq != start_seq or not self._result_current(umo, start_seq):
+        if not self._semantic_current(umo, start_seq):
             logger.info(
                 f"{TAG} 语义识别结果已过期（第 {start_seq} 条，当前第 {now_seq} 条），丢弃：{text[:12]}"
             )
