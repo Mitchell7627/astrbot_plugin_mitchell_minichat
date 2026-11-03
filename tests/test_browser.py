@@ -62,7 +62,7 @@ async def test_task_page_diagnostics_and_delivery_states(plugin, umo, monkeypatc
                 # 取消记录也必须显示已应用，面板撤销恢复原约定。
                 r.update_from_message(umo, "我下午三点开会")
                 original = r._appointments(umo)
-                r.update_from_message(umo, "下午三点的那个安排取消了")
+                r.update_from_message(umo, "下午三点的那个安排取消掉")
                 assert not r._appointments(umo)
                 await page.reload()
                 await page.locator('[data-tab="tasks"]').click()

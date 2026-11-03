@@ -1397,9 +1397,12 @@ class Runner:
             return False
         if re.search(r"(?:想|考虑|打算|准备|计划|可能|也许|大概|差点|险些|尝试|试着|能否|是否)(?:要|去|先|再|着)?$", head):
             return False
-        if marker.group() == "取消" and re.match(
+        if marker.group().startswith("取消") and re.match(
             r"(?:了)?(?:但|却)?(?:失败|不了|不成|不掉|不成功|(?:未|没|没有)(?:能)?(?:成功|取消))", tail
         ):
+            return False
+        if marker.group() in ("不用了", "不要了", "算了") and not re.fullmatch(r"[呀啊吧啦了\s]*", tail):
+            # 「算了我还是要去」没有确认取消；口语取消只接受完整句尾。
             return False
         return True
 
@@ -1409,7 +1412,8 @@ class Runner:
         described = any(word in value for word in all_words)
         cancel_all = bool(re.search(r"全部|所有", value))
         # 保持位置，先去时间与动作，再区分事项和语法修饰。
-        spans = [(marker.start(), marker.end() if marker.group() == "取消" else marker.start() + 1)]
+        explicit = marker.group().startswith("取消") or marker.group() in ("不用了", "不要了", "算了")
+        spans = [(marker.start(), marker.end() if explicit else marker.start() + 1)]
         if clock:
             spans.append((clock["idx"], clock["idx"] + clock["length"]))
         remaining = value
@@ -1436,7 +1440,7 @@ class Runner:
         all_words.update(w for words in self._APPOINTMENT_ALIASES.values() for w in words)
         for clause in re.finditer(r"[^，,。！？!?；;\n]+", text):
             value = clause.group()
-            marker = re.search(r"取消|不(?:去|开|上|办|参加|举行|回|到)", value)
+            marker = re.search(r"取消(?:掉)?|不用了|不要了|算了|不(?:去|开|上|办|参加|举行|回|到)", value)
             if marker is None or not self._cancel_action_confirmed(value, marker):
                 continue
             anchor = clause.start() + marker.start()
@@ -1454,6 +1458,11 @@ class Runner:
                 continue
             clock = find_appointment_clock(value)
             described, cancel_all, unknown_item = self._cancel_target(value, marker, clock, all_words)
+            if marker.group() in ("不用了", "不要了", "算了") and not (
+                clock or described or cancel_all or re.search(r"这个|那个|这条|那条|这件事", value)
+            ):
+                # 单独「算了／不用了」不能凭唯一约定猜用户要取消什么。
+                continue
             cancelled_ids = set()
             for position, item in enumerate(items):
                 if unknown_item:
@@ -1464,7 +1473,7 @@ class Runner:
                     moment = datetime.fromtimestamp(_as_float_safe(item.get("original_at") or item.get("at")))
                     # 与登记共用时段与日期归一；以登记日零点为锚点。
                     anchor_day = moment.replace(hour=0, minute=0, second=0, microsecond=0)
-                    if clock.get("period") == "pm" and clock["h"] == 12:
+                    if clock.get("period") == "night" and (clock["h"] == 12 or clock["h"] <= 5):
                         anchor_day -= timedelta(days=1)
                     resolved = resolve_appointment_at(clock["h"], clock["m"], clock.get("period"), anchor_day, 48)
                     target = datetime.fromtimestamp(resolved) if resolved is not None else None

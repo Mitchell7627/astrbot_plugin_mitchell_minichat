@@ -62,7 +62,8 @@ _PERIOD_WORDS = (
     (("早上", "早晨", "上午", "今早"), "am"),
     (("中午", "正午"), "noon"),
     (("下午", "午后"), "pm"),
-    (("傍晚", "晚上", "夜里", "今晚", "晚间"), "pm"),
+    (("傍晚",), "pm"),
+    (("晚上", "夜里", "今晚", "晚间"), "night"),
 )
 
 # 「还有十分钟下课」这类剩余时长，只能交给模型
@@ -116,6 +117,9 @@ def _find_period(text: str, start: int):
 
 def _degree_point(text: str, match: re.Match) -> bool:
     """裸「一点」需要钟点结构佐证；数量/程度和不确定用法不生成钟点拒绝。"""
+    # 在可选分钟之前排除叠词：「一点一点」中的第二个「一」不是分钟。
+    if re.match(r"一\s*点\s*一\s*点", text[match.start():]):
+        return True
     if match.group(1) != "一" or match.group(2) or match.group(3):
         return False
     head = text[rules.clause_start(text, match.start()):match.start()].rstrip()
@@ -232,12 +236,19 @@ def resolve_at(hour: int, minute: int, period: str | None,
     day_offset = 0
     if period == "noon" and hour <= 2:
         hour += 12
-    elif period == "pm":
-        if hour == 12:
-            # 「晚上十二点」是次日 0 点，不是中午
-            hour = 0
+    elif period == "night":
+        if hour <= 5 or hour == 12:
+            # 夜里一点 / 晚上十二点属于这一晚跨过午夜后的时刻。
+            hour = 0 if hour == 12 else hour
             day_offset = 1
         elif hour <= 11:
+            hour += 12
+        elif hour < 18:
+            # 不把「晚上十三点」这种矛盾时段改记为下午。
+            return None
+    elif period == "pm":
+        # 午夜由 night 分支处理；下午十二点仍是当日中午。
+        if hour <= 11:
             hour += 12
 
     base = now.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=day_offset)
