@@ -173,3 +173,9 @@ def test_explicit_request_to_bot(plugin,umo,clock):
     clock.now=datetime(2026,11,3,16,37).timestamp()
     plugin.runner.update_from_message(umo,'你晚上六点叫醒我')
     assert plugin.runner._appointments(umo)[0]['kind']=='wake'
+
+@pytest.mark.parametrize('text',['晚上六点叫醒我妈','晚上六点叫醒他','晚上六点喊醒室友'])
+def test_wake_other_object_is_not_user(plugin,umo,clock,text):
+    clock.now=datetime(2026,11,3,16,37).timestamp()
+    plugin.runner.update_from_message(umo,text)
+    assert not plugin.runner._appointments(umo)

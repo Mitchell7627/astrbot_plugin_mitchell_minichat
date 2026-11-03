@@ -615,6 +615,10 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
         return drop("E1", "有时间但没有对应的事")
 
     label, kind, _event_idx, _event_len = event
+    if kind == 'wake' and label in ('叫醒', '喊醒'):
+        target = text[_event_idx + _event_len:rules.clause_end(text, _event_idx + _event_len)].strip()
+        if target and not re.fullmatch(r'(?:一下)?(?:我)?[吧呀啊啦\s]*', target):
+            return drop('P1', '唤醒对象不是明确的本人，不登记')
     if kind == 'wake' and (re.match(r'了|啦|咯|过', text[_event_idx + _event_len:]) or re.search(r'已经|刚刚|刚才', text[rules.clause_start(text, _event_idx):_event_idx])):
         return drop('D1', '已经起床，不建立新的唤醒预约')
     if kind == 'wake' and label == '起来' and _event_idx > 0:
