@@ -162,3 +162,14 @@ async def test_wake_delivers_once_without_early_wakeup(plugin,umo,clock,monkeypa
     plugin.context.send_message.assert_awaited()
     assert not any(x.get('deferred') for x in r._appointments(umo))
     assert not r.appointment_shot_item(umo)
+
+@pytest.mark.parametrize('text',['六点起来了','六点已经起床','晚上六点玩起来'])
+def test_completed_wake_not_registered(plugin,umo,clock,text):
+    clock.now=datetime(2026,11,3,16,37).timestamp()
+    plugin.runner.update_from_message(umo,text)
+    assert not plugin.runner._appointments(umo)
+
+def test_explicit_request_to_bot(plugin,umo,clock):
+    clock.now=datetime(2026,11,3,16,37).timestamp()
+    plugin.runner.update_from_message(umo,'你晚上六点叫醒我')
+    assert plugin.runner._appointments(umo)[0]['kind']=='wake'

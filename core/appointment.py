@@ -531,6 +531,11 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
     return {"hit": None, "gray": gray, "dropped": dropped}
 
 
+def _wake_request(text, idx):
+    clause = text[rules.clause_start(text, idx):rules.clause_end(text, idx)]
+    return bool(re.search(r'(?:叫醒|喊醒)我(?:[吧呀啊啦\s]|$)', clause))
+
+
 def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candidate=None):
     """解析一句话。
 
@@ -583,7 +588,7 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
 
     if rules.is_question_clause(text, idx, kw_len=kw_len):
         return drop("Q1", "疑问句，分不清是问他还是说约定")
-    if rules.is_third_person_clause(text, idx) or rules.is_second_person_clause(text, idx):
+    if rules.is_third_person_clause(text, idx) or (rules.is_second_person_clause(text, idx) and not _wake_request(text, idx)):
         return drop("P1", "说的是别人的事")
     if rules.negated_by_clause(text, idx, NEGATIONS, window=4):
         return drop("N1", "否定了，这件事不会发生")
@@ -610,6 +615,8 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
         return drop("E1", "有时间但没有对应的事")
 
     label, kind, _event_idx, _event_len = event
+    if kind == 'wake' and (re.match(r'了|啦|咯|过', text[_event_idx + _event_len:]) or re.search(r'已经|刚刚|刚才', text[rules.clause_start(text, _event_idx):_event_idx])):
+        return drop('D1', '已经起床，不建立新的唤醒预约')
     if kind == 'wake' and label == '起来' and _event_idx > 0:
         if text[_event_idx - 1] not in '再才就要会先我点分整半 ，,：:0123456789':
             return drop('E1', '不是起床语境，不建立唤醒预约')
@@ -630,7 +637,7 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
     for anchor, width in ((idx, kw_len), (_event_idx, _event_len)):
         if rules.is_question_clause(text, anchor, kw_len=width):
             return drop('Q1', '疑问句，不登记')
-        if rules.is_third_person_clause(text, anchor) or rules.is_second_person_clause(text, anchor):
+        if rules.is_third_person_clause(text, anchor) or (rules.is_second_person_clause(text, anchor) and not _wake_request(text, anchor)):
             return drop('P1', '说的是别人的事')
         if rules.is_reported_clause(text, anchor) or rules.is_dream_clause(text, anchor):
             return drop('R1', '引用或梦境，不是本人约定')
