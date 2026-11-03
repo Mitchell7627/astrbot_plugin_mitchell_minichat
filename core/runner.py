@@ -188,9 +188,12 @@ class Runner:
 
     @staticmethod
     def is_confirmation(text: str) -> bool:
-        return text.strip().strip('。！!～~ ') in (
+        # 仅完整确认短句可沿用先前意图；疑问或附带新动作仍必须使旧结果失效。
+        # 自定义关键词先走规则，是否中性还会核对候选及实际状态变化。
+        return text.strip().strip('。！!～~ ').casefold() in (
             '我知道了', '知道了', '知道啦', '收到啦', '收到', '明白了',
             '好的', '好哒', '嗯嗯', '嗯', '你好',
+            '好', '对啊', '嗯呢', '行', '可以', 'ok',
         )
 
     def _semantic_current(self, umo: str, seq: int) -> bool:

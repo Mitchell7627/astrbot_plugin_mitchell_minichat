@@ -4,7 +4,15 @@
 
 ## 安装与运行
 
-需要 Python 3.12。仓库根目录运行 README 中的虚拟环境安装命令，然后执行 `python -m pytest -q`。`requirements-dev.txt` 固定顶层开发依赖，间接依赖仍由包管理器解析；它不是完整依赖锁文件。云环境也可直接使用 `/workspace/.venvs/minichat/bin/python`。
+需要 Python 3.12。在仓库根目录创建并激活虚拟环境后运行：
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m playwright install chromium
+python -m pytest -q
+```
+
+Linux 首次安装浏览器可使用 `python -m playwright install --with-deps chromium` 补齐系统依赖。`requirements-dev.txt` 固定顶层开发依赖，间接依赖仍由包管理器解析；它不是完整依赖锁文件。
 
 历史回归另跑 `python tools/run_legacy.py`。不要在同一 pytest 进程混合收集 `tests/` 和 `legacy_tests/`：历史集会替换 AstrBot 模块。Windows 测试夹具显式按 UTF-8 读取 schema；CLI 回放目前依赖 Unix 的 `time.tzset()`，在 Linux/WSL 执行。
 
