@@ -60,6 +60,8 @@ from .appointment import (
     parse as parse_appointment,
     resolve_at as resolve_appointment_at,
     stage_of as appointment_stage,
+    wake_target_is_self,
+    _alternative_clock as appointment_alternative_clock,
 )
 
 TAG = "[Minichat]"
@@ -1428,6 +1430,8 @@ class Runner:
     def _cancel_action_confirmed(value: str, marker) -> bool:
         """取消动作的极性和结果；不把意向、反取消或失败当作已取消。"""
         head, tail = value[:marker.start()], value[marker.end():]
+        if marker.group() in ('不用', '不要', '不必', '别', '不再') and re.match(r'(?:再)?取消', tail):
+            return False
         if rules.negated_by_clause(value, marker.start(), rules.SELF_NEGATIONS, window=4):
             return False
         if re.search(r"(?:不再|不想|不必|不用|别|不要)(?:要)?$", head):
@@ -1449,7 +1453,7 @@ class Runner:
         described = any(word in value for word in all_words)
         cancel_all = bool(re.search(r"全部|所有", value))
         # 保持位置，先去时间与动作，再区分事项和语法修饰。
-        explicit = marker.group().startswith("取消") or marker.group() in ("不用了", "不要了", "算了")
+        explicit = marker.group().startswith("取消") or marker.group() in ("不用了", "不要了", "算了", "不用", "不要", "不必", "别", "不再")
         spans = [(marker.start(), marker.end() if explicit else marker.start() + 1)]
         if clock:
             spans.append((clock["idx"], clock["idx"] + clock["length"]))
@@ -1459,6 +1463,8 @@ class Runner:
             remaining = remaining[:start] + " " * (end - start) + remaining[end:]
         for word in sorted(all_words, key=len, reverse=True):
             remaining = remaining.replace(word, " ")
+        if marker.group() in ('不用', '不要', '不必', '别', '不再'):
+            remaining = re.sub(r'叫|喊|让|提醒|通知|你', '', remaining)
         remaining = re.sub(
             r"(?:这个|那个|这条|那条|这件事|原来的|全部|所有|约定|安排|提醒|预约|"
             r"凌晨|早上|早晨|上午|中午|正午|下午|午后|傍晚|晚上|夜里|今晚|晚间|今天|今早|"
@@ -1478,9 +1484,15 @@ class Runner:
         all_words.update(w for words in self._APPOINTMENT_ALIASES.values() for w in words)
         for clause in re.finditer(r"[^，,。！？!?；;\n]+", text):
             value = clause.group()
-            marker = re.search(r"取消(?:掉)?|不用了|不要了|算了|不(?:去|开|上|办|参加|举行|回|到)", value)
+            marker = re.search(r"取消(?:掉)?|不用了|不要了|算了|(?:不用|不要|不必|别|不再)(?=[^，,。！？!?；;\n]{0,24}(?:叫醒|喊醒|起床|起来))|不(?:去|开|上|办|参加|举行|回|到)", value)
             if marker is None or not self._cancel_action_confirmed(value, marker):
                 continue
+            wake_cancel = marker.group() in ('不用', '不要', '不必', '别', '不再')
+            if wake_cancel:
+                wake = re.search(r'叫醒|喊醒|起床|起来', value)
+                normalized = value.rstrip('了啦吧呀啊哦喔 ')
+                if not wake or not wake_target_is_self(normalized, wake.start(), len(wake.group()), wake.group()):
+                    continue
             anchor = clause.start() + marker.start()
             previous = rules.prev_clause(text, clause.start(), 48)
             if (previous.startswith(rules.CONDITIONAL_LEADS) or previous.rstrip().endswith("的话")) and not value.lstrip().startswith(("不过", "但是", "但", "然而", "现在", "实际上", "事实上")):
@@ -1490,7 +1502,7 @@ class Runner:
                     or rules.is_conditional_clause(text, anchor)
                     or rules.is_question_clause(text, anchor, kw_len=len(marker.group()))
                     or rules.is_third_person_clause(text, anchor)
-                    or rules.is_second_person_clause(text, anchor)
+                    or (rules.is_second_person_clause(text, anchor) and not wake_cancel)
                     or (rules.is_far_past_clause(text, anchor)
                         and not appointment_day_markers(value, datetime.now()))):
                 continue
@@ -1549,6 +1561,102 @@ class Runner:
                 "kw": marker.group(), "verdict": "accept", "gate_rule": "CANCEL",
                 "reason": f"取消 {len(cancelled_ids)} 条匹配约定",
             }})
+            return True, self._mask_span(text, clause.start(), clause.end())
+        return False, text
+
+    def _reschedule_from_message(self, umo: str, text: str):
+        """跨轮改期只提交唯一目标；所有新时间仍通过正式解析和额度入口。"""
+        cfg = self._appointment_cfg()
+        if not cfg["enable"]:
+            return False, text
+        if not self._appointments(umo):
+            return False, text  # 保留尚未入队的同句日期改口入口。
+        for clause in re.finditer(r"[^，,。！？!?；;\n]+", text):
+            value = clause.group()
+            change = re.search(r"改到|改成|改为|挪到|推迟到", value)
+            if not change or find_appointment_clock(value[:change.start()]):
+                continue  # 有原钟点的同句改期沿用已有解析。
+            anchor = clause.start() + change.start()
+            before, tail = value[:change.start()], value[change.end():]
+            # 保护整句语义，不能把第三方/假设/否定改期当本人指令。
+            protected = (rules.is_reported_clause(text, anchor)
+                         or rules.is_dream_clause(text, anchor)
+                         or rules.is_conditional_clause(text, anchor)
+                         or rules.is_question_clause(text, anchor, kw_len=len(change.group()))
+                         or rules.is_third_person_clause(text, anchor)
+                         or rules.is_second_person_clause(text, anchor)
+                         or rules.negated_by_clause(text, anchor, (*rules.SELF_NEGATIONS, '别', '不', '没'), window=len(value))
+                         or re.search(r'考虑|可能|也许|打算|准备|想要|想把|失败|没成功|不成功|或者|或是|二选一', value))
+            clock = find_appointment_clock(tail)
+            if not clock:
+                continue
+            protected = protected or appointment_alternative_clock(text, {
+                **clock, 'idx': clause.start() + change.end() + clock['idx']})
+            if protected:
+                self._dec_buffer.append({'kind': 'appointment', 'kw': change.group(),
+                    'verdict': 'reject', 'rule': 'RESCHEDULE', 'applied': False,
+                    'reason': '否定、第三方、引用、疑问或未确定的改期，保留原约定'})
+                return True, self._mask_span(text, clause.start(), clause.end())
+            pending = [x for x in self._appointments(umo)
+                       if self._appointment_alive(x, time.time(), cfg)]
+            described = before.strip()
+            choices = []
+            for item in pending:
+                aliases = self._APPOINTMENT_ALIASES.get(item.get('label'), (item.get('label'),))
+                residue = described
+                head_days = appointment_day_markers(residue, datetime.now())
+                item_day = datetime.fromtimestamp(_as_float_safe(item.get('original_at') or item.get('at'))).date()
+                if any(m.target != item_day for m in head_days):
+                    continue
+                for m in sorted(head_days, reverse=True):
+                    residue = residue[:m.start] + ' ' * (m.end - m.start) + residue[m.end:]
+                for word in sorted((w for w in aliases if w), key=len, reverse=True):
+                    residue = residue.replace(word, '')
+                if item.get('label') == '开会':
+                    residue = residue.replace('会', '')
+                residue = re.sub(r'那个|这个|那条|这条|这件事|原来的|约定|安排|预约|提醒|我|把|的', '', residue)
+                if not residue.strip():
+                    choices.append(item)
+            reason, applied = '改期目标不唯一或事项不明确，保留原约定', False
+            if len(choices) == 1:
+                original = choices[0]
+                old_at = _as_float_safe(original.get('original_at') or original.get('at'))
+                old_day = datetime.fromtimestamp(old_at)
+                target = tail.strip()
+                if not clock.get('period') and clock['h'] <= 12:
+                    # 省略上午/下午时继承原约定的半天；日期同样继承而非改记今天。
+                    period = '下午' if old_day.hour >= 12 else '上午'
+                    target = tail[:clock['idx']] + period + tail[clock['idx']:]
+                if not appointment_day_markers(target, datetime.now()):
+                    target = old_day.strftime('%Y年%m月%d日') + target
+                # 只允许时间、日期和语气词，不接受新事项或失败说明残留。
+                scan = target
+                target_clock = find_appointment_clock(scan)
+                spans = [(m.start, m.end) for m in appointment_day_markers(scan, datetime.now())]
+                if target_clock:
+                    spans.append((target_clock['idx'], target_clock['idx'] + target_clock['length']))
+                for a, b in sorted(spans, reverse=True):
+                    scan = scan[:a] + ' ' * (b-a) + scan[b:]
+                for word in self._APPOINTMENT_ALIASES.get(original['label'], (original['label'],)):
+                    scan = scan.replace(word, '')
+                scan = re.sub(r'凌晨|早上|早晨|上午|中午|正午|下午|午后|傍晚|晚上|夜里|晚间|吧|呀|啊|啦|哦|喔|就行|就好|了|\s', '', scan)
+                if not scan:
+                    parsed = parse_appointment(target + original['label'], datetime.now(), cfg)
+                    hit = parsed.get('hit')
+                    if hit and not parsed.get('gray'):
+                        hit.update(reschedule=True, replace_at=old_at, raw=value.strip()[:20])
+                        applied = self._register_appointment(umo, hit)
+                        reason = '已按唯一匹配约定改期' if applied else '改期未提交（额度、重复或目标冲突），保留原约定'
+                    else:
+                        reason = '新时间无效、模糊或超出范围，保留原约定'
+                else:
+                    reason = '新时间含未知事项或说明，保留原约定'
+            self._dec_buffer.append({
+                'kind': 'appointment', 'kw': change.group(), 'verdict': 'accept' if applied else 'reject',
+                'rule': 'RESCHEDULE', 'reason': reason, 'applied': applied,
+            })
+            if applied:
+                self.reschedule(umo)
             return True, self._mask_span(text, clause.start(), clause.end())
         return False, text
 
@@ -2765,6 +2873,10 @@ class Runner:
         if cancelled:
             return (rest if rest.strip() else None), True
 
+        changed, rest = self._reschedule_from_message(umo, text)
+        if changed:
+            return (rest if rest.strip() else None), True
+
         # 约定时间点：独立于事件开关（说了「上到十二点」就该记住）
         appt_hit, appt_rest = self._handle_appointment_words(umo, text)
 
@@ -3416,6 +3528,7 @@ class Runner:
         reschedule_needed = True
         # 已送达的分段：被取消时靠它补写历史（取消异常不会走到下面的写历史）
         delivered: list[str] = []
+        shot, appt_at, appt_id = None, None, None
         try:
             if not self.cfg.get("enable", False):
                 result["reason"] = "disabled"
@@ -3425,11 +3538,14 @@ class Runner:
                              if item.get('kind') == 'wake' and not item.get('due_sent_at')
                              and item.get('at', 0) <= time.time()
                              and appointment_stage(item, time.time(), self._appointment_cfg()) == 'due'), None)
-            if wake_due:
-                self.store.pop(umo, SLEEP_KEY)
-                self.store.save()
+            wake_sleep = copy.deepcopy(self._sleep_state(umo)) if wake_due else None
+
+            def can_send():
+                return self._result_current(umo, seq) and (
+                    not self.is_sleeping(umo)
+                    or bool(wake_due and self._sleep_state(umo) == wake_sleep))
             # 睡眠免打扰：说「睡了」之后静音（智能时长：近起床点到起床、远则 N 小时）
-            if self.is_sleeping(umo):
+            if self.is_sleeping(umo) and not wake_due:
                 # 到点的约定不能静默丢掉：改排到起床后，醒来再补。
                 appt = self.appointment_shot_item(umo)
                 if appt and appt.get("shot") in ("due", "follow"):
@@ -3504,7 +3620,7 @@ class Runner:
                     self._appointment_fail(umo, shot, appt_at, appt_id)
                 return result
 
-            if not self._result_current(umo, seq) or self.is_sleeping(umo):
+            if not can_send():
                 # 面板 fire 不属于 timers；用户新消息不会自动取消它，必须在
                 # 模型 await 返回后复核。新消息已经排过时间，旧任务不再重排。
                 reschedule_needed = False
@@ -3514,7 +3630,7 @@ class Runner:
             try:
                 sent_text = await self._send_split(
                     umo, text, sent_out=delivered, report=result,
-                    guard=lambda: self._result_current(umo, seq) and not self.is_sleeping(umo),
+                    guard=can_send,
                 )
             except asyncio.CancelledError:
                 # 用户开口会取消定时器，CancelledError 会从这里穿出去、写历史的代码根本到不了。
@@ -3534,6 +3650,8 @@ class Runner:
                     # 或者推进新消息已取消/修改的约定。
                     reschedule_needed = False
                 elif shot:
+                    if wake_due and self._sleep_state(umo) == wake_sleep:
+                        self.store.pop(umo, SLEEP_KEY)
                     self._advance_appointment(umo, shot, appt_at, appt_id)
                     count = self.store.bump_unanswered(umo)
                     logger.info(
@@ -3559,6 +3677,8 @@ class Runner:
             raise
         except Exception as e:
             result["reason"] = "error"
+            if shot and self._result_current(umo, seq):
+                self._appointment_fail(umo, shot, appt_at, appt_id)
             logger.error(f"{TAG} 发送流程异常: {e}")
         finally:
             if held and lock.locked():

@@ -533,7 +533,44 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
 
 def _wake_request(text, idx):
     clause = text[rules.clause_start(text, idx):rules.clause_end(text, idx)]
-    return bool(re.search(r'(?:叫醒|喊醒)我(?:[吧呀啊啦\s]|$)', clause))
+    return bool(re.search(r'(?:叫醒|喊醒)(?:一下)?我|(?:叫|喊|提醒|让)我(?:一下)?(?:起床|起来)', clause))
+
+
+def wake_target_is_self(text, idx, length, label):
+    """同一套对象检查覆盖「叫醒我」与「叫我起床」，语气尾不充当对象。"""
+    left, right = rules.clause_start(text, idx), rules.clause_end(text, idx + length)
+    if label in ('叫醒', '喊醒'):
+        object_before = re.search(r'(?:把|将)([^，,。！？!?；;\n]{1,12})$', text[left:idx])
+        if object_before and not re.fullmatch(r'我(?:自己)?', object_before.group(1)):
+            return False
+        target = text[idx + length:right].strip()
+        return not target or bool(re.fullmatch(
+            r'(?:一下)?(?:我(?:一下)?)?(?:吧|呀|啊|啦|哦|喔|哟|噢|哈|就行|就好|就可以了|谢谢|拜托|\s)*', target))
+    request = re.search(r'(?:叫|喊|提醒|通知|让)([^，,。！？!?；;\n]{0,16})$', text[left:idx])
+    return request is None or bool(re.fullmatch(r'(?:一下)?我(?:自己)?(?:一下)?', request.group(1)))
+
+
+def _alternative_clock(text, clock):
+    left = rules.clause_start(text, clock['idx'])
+    right = rules.clause_end(text, clock['idx'] + clock['length'])
+    clause = text[left:right]
+    if re.search(r'或者|或是|或|二选一', clause):
+        return True
+    # 备选关系可跨逗号；句号、分号和独立转折不继承。
+    if right < len(text) and text[right] in '，,':
+        following = text[right + 1:rules.clause_end(text, right + 1)].lstrip()
+        if re.match(r'(?:或者|或是|或)', following):
+            return True
+        cursor = right
+        while cursor < len(text) and text[cursor] in '，,':
+            end = rules.clause_end(text, cursor + 1)
+            following = text[cursor + 1:end].strip()
+            if following.startswith('二选一'):
+                return True
+            if not find_clock(following):
+                break
+            cursor = end
+    return False
 
 
 def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candidate=None):
@@ -593,7 +630,13 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
     if rules.negated_by_clause(text, idx, NEGATIONS, window=4):
         return drop("N1", "否定了，这件事不会发生")
     clause = text[rules.clause_start(text, idx):rules.clause_end(text, idx + kw_len)]
-    if re.search(r'或者|或是|或|二选一', clause):
+    changes = list(_CHANGE_RE.finditer(clause))
+    if changes:
+        change_idx = rules.clause_start(text, idx) + changes[-1].start()
+        if (rules.negated_by_clause(text, change_idx, NEGATIONS, window=len(clause))
+                or re.search(r'考虑|可能|也许|打算|准备|失败|没成功|不成功', clause)):
+            return drop('N1', '否定、意向或失败的改期，不修改约定')
+    if _alternative_clock(text, clock):
         return drop('A2', '备选时间尚未确定，不登记')
     day = _selected_day(text, idx, kw_len, now=now)
     future_days = max(0, min(365, int(cfg.get('future_days', 0))))
@@ -615,10 +658,8 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
         return drop("E1", "有时间但没有对应的事")
 
     label, kind, _event_idx, _event_len = event
-    if kind == 'wake' and label in ('叫醒', '喊醒'):
-        target = text[_event_idx + _event_len:rules.clause_end(text, _event_idx + _event_len)].strip()
-        if target and not re.fullmatch(r'(?:一下)?(?:我)?[吧呀啊啦\s]*', target):
-            return drop('P1', '唤醒对象不是明确的本人，不登记')
+    if kind == 'wake' and not wake_target_is_self(text, _event_idx, _event_len, label):
+        return drop('P1', '唤醒对象不是明确的本人，不登记')
     if kind == 'wake' and (re.match(r'了|啦|咯|过', text[_event_idx + _event_len:]) or re.search(r'已经|刚刚|刚才', text[rules.clause_start(text, _event_idx):_event_idx])):
         return drop('D1', '已经起床，不建立新的唤醒预约')
     if kind == 'wake' and label == '起来' and _event_idx > 0:
