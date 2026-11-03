@@ -1387,6 +1387,45 @@ class Runner:
         "吃饭": ("吃饭", "饭局", "聚餐"), "约会": ("约会",),
     }
 
+    @staticmethod
+    def _cancel_action_confirmed(value: str, marker) -> bool:
+        """取消动作的极性和结果；不把意向、反取消或失败当作已取消。"""
+        head, tail = value[:marker.start()], value[marker.end():]
+        if rules.negated_by_clause(value, marker.start(), rules.SELF_NEGATIONS, window=4):
+            return False
+        if re.search(r"(?:不再|不想|不必|不用|别|不要)(?:要)?$", head):
+            return False
+        if re.search(r"(?:想|考虑|打算|准备|计划|可能|也许|大概|差点|险些|尝试|试着|能否|是否)(?:要|去|先|再|着)?$", head):
+            return False
+        if marker.group() == "取消" and re.match(
+            r"(?:了)?(?:但|却)?(?:失败|不了|不成|不掉|不成功|(?:未|没|没有)(?:能)?(?:成功|取消))", tail
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _cancel_target(value: str, marker, clock, all_words: set) -> tuple[bool, bool, bool]:
+        """从完整分句解析事项和范围；钟点两侧都检查，未知残留不退化成省略。"""
+        described = any(word in value for word in all_words)
+        cancel_all = bool(re.search(r"全部|所有", value))
+        # 保持位置，先去时间与动作，再区分事项和语法修饰。
+        spans = [(marker.start(), marker.end() if marker.group() == "取消" else marker.start() + 1)]
+        if clock:
+            spans.append((clock["idx"], clock["idx"] + clock["length"]))
+        remaining = value
+        for start, end in sorted(spans, reverse=True):
+            remaining = remaining[:start] + " " * (end - start) + remaining[end:]
+        for word in sorted(all_words, key=len, reverse=True):
+            remaining = remaining.replace(word, " ")
+        remaining = re.sub(
+            r"(?:这个|那个|这条|那条|这件事|原来的|全部|所有|约定|安排|提醒|预约|"
+            r"凌晨|早上|早晨|上午|中午|正午|下午|午后|傍晚|晚上|夜里|今晚|晚间|今天|今早|"
+            r"已经|现在|刚刚|刚才|确定|决定|成功|参加|举行|我|把|将|给|的|都|先|已|去|了|啦|咯|呀|啊|吧)",
+            "", remaining,
+        )
+        unknown_item = bool(remaining.strip())
+        return described, cancel_all, unknown_item
+
     def _cancel_appointments_from_message(self, umo: str, text: str) -> tuple[bool, str]:
         """只撤销本人明确取消的匹配条目；不把第三方、疑问或反取消当指令。"""
         items = self._appointments(umo)
@@ -1398,7 +1437,7 @@ class Runner:
         for clause in re.finditer(r"[^，,。！？!?；;\n]+", text):
             value = clause.group()
             marker = re.search(r"取消|不(?:去|开|上|办|参加|举行|回|到)", value)
-            if marker is None or re.search(r"(?:不要|别|不|没|没有|不必|不是|并非|不是要)取消", value):
+            if marker is None or not self._cancel_action_confirmed(value, marker):
                 continue
             anchor = clause.start() + marker.start()
             previous = rules.prev_clause(text, clause.start(), 48)
@@ -1414,13 +1453,7 @@ class Runner:
                     or rules.is_far_past_clause(text, anchor)):
                 continue
             clock = find_appointment_clock(value)
-            described = any(word in value for word in all_words)
-            # 明说另一件未知事项不能退化成「只按钟点取消」。
-            named = value[clock["idx"] + clock["length"]:] if clock else ""
-            named = re.sub(r"(?:取消了?|不去了)[呀啊啦 ]*$", "", named).strip().lstrip("的").strip()
-            unknown_item = bool(named and named not in ("约定", "安排", "提醒")
-                                and not any(w in named for w in all_words))
-            cancel_all = bool(re.search(r"(?:全部|所有)(?:的)?(?:约定|安排|提醒)", value))
+            described, cancel_all, unknown_item = self._cancel_target(value, marker, clock, all_words)
             cancelled_ids = set()
             for position, item in enumerate(items):
                 if unknown_item:
@@ -1442,16 +1475,12 @@ class Runner:
                             continue
                 label = str(item.get("label") or "")
                 aliases = self._APPOINTMENT_ALIASES.get(label, (label,))
-                if described and not any(word and word in value for word in aliases) and not cancel_all:
+                if described and not any(word and word in value for word in aliases):
                     continue
                 if not clock and not described and not cancel_all and len(pending) != 1:
                     continue
-                if not clock and not described and not cancel_all and not re.fullmatch(
-                    r"(?:我)?(?:(?:这个|那个|这件事|原来的安排))?(?:取消了?|不去了)[呀啊啦 ]*", value.strip()
-                ):
-                    continue
                 cancelled_ids.add(position)
-            if len(cancelled_ids) > 1 and not clock and not cancel_all:
+            if len(cancelled_ids) > 1 and not cancel_all:
                 # 多条同类约定没有钟点时不猜，避免一句「会议取消」全删。
                 continue
             if not cancelled_ids:

@@ -11,7 +11,7 @@ import pytest
 from playwright.async_api import async_playwright, expect
 
 
-async def test_task_page_diagnostics_and_delivery_states(plugin, umo, monkeypatch):
+async def test_task_page_diagnostics_and_delivery_states(plugin, umo, monkeypatch, clock):
     executable = os.environ.get("MINICHAT_CHROMIUM") or shutil.which("chromium")
     r = plugin.runner
     r.update_from_message(umo, "我正在洗澡")
@@ -59,6 +59,21 @@ async def test_task_page_diagnostics_and_delivery_states(plugin, umo, monkeypatc
                 await stop_row.locator('[data-op="undo"]').click()
                 await expect(stop_row).to_contain_text("已撤销")
                 assert plugin.store.get(umo, "active_event")["name"] == "shower"
+                # 取消记录也必须显示已应用，面板撤销恢复原约定。
+                r.update_from_message(umo, "我下午三点开会")
+                original = r._appointments(umo)
+                r.update_from_message(umo, "下午三点的那个安排取消了")
+                assert not r._appointments(umo)
+                await page.reload()
+                await page.locator('[data-tab="tasks"]').click()
+                await page.locator('#task-list details').filter(
+                    has=page.locator("summary", has_text="最近判定")
+                ).locator("summary").click()
+                cancel_row = page.locator("#task-list .log-row").filter(has_text="取消 1 条匹配约定")
+                await expect(cancel_row.locator(".badge")).to_have_text("已记录")
+                await cancel_row.locator('[data-op="undo"]').click()
+                await expect(cancel_row).to_contain_text("已撤销")
+                assert r._appointments(umo) == original
                 await expect(page.locator("#task-list")).to_contain_text("排程原因")
                 await (
                     page.locator("#task-list details")
