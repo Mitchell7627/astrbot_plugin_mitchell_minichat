@@ -240,6 +240,6 @@ Get-FileHash .\astrbot_plugin_mitchell_minichat_v0.2.21.zip -Algorithm SHA256
 
 将输出的 `Hash` 与校验文件中的摘要比较（大小写不影响结果）；一致表示校验通过，不一致则应重新下载并核对版本。
 
-## 鸣谢与许可
+## 开源协议
 
-插件代码使用 [MIT License](LICENSE)。
+本项目采用 [MIT License](LICENSE) 开源协议。
