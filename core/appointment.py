@@ -115,7 +115,7 @@ def _find_period(text: str, start: int):
 
 
 def _degree_point(text: str, match: re.Match) -> bool:
-    """「快一点 / 一点都不」不是 1:00；「一点半 / 下午一点」仍是钟点。"""
+    """裸「一点」需要钟点结构佐证；数量/程度和不确定用法不生成钟点拒绝。"""
     if match.group(1) != "一" or match.group(2) or match.group(3):
         return False
     head = text[rules.clause_start(text, match.start()):match.start()].rstrip()
@@ -124,13 +124,55 @@ def _degree_point(text: str, match: re.Match) -> bool:
         return True
     if any(head.endswith(word) for words, _ in _PERIOD_WORDS for word in words):
         return False
-    if tail.startswith(("时间", "小事", "要求", "东西", "事情", "机会", "心意", "钱")):
+    if re.search(r"(?:有|还有|剩|剩下|留|留给|给我|给你|给他|给她|喝|吃|买|拿|带|加|补|借|花|用|省)(?:了|着|上|下)?$", head):
         return True
-    return head.endswith((
+    if head.endswith((
         "快", "慢", "轻", "重", "早", "晚", "多", "少", "大", "小",
         "好", "坏", "高", "低", "远", "近", "深", "浅", "长", "短",
         "暖", "冷", "热", "直白", "清楚", "明确", "详细", "色",
-    ))
+    )):
+        return True
+    # 看时间搭配，不枚举「水/精力/建议」等无限多的数量名词。
+    if tail.startswith(("钟", "左右", "前后", "的时候", "以后", "之后", "之前", "多", "开始", "准时")):
+        return False
+    if any(tail.startswith(word) for words in DEFAULT_EVENTS.values() for word in words):
+        return False
+    actions = [word for words in DEFAULT_EVENTS.values() for word in words]
+    actions += ["洗澡", "洗头", "睡觉", "运动", "跑步", "做饭", "看电影", "玩游戏", "喝水", "开始", "去"]
+    if re.match(r"(?:我)?(?:就|才|再|先|要|会|准备|去|正在|能)?(?:" + "|".join(map(re.escape, actions)) + r")", tail):
+        return False
+    if not tail.strip("了啦咯喽呀啊 ") and re.search(r"(?:等到|到|定在|约在|现在|已经)$", head):
+        return False
+    return True
+
+
+_TODAY_WORDS = ("今天", "今日", "今儿", "今早", "今晚", "今晨", "今夜")
+_OTHER_DAY_WORDS = (
+    "大后天", "后天", "明天", "明日", "明早", "明晚", "明晨", "明儿", "明个",
+    "下周", "下星期", "下礼拜", "下个月", "下月", "下学期", "明年", "改天", "下次", "下回",
+    "大前天", "前天", "昨天", "昨日", "昨晚", "昨儿", "昨夜", "上周", "上个月", "去年",
+)
+_DAY_RE = re.compile("|".join(map(re.escape, sorted(_TODAY_WORDS + _OTHER_DAY_WORDS, key=len, reverse=True))))
+
+
+def _supported_day(text: str, idx: int, length: int = 0) -> bool:
+    """日期绑定钟点所在分句，优先取钟点前最近的日期；不把其他日子改记今天。"""
+    start = rules.clause_start(text, idx, None)
+    end = rules.clause_end(text, idx + length)
+    head = text[start:idx]
+    changes = list(re.finditer(r"(?:改到|改为|改成|挪到|推迟到|安排在)(?:" + _DAY_RE.pattern + r")", text[start:end]))
+    if changes:
+        return _DAY_RE.search(changes[-1].group()).group() in _TODAY_WORDS
+    dates = list(_DAY_RE.finditer(head))
+    if dates:
+        return dates[-1].group() in _TODAY_WORDS
+    # 「三点开会改到明天」同样不能落成今天。
+    if _DAY_RE.search(text[idx:end]):
+        return False
+    previous = rules.prev_clause(text, start, 4).strip()
+    if previous in _OTHER_DAY_WORDS:
+        return False
+    return not rules.is_future_clause(text, idx)
 
 
 def find_clock(text: str):
@@ -279,8 +321,8 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
     out = {"hit": None, "gray": None, "dropped": []}
     clock = None
 
-    def drop(rule, reason):
-        idx = clock["idx"] if clock else None
+    def drop(rule, reason, anchor=None):
+        idx = clock["idx"] if clock else anchor
         if idx is None and (question := _WHEN_ASK_RE.search(text)):
             idx = question.start()
         out["dropped"].append({"rule": rule, "reason": reason, "idx": idx})
@@ -299,6 +341,8 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
         remain = _REMAIN_RE.search(text)
         if remain:
             event = _find_event(text, {"idx": remain.start(), "length": 0}, keywords)
+            if event and not _supported_day(text, remain.start(), len(remain.group())):
+                return drop("F1", "明确其他日期，本版未登记", remain.start())
             if event and force:
                 minutes = cn_to_int(remain.group(1))
                 if minutes and 0 < minutes <= max_hours * 60:
@@ -324,8 +368,8 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
     if rules.negated_by_clause(text, idx, NEGATIONS, window=4):
         return drop("N1", "否定了，这件事不会发生")
     clause = text[rules.clause_start(text, idx):rules.clause_end(text, idx + kw_len)]
-    if rules.is_future_clause(text, idx) and not re.search(r"今天|今早|今晚|今儿", clause):
-        return drop("F1", "说的是别的日子")
+    if not _supported_day(text, idx, kw_len):
+        return drop("F1", "明确其他日期或未来表达，本版未登记")
     # 「如果我十二点下课」「示例：'十二点下课'」「我十二点下课的安排取消了」都不是有效约定
     if rules.is_reported_clause(text, idx):
         return drop("R1", "是转述/示例，不是本人约定")
