@@ -660,10 +660,18 @@
             },
             "appointment_max_hours": {
                 "description": "最远认多久",
-                "hint": "超过这么多小时的时间点不认（「明天九点」本来就该被将来时挡掉）。",
+                "hint": "没有明确日期时的最远小时数；带日期的预约使用下面的跨日范围。",
                 "type": "int",
                 "default": 14,
                 "slider": {"min": 1, "max": 24, "step": 1},
+                "condition": {"enable_appointment": true}
+            },
+            "appointment_future_days": {
+                "description": "跨日预约最远天数",
+                "hint": "明确日期可预约未来多少个日历日。0 为仅本日。过去日期不自动顺延；队列和每日登记额度不变。",
+                "type": "int",
+                "default": 14,
+                "slider": {"min": 0, "max": 365, "step": 1},
                 "condition": {"enable_appointment": true}
             },
             "appointment_max_per_day": {

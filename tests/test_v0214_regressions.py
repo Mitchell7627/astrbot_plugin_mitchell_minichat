@@ -32,7 +32,7 @@ def test_other_clause_completion_cannot_reject_real_appointment(plugin, umo, clo
 
 @pytest.mark.parametrize("prefix", ["今天心情不错", "我今天正在吃饭", "今晚想看星星"])
 @pytest.mark.parametrize("day", ["明天", "后天"])
-def test_today_in_other_clause_cannot_turn_future_day_into_today(plugin, umo, clock, prefix, day):
+def test_today_in_other_clause_cannot_turn_future_day_into_today(plugin, umo, clock, prefix, day, same_day_only):
     plugin.runner.update_from_message(umo, f"{prefix}，我{day}下午三点开会")
     assert not plugin.runner._appointments(umo), plugin.runner._appointments(umo)
 

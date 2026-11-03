@@ -59,6 +59,12 @@ def umo(plugin):
     return plugin.runner.sessions()[0]
 
 
+@pytest.fixture
+def same_day_only(plugin):
+    """Explicit compatibility mode for historical tests requiring future dates to be rejected."""
+    plugin.engine_cfg['appointment_future_days'] = 0
+
+
 @pytest.fixture(autouse=True)
 async def cleanup_plugin(plugin):
     yield

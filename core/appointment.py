@@ -10,7 +10,8 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import date as CalendarDate, datetime, timedelta
+from typing import NamedTuple
 
 from . import text_rules as rules
 
@@ -56,14 +57,14 @@ _DIFF_RE = re.compile(
     rf"(\d{{1,2}}|[{_CN_CHARS}]{{1,3}})\s*点"
 )
 
-# 时段词按「离时间越近越优先」找，最多回看 4 个字
+# 时段词按所属分句中「离钟点越近越优先」找。
 _PERIOD_WORDS = (
-    (("凌晨",), "am"),
-    (("早上", "早晨", "上午", "今早"), "am"),
+    (("凌晨",), "dawn"),
+    (("早上", "早晨", "上午", "今早", "明早", "明晨"), "am"),
     (("中午", "正午"), "noon"),
     (("下午", "午后"), "pm"),
     (("傍晚",), "pm"),
-    (("晚上", "夜里", "今晚", "晚间"), "night"),
+    (("晚上", "夜里", "今晚", "晚间", "明晚"), "night"),
 )
 
 # 「还有十分钟下课」这类剩余时长，只能交给模型
@@ -102,7 +103,8 @@ NEGATIONS = ("不", "别", "没", "不用", "不必", "取消")
 
 
 def _find_period(text: str, start: int):
-    head = text[max(0, start - 4):start]
+    left = rules.clause_start(text, start, None)
+    head = text[left:start]
     best = None
     for words, period in _PERIOD_WORDS:
         for word in words:
@@ -112,7 +114,10 @@ def _find_period(text: str, start: int):
             pos = idx + len(word)
             if best is None or pos > best[0]:
                 best = (pos, period)
-    return best[1] if best else None
+    if best:
+        return best[1]
+    # 仅继承相邻的纯时段短句，不借用「今晚有事」等其他活动的时段。
+    return _pure_period(rules.prev_clause(text, left, 32).strip())
 
 
 def _degree_point(text: str, match: re.Match) -> bool:
@@ -157,31 +162,155 @@ _OTHER_DAY_WORDS = (
     "大前天", "前天", "昨天", "昨日", "昨晚", "昨儿", "昨夜", "上周", "上个月", "去年",
 )
 _DAY_RE = re.compile("|".join(map(re.escape, sorted(_TODAY_WORDS + _OTHER_DAY_WORDS, key=len, reverse=True))))
+_DATE_NUMBER = rf"[0-9{_CN_CHARS}]+"
+_CALENDAR_RE = re.compile(
+    rf"(?<![0-9{_CN_CHARS}])(?:(?P<year>{_DATE_NUMBER})年)?"
+    rf"(?P<month>{_DATE_NUMBER})月(?P<day>{_DATE_NUMBER})(?:日|号)"
+)
+# 必须带星期单位，避免把普通「一」当作日期；允许「下周星期一」。
+_WEEKDAY_RE = re.compile(
+    r"(?:(?P<week>上|下|这|本)(?:一?个|一)?)?"
+    r"(?:周|星期|礼拜)(?:(?:周|星期|礼拜))?(?P<weekday>[一二三四五六日天1-7末])"
+)
 
 
-def _supported_day(text: str, idx: int, length: int = 0) -> bool:
+def _pure_period(text: str):
+    """纯时段或「日期+时段」短句可以继承，不能含另一个活动。"""
+    for words, period in _PERIOD_WORDS:
+        for word in words:
+            if text.endswith(word):
+                date = text[:-len(word)].strip()
+                if not date or any(p.fullmatch(date) for p in (_DAY_RE, _CALENDAR_RE, _WEEKDAY_RE)):
+                    return period
+    return None
+
+
+class _DayMarker(NamedTuple):
+    start: int
+    end: int
+    is_today: bool
+    target: CalendarDate | None = None
+
+
+def _date_number(raw: str, *, year: bool = False) -> int:
+    if raw.isdigit():
+        return int(raw)
+    if year:
+        return int("".join(str(_CN_DIGITS[c]) for c in raw))
+    value = cn_to_int(raw)
+    if value is None:
+        raise ValueError("invalid calendar number")
+    return value
+
+
+def _day_markers(text: str, now: datetime) -> list[_DayMarker]:
+    """日期与本日比较；非法日期也保留为拒绝标记，不能回退成没有日期。"""
+    offsets = {w: 0 for w in _TODAY_WORDS}
+    offsets.update({w: 1 for w in ('明天', '明日', '明早', '明晚', '明晨', '明儿', '明个')})
+    offsets.update({'后天': 2, '大后天': 3, '昨天': -1, '昨日': -1, '昨晚': -1, '昨儿': -1, '昨夜': -1, '前天': -2, '大前天': -3})
+    found = [_DayMarker(m.start(), m.end(), m.group() in _TODAY_WORDS,
+                        now.date() + timedelta(days=offsets[m.group()]) if m.group() in offsets else None)
+             for m in _DAY_RE.finditer(text)]
+    for match in _CALENDAR_RE.finditer(text):
+        try:
+            year = _date_number(match['year'], year=True) if match['year'] else now.year
+            target = datetime(year, _date_number(match['month']), _date_number(match['day'])).date()
+            today = target == now.date()
+        except (ValueError, KeyError, OverflowError):
+            today = False
+            target = None
+        found.append(_DayMarker(match.start(), match.end(), today, target))
+    weekdays = {c: i for i, c in enumerate("一二三四五六日")}
+    weekdays.update({str(i + 1): i for i in range(7)})
+    weekdays['天'] = 6
+    for match in _WEEKDAY_RE.finditer(text):
+        weekday = weekdays.get(match['weekday'])
+        target = None
+        if weekday is not None:
+            offset = weekday - now.weekday()
+            if match['week'] == '下':
+                offset += 7
+            elif match['week'] == '上':
+                offset -= 7
+            elif match['week'] is None:
+                offset %= 7  # 裸星期取最近一次，含今天；本/这周不滚动。
+            target = now.date() + timedelta(days=offset)
+        found.append(_DayMarker(match.start(), match.end(), target == now.date(), target))
+    out = []
+    for marker in sorted(found, key=lambda m: (m.start, -(m.end - m.start))):
+        if not out or marker.start >= out[-1].end:
+            out.append(marker)
+    return out
+
+
+def _previous_day_markers(text: str, start: int, now: datetime) -> list[_DayMarker]:
+    previous = rules.prev_clause(text, start, 32).strip()
+    markers = _day_markers(previous, now)
+    if len(markers) == 1 and (
+        markers[0].start == 0 and markers[0].end == len(previous) or _pure_period(previous) is not None
+    ):
+        return markers
+    return []
+
+
+def _selected_day(text: str, idx: int, length: int = 0, *, now: datetime) -> _DayMarker | None:
     """日期绑定钟点所在分句，优先取钟点前最近的日期；不把其他日子改记今天。"""
     start = rules.clause_start(text, idx, None)
     end = rules.clause_end(text, idx + length)
-    head = text[start:idx]
-    changes = list(re.finditer(r"(?:改到|改为|改成|挪到|推迟到|安排在)(?:" + _DAY_RE.pattern + r")", text[start:end]))
+    clause = text[start:end]
+    markers = _day_markers(clause, now)
+    for left, right in zip(markers, markers[1:]):
+        if (left.target != right.target
+                and re.fullmatch(r"[\s的（(]*", clause[left.end:right.start])):
+            # 「11月4日（周一）」等互相矛盾的同一日期描述不能猜。
+            return _DayMarker(left.start, right.end, False, None)
+    changes = [m for m in markers if re.search(r"(?:改到|改为|改成|挪到|推迟到|安排在)\s*$", clause[:m.start])]
     if changes:
-        return _DAY_RE.search(changes[-1].group()).group() in _TODAY_WORDS
-    dates = list(_DAY_RE.finditer(head))
+        return changes[-1]
+    dates = [m for m in markers if m.end <= idx - start]
     if dates:
-        return dates[-1].group() in _TODAY_WORDS
-    # 「三点开会改到明天」同样不能落成今天。
-    if _DAY_RE.search(text[idx:end]):
-        return False
-    previous = rules.prev_clause(text, start, 4).strip()
-    if previous in _OTHER_DAY_WORDS:
-        return False
+        return dates[-1]
+    if markers:
+        return markers[-1]
+    previous_dates = _previous_day_markers(text, start, now)
+    if previous_dates:
+        return previous_dates[0]
+    return None
+
+
+def _supported_day(text: str, idx: int, length: int = 0, *, now: datetime) -> bool:
+    marker = _selected_day(text, idx, length, now=now)
+    if marker is not None:
+        return marker.is_today
     return not rules.is_future_clause(text, idx)
+
+
+def _dated_at(clock: dict, marker: _DayMarker, now: datetime, days: int, max_hours: int = 48) -> float | None:
+    if marker.target is None or not 0 <= (marker.target - now.date()).days <= days:
+        return None
+    if marker.is_today:
+        at = resolve_at(clock['h'], clock['m'], clock.get('period'), now, max_hours)
+        if at is not None and clock.get('period') != 'night' and datetime.fromtimestamp(at).date() != now.date():
+            return None
+        return at
+    anchor = now.replace(year=marker.target.year, month=marker.target.month, day=marker.target.day,
+                         hour=0, minute=0, second=0, microsecond=0)
+    at = resolve_at(clock['h'], clock['m'], clock.get('period'), anchor, (days + 2) * 24)
+    if at is None or at <= now.timestamp() - 300:
+        return None
+    if (datetime.fromtimestamp(at).date() - now.date()).days > days:
+        return None
+    return at
 
 
 def find_clock(text: str):
     """返回 {"h","m","idx","length","period"} 或 None。冒号写法优先。"""
-    for match in _COLON_RE.finditer(text):
+    # 「周一一点」不能把星期中的「一」吞进小时；遮罩保持原索引。
+    scan = text
+    for pattern in (_CALENDAR_RE, _WEEKDAY_RE):
+        for date in pattern.finditer(text):
+            scan = scan[:date.start()] + " " * (date.end() - date.start()) + scan[date.end():]
+    for match in _COLON_RE.finditer(scan):
         hour, minute = int(match.group(1)), int(match.group(2))
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
             continue
@@ -191,7 +320,7 @@ def find_clock(text: str):
             "period": _find_period(text, match.start()),
         }
 
-    match = _DIFF_RE.search(text)
+    match = _DIFF_RE.search(scan)
     if match:
         # 差一刻五点 = 4:45；差五分五点 = 4:55
         offset = _MINUTE_WORDS.get(match.group(1))
@@ -205,7 +334,7 @@ def find_clock(text: str):
                 "period": _find_period(text, match.start()),
             }
 
-    for match in _POINT_RE.finditer(text):
+    for match in _POINT_RE.finditer(scan):
         if _degree_point(text, match):
             continue
         hour = cn_to_int(match.group(1))
@@ -234,7 +363,9 @@ def resolve_at(hour: int, minute: int, period: str | None,
         return None
 
     day_offset = 0
-    if period == "noon" and hour <= 2:
+    if period == "dawn" and hour == 12:
+        hour = 0
+    elif period == "noon" and hour <= 2:
         hour += 12
     elif period == "night":
         if hour <= 5 or hour == 12:
@@ -352,7 +483,7 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
         remain = _REMAIN_RE.search(text)
         if remain:
             event = _find_event(text, {"idx": remain.start(), "length": 0}, keywords)
-            if event and not _supported_day(text, remain.start(), len(remain.group())):
+            if event and not _supported_day(text, remain.start(), len(remain.group()), now=now):
                 return drop("F1", "明确其他日期，本版未登记", remain.start())
             if event and force:
                 minutes = cn_to_int(remain.group(1))
@@ -379,7 +510,10 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
     if rules.negated_by_clause(text, idx, NEGATIONS, window=4):
         return drop("N1", "否定了，这件事不会发生")
     clause = text[rules.clause_start(text, idx):rules.clause_end(text, idx + kw_len)]
-    if not _supported_day(text, idx, kw_len):
+    day = _selected_day(text, idx, kw_len, now=now)
+    future_days = max(0, min(365, int(cfg.get('future_days', 0))))
+    if ((day is not None and (day.target is None or not 0 <= (day.target - now.date()).days <= future_days))
+            or day is None and not _supported_day(text, idx, kw_len, now=now)):
         return drop("F1", "明确其他日期或未来表达，本版未登记")
     # 「如果我十二点下课」「示例：'十二点下课'」「我十二点下课的安排取消了」都不是有效约定
     if rules.is_reported_clause(text, idx):
@@ -398,7 +532,8 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
     label, kind, _event_idx, _event_len = event
     if rules.negated_by_clause(text, _event_idx, NEGATIONS, window=4):
         return drop("N1", "否定了，这件事不会发生")
-    at = resolve_at(clock["h"], clock["m"], clock["period"], now, max_hours)
+    at = (_dated_at(clock, day, now, future_days, max_hours) if day is not None
+          else resolve_at(clock["h"], clock["m"], clock["period"], now, max_hours))
     if at is None:
         return drop("T1", "这个时刻已经过去，或者太远")
 
@@ -417,6 +552,7 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
         "label": label,
         "kind": kind,
         "time_text": moment.strftime("%H:%M"),
+        "date_text": moment.strftime("%Y-%m-%d"),
         "raw": text.strip()[:20],
         "source": "gray" if force else "kw",
         "idx": idx,
@@ -542,7 +678,7 @@ def build_hint(ap: dict, shot: str, now: datetime, template: str = "") -> str:
     try:
         return body.format(
             hhmm=now.strftime("%H:%M"),
-            time_text=str(ap.get("time_text") or moment.strftime("%H:%M")),
+            time_text=(str(ap.get("date_text") or "") + " " + str(ap.get("time_text") or moment.strftime("%H:%M"))).strip(),
             label=str(ap.get("label") or ""),
             raw=str(ap.get("raw") or ""),
             n=minutes_left,

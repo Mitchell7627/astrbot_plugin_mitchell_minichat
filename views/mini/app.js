@@ -278,7 +278,7 @@
       const appointment = (() => {
         const a = it.appointment;
         if (!a || !a.at) return "—";
-        const time = a.time_text || L.fmtClock(a.at);
+        const time = [a.date_text, a.time_text || L.fmtClock(a.at)].filter(Boolean).join(' ');
         const name = a.label || "";
         const more = a.pending > 1 ? ` · 另有 ${a.pending - 1} 个` : "";
         if (a.stage === "due" && a.follow_up_at) {

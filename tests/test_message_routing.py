@@ -65,7 +65,7 @@ async def test_degree_does_not_prevent_semantic_fallback(plugin, umo, clock, mon
 ])
 @pytest.mark.parametrize("first", [True, False])
 async def test_rejected_appointment_only_blocks_its_own_clause(
-    plugin, umo, clock, monkeypatch, blocked, first
+    plugin, umo, clock, monkeypatch, blocked, first, same_day_only
 ):
     fallback = AsyncMock()
     monkeypatch.setattr(plugin.runner, "classify_with_llm", fallback)

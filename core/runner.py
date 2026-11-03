@@ -50,6 +50,10 @@ from .splitter import calc_delay, normalize_escapes, split_text
 from .decisions import DecisionLog, clip_text
 from .appointment import (
     DEFAULT_EVENTS,
+    _day_markers as appointment_day_markers,
+    _supported_day as appointment_day_supported,
+    _selected_day as appointment_selected_day,
+    _dated_at as appointment_dated_at,
     build_hint as build_appointment_hint,
     find_clock as find_appointment_clock,
     next_delay as appointment_next_delay,
@@ -868,6 +872,7 @@ class Runner:
             "followup_minutes": max(1, _as_int(eng.get("appointment_followup_minutes"), 8)),
             "max_followups": max(0, _as_int(eng.get("appointment_max_followups"), 1)),
             "max_hours": max(1, _as_int(eng.get("appointment_max_hours"), 14)),
+            "future_days": max(0, min(365, _as_int(eng.get("appointment_future_days"), 14))),
             "max_per_day": max(0, _as_int(eng.get("appointment_max_per_day"), 6)),
             "grace_minutes": APPOINTMENT_GRACE_MINUTES,
             "events": events,
@@ -1010,6 +1015,7 @@ class Runner:
             "label": str(hit.get("label") or ""),
             "kind": str(hit.get("kind") or "end"),
             "time_text": str(hit.get("time_text") or ""),
+            "date_text": str(hit.get("date_text") or ""),
             "raw": str(hit.get("raw") or ""),
             "created_at": now,
             "stage": "pending",
@@ -1036,7 +1042,7 @@ class Runner:
             f"{TAG} 记下约定：{record['time_text']} {record['label']}（原话「{record['raw']}」）"
         )
         # 结束类约定（18:00 下课）同时约束当前事件：到点就结束，不能按自己的 TTL 继续挂。
-        if record["kind"] == "end" and at > now:
+        if record["kind"] == "end" and at > now and datetime.fromtimestamp(at).date() == datetime.now().date():
             self._align_event_to_end(umo, record["label"], at, record["time_text"])
         return True
 
@@ -1336,31 +1342,35 @@ class Runner:
         """
         if not text:
             return text
-        clock = find_appointment_clock(text)
-        if not clock:
-            return text
-        idx = int(clock.get("idx") or 0)
-        head = text[max(0, idx - 4):idx]
-        # 「现在三点」「已经三点了」是在报当前时间，不是安排。
-        if any(w in head for w in ("现在", "已经", "都", "刚")):
-            return text
-        at = resolve_appointment_at(
-            int(clock.get("h") or 0), int(clock.get("m") or 0),
-            clock.get("period"), now,
-            max(1, _as_int(self.engine_cfg.get("appointment_max_hours"), 14)),
-        )
-        if at is None:
-            return text
-        # 已经到点 / 就在此刻的钟点（「我十点吃饭」在 10:00 说）不算未来安排。
-        if at <= now.timestamp() + 60:
-            return text
-        start = rules.clause_start(text, idx, None)
-        prefix = text[start:idx]
-        if prefix.strip() and self.engine.match(prefix) is not None:
-            start = idx
-        end = rules.clause_end(text, idx)
-        end = self._action_tail_start(text, idx, end)
-        return self._mask_span(text, start, end)
+        scan, clocks = text, []
+        while clock := find_appointment_clock(scan):
+            clocks.append(clock)
+            scan = self._mask_span(scan, clock["idx"], clock["idx"] + clock["length"])
+        work = text
+        for clock in sorted(clocks, key=lambda c: c["idx"]):
+            idx = clock["idx"]
+            if not work[idx:idx + clock["length"]].strip():
+                continue
+            supported = appointment_day_supported(text, idx, clock["length"], now=now)
+            if supported:
+                head = text[max(0, idx - 4):idx]
+                # 报当前钟点只跳过这个候选，不能放过后面的未来日期。
+                if any(w in head for w in ("现在", "已经", "都", "刚")):
+                    continue
+                at = resolve_appointment_at(
+                    clock["h"], clock["m"], clock.get("period"), now,
+                    max(1, _as_int(self.engine_cfg.get("appointment_max_hours"), 14)),
+                )
+                if at is None or at <= now.timestamp() + 60:
+                    continue
+            # 非本日日期即使写的是当前钟点，也不能成为「正在做」。
+            start = rules.clause_start(text, idx, None)
+            prefix = text[start:idx]
+            if prefix.strip() and self.engine.match(prefix) is not None:
+                start = idx
+            end = self._action_tail_start(text, idx, rules.clause_end(text, idx))
+            work = self._mask_span(work, start, end)
+        return work
 
     def _action_tail_start(self, text: str, start: int, end: int) -> int:
         """未来分句后面又接了一件「现在正在做」的事时，返回那件事的起点。
@@ -1416,6 +1426,7 @@ class Runner:
         spans = [(marker.start(), marker.end() if explicit else marker.start() + 1)]
         if clock:
             spans.append((clock["idx"], clock["idx"] + clock["length"]))
+        spans.extend((m.start, m.end) for m in appointment_day_markers(value, datetime.now()))
         remaining = value
         for start, end in sorted(spans, reverse=True):
             remaining = remaining[:start] + " " * (end - start) + remaining[end:]
@@ -1453,10 +1464,17 @@ class Runner:
                     or rules.is_question_clause(text, anchor, kw_len=len(marker.group()))
                     or rules.is_third_person_clause(text, anchor)
                     or rules.is_second_person_clause(text, anchor)
-                    or rules.is_future_clause(text, anchor)
-                    or rules.is_far_past_clause(text, anchor)):
+                    or (rules.is_far_past_clause(text, anchor)
+                        and not appointment_day_markers(value, datetime.now()))):
                 continue
             clock = find_appointment_clock(value)
+            date_idx = clock["idx"] if clock else marker.start()
+            date_len = clock["length"] if clock else len(marker.group())
+            day = appointment_selected_day(text, clause.start() + date_idx, date_len, now=datetime.now())
+            if day is not None and day.target is None:
+                continue
+            if day is None and not appointment_day_supported(text, clause.start() + date_idx, date_len, now=datetime.now()):
+                continue
             described, cancel_all, unknown_item = self._cancel_target(value, marker, clock, all_words)
             if marker.group() in ("不用了", "不要了", "算了") and not (
                 clock or described or cancel_all or re.search(r"这个|那个|这条|那条|这件事", value)
@@ -1469,8 +1487,13 @@ class Runner:
                     continue
                 if item.get("stage") == "done":
                     continue
+                moment = datetime.fromtimestamp(_as_float_safe(item.get("original_at") or item.get("at")))
+                if day is not None:
+                    target = appointment_dated_at(clock, day, datetime.now(), 365) if clock else None
+                    target_day = datetime.fromtimestamp(target).date() if target else day.target
+                    if moment.date() != target_day:
+                        continue
                 if clock:
-                    moment = datetime.fromtimestamp(_as_float_safe(item.get("original_at") or item.get("at")))
                     # 与登记共用时段与日期归一；以登记日零点为锚点。
                     anchor_day = moment.replace(hour=0, minute=0, second=0, microsecond=0)
                     if clock.get("period") == "night" and (clock["h"] == 12 or clock["h"] <= 5):
@@ -1546,6 +1569,7 @@ class Runner:
             })
             self._appt_candidate = {
                 "text": text.strip(),
+                "reference_at": time.time(),
                 "snapshot": copy.deepcopy(self.store.get(umo, APPOINTMENT_KEY)),
             }
             return False, None
@@ -2567,9 +2591,10 @@ class Runner:
         if cand.get("snapshot") != self.store.get(umo, APPOINTMENT_KEY):
             logger.info(f"{TAG} 约定灰度放弃：等模型期间约定已经变了")
             return
-        result = parse_appointment(text, datetime.now(), self._appointment_cfg(), force=True)
+        reference = datetime.fromtimestamp(_as_float_safe(cand.get("reference_at")) or time.time())
+        result = parse_appointment(text, reference, self._appointment_cfg(), force=True)
         hit = result.get("hit")
-        if not hit:
+        if not hit or hit['at'] <= time.time() - 300:
             logger.info(f"{TAG} 约定灰度答 YES 但落不出时刻：「{text[:16]}」")
             return
         before = self._snapshot(umo)

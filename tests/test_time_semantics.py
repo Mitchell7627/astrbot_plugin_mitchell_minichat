@@ -24,7 +24,7 @@ def test_quantity_nouns(text):
 
 
 @pytest.mark.parametrize('text', ['我今天决定明天下午三点开会', '我今天确认后天下午三点开会', '今天刚定好明天下午三点开会'])
-def test_explicit_later_day_with_today_in_same_clause(plugin, umo, clock, text):
+def test_explicit_later_day_with_today_in_same_clause(plugin, umo, clock, text, same_day_only):
     plugin.runner.update_from_message(umo, text)
     assert not plugin.runner._appointments(umo)
 
@@ -121,7 +121,7 @@ def test_clock_structure_controls(text, h, m):
     "我今天决定下周下午三点开会", "我昨天决定明天下午三点开会",
     "我今天下午三点开会改到明天",
 ])
-def test_unsupported_day_has_truthful_reject_record(plugin, umo, clock, text):
+def test_unsupported_day_has_truthful_reject_record(plugin, umo, clock, text, same_day_only):
     plugin.runner.update_from_message(umo, text)
     assert not plugin.runner._appointments(umo)
     records = [x for x in plugin.runner.decisions.items(umo) if x["rule"] == "F1"]
@@ -138,7 +138,7 @@ def test_today_and_explicit_day_correction_controls(plugin, umo, clock, text):
 
 
 @pytest.mark.parametrize("first", [True, False])
-async def test_rejected_date_does_not_starve_current_activity(plugin, umo, clock, monkeypatch, first):
+async def test_rejected_date_does_not_starve_current_activity(plugin, umo, clock, monkeypatch, first, same_day_only):
     classifier = AsyncMock(return_value={"name": "shower", "done": False})
     monkeypatch.setattr(plugin.runner, "classify_text", classifier)
     parts = ["我今天决定明天下午三点开会", "我现在去冲个澡"]

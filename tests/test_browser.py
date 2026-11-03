@@ -74,6 +74,11 @@ async def test_task_page_diagnostics_and_delivery_states(plugin, umo, monkeypatc
                 await cancel_row.locator('[data-op="undo"]').click()
                 await expect(cancel_row).to_contain_text("已撤销")
                 assert r._appointments(umo) == original
+                r._clear_appointment(umo)  # 下一阶段单独检查最近一条跨日约定的日期显示。
+                r.update_from_message(umo, "我明天下午四点下课")
+                await page.reload()
+                await page.locator('[data-tab="tasks"]').click()
+                await expect(page.locator("#task-list")).to_contain_text("2026-11-03", timeout=15000)
                 await expect(page.locator("#task-list")).to_contain_text("排程原因")
                 await (
                     page.locator("#task-list details")

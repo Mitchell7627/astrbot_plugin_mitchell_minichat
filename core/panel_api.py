@@ -297,6 +297,7 @@ class PanelService:
                 "at": item.get("at"),
                 "label": item.get("label"),
                 "time_text": item.get("time_text"),
+                "date_text": item.get("date_text"),
                 "kind": item.get("kind"),
                 "stage": item.get("stage"),
                 "raw": item.get("raw"),
