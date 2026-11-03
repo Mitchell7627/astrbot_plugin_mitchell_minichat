@@ -558,6 +558,13 @@ class PanelService:
             for c in changed
         )
 
+        if 'web_panel.password' in changed:
+            panel = getattr(self.plugin, 'panel_http', None)
+            if panel is not None:
+                # 原生插件页也能保存密码；每次成功修改都撤销旧凭据，
+                # 即使两次修改之间没有访问独立面板，恢复旧密码也不能复活旧token。
+                panel._sync_auth()
+
         # 插件以禁用状态启动时根本没有 Runner：面板里把 enable 打开并保存，
         # 以前只回一句「无需重载」，实际什么都没起来，用户以为开了。
         enable_changed = any(c == "friend_settings.enable" for c in changed)

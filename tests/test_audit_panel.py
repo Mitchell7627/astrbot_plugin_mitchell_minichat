@@ -62,6 +62,17 @@ async def test_password_change_revokes_existing_sessions(plugin):
         assert (await c.post('/api/login', json={'password': 'new-audit-password'})).status_code == 200
 
 
+async def test_restoring_password_cannot_resurrect_old_tokens_between_native_saves(plugin):
+    plugin.config['web_panel']['password'] = 'old-audit-password'
+    async with client(plugin) as c:
+        token = (await c.post('/api/login', json={'password': 'old-audit-password'})).json()['data']['token']
+        # AstrBot的原生插件页直接调用业务层，两次保存之间没有HTTP面板请求。
+        await plugin.panel_service.config_save({'patch': {'web_panel': {'password': 'new-audit-password'}}})
+        await plugin.panel_service.config_save({'patch': {'web_panel': {'password': 'old-audit-password'}}})
+        c.cookies.clear()
+        assert (await c.get('/api/tasks', headers={'Authorization': 'Bearer ' + token})).status_code == 401
+
+
 async def test_failed_configuration_save_does_not_apply_in_memory(plugin, monkeypatch):
     before = copy.deepcopy(dict(plugin.config))
     monkeypatch.setattr(plugin.config, 'save_config_async', AsyncMock(side_effect=OSError('disk full')))

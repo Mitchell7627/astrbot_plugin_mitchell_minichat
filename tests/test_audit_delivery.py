@@ -94,6 +94,35 @@ async def test_cancelled_config_save_restores_configuration(plugin, monkeypatch)
     assert dict(plugin.config) == before
 
 
+async def test_failed_save_cannot_roll_back_a_later_successful_save(plugin, monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+    original_minimum = plugin.friend_cfg['schedule_settings']['min_interval_minutes']
+
+    async def persist():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+            raise OSError('first save failed')
+
+    monkeypatch.setattr(plugin.config, 'save_config_async', persist)
+    first = asyncio.create_task(plugin.panel_service.config_save({'patch': {
+        'friend_settings': {'schedule_settings': {'min_interval_minutes': 10}},
+    }}))
+    await asyncio.wait_for(entered.wait(), 2)
+    second = asyncio.create_task(plugin.panel_service.config_save({'patch': {
+        'friend_settings': {'schedule_settings': {'max_interval_minutes': 200}},
+    }}))
+    await asyncio.sleep(0)
+    release.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+    assert isinstance(results[0], PanelError) and results[1]['saved']
+    assert plugin.friend_cfg['schedule_settings']['min_interval_minutes'] == original_minimum
+    assert plugin.friend_cfg['schedule_settings']['max_interval_minutes'] == 200
+
+
 async def test_enable_cycle_invalidates_pending_work_and_restarts_scheduling(plugin, umo, clock, monkeypatch):
     runner = plugin.runner
     runner.started = True
