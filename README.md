@@ -21,7 +21,7 @@
   <a href="#错误反馈与建议">反馈与建议</a>
 </p>
 
-<img src="docs/assets/minichat-banner.svg" width="960" alt="Mini 主动陪伴：知道你在忙，也记得什么时候找你">
+<img src="docs/assets/minichat-banner.svg?v=3" width="960" alt="Mini 主动陪伴：知道你在忙，也记得什么时候找你">
 
 <a href="https://count.getloli.com/@mitchell7627-minichat">
   <img src="https://count.getloli.com/@mitchell7627-minichat?theme=moebooru&amp;padding=6&amp;offset=0&amp;align=bottom&amp;scale=0.85&amp;pixelated=1&amp;darkmode=auto" width="680" alt="猫娘举牌访问计数">
