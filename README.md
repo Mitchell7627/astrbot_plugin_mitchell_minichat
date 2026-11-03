@@ -1,6 +1,6 @@
 # 主动私聊Mini（astrbot_plugin_mitchell_minichat）
 
-> 版本 **v0.2.12** ｜ 仅支持 **aiocqhttp（QQ）私聊** ｜ MIT
+> 版本 **v0.2.13** ｜ 仅支持 **aiocqhttp（QQ）私聊** ｜ MIT
 
 > **反馈**：遇到问题请到 [GitHub Issues](https://github.com/Mitchell7627/astrbot_plugin_mitchell_minichat/issues) 提交，并附上 AstrBot 版本、插件版本和相关日志。
 
@@ -371,7 +371,7 @@
 
 ## 开发与测试
 
-开发安装、离线回放、诊断接口、跨功能回归和回滚步骤见 [开发验证说明](docs/validation.md)。v0.2.12 修正跨语境及异步状态冲突，不更改用户的聊天频率或私人提示词。
+开发安装、离线回放、诊断接口、跨功能回归和回滚步骤见 [开发验证说明](docs/validation.md)。v0.2.13 修复程度词误入约定后拦截其他分句、以及结束事件与判定记录不一致的问题，不更改用户的聊天频率或私人提示词。
 
 ```bash
 python3.12 -m venv .venv

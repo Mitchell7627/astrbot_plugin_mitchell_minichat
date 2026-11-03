@@ -114,6 +114,23 @@ def _find_period(text: str, start: int):
     return best[1] if best else None
 
 
+def _degree_point(text: str, match: re.Match) -> bool:
+    """「快一点 / 一点都不」不是 1:00；「一点半 / 下午一点」仍是钟点。"""
+    if match.group(1) != "一" or match.group(2) or match.group(3):
+        return False
+    head = text[rules.clause_start(text, match.start()):match.start()].rstrip()
+    tail = text[match.end():].lstrip()
+    if tail.startswith(("都", "也", "点", "儿")):
+        return True
+    if any(head.endswith(word) for words, _ in _PERIOD_WORDS for word in words):
+        return False
+    return head.endswith((
+        "快", "慢", "轻", "重", "早", "晚", "多", "少", "大", "小",
+        "好", "坏", "高", "低", "远", "近", "深", "浅", "长", "短",
+        "暖", "冷", "热", "直白", "清楚", "明确", "详细", "色",
+    ))
+
+
 def find_clock(text: str):
     """返回 {"h","m","idx","length","period"} 或 None。冒号写法优先。"""
     match = _COLON_RE.search(text)
@@ -141,25 +158,26 @@ def find_clock(text: str):
                 "period": _find_period(text, match.start()),
             }
 
-    match = _POINT_RE.search(text)
-    if not match:
-        return None
-    hour = cn_to_int(match.group(1))
-    if hour is None:
-        return None
-    if match.group(2):
-        minute = _MINUTE_WORDS.get(match.group(2))
-    elif match.group(3):
-        minute = cn_to_int(match.group(3))
-    else:
-        minute = 0
-    if minute is None or not (0 <= hour <= 23 and 0 <= minute <= 59):
-        return None
-    return {
-        "h": hour, "m": minute, "idx": match.start(),
-        "length": match.end() - match.start(),
-        "period": _find_period(text, match.start()),
-    }
+    for match in _POINT_RE.finditer(text):
+        if _degree_point(text, match):
+            continue
+        hour = cn_to_int(match.group(1))
+        if hour is None:
+            continue
+        if match.group(2):
+            minute = _MINUTE_WORDS.get(match.group(2))
+        elif match.group(3):
+            minute = cn_to_int(match.group(3))
+        else:
+            minute = 0
+        if minute is None or not (0 <= hour <= 23 and 0 <= minute <= 59):
+            continue
+        return {
+            "h": hour, "m": minute, "idx": match.start(),
+            "length": match.end() - match.start(),
+            "period": _find_period(text, match.start()),
+        }
+    return None
 
 
 def resolve_at(hour: int, minute: int, period: str | None,
@@ -238,9 +256,13 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
     force=True 是灰度答 YES 之后用：跳过「模糊」这一关，尽量落一个时刻。
     """
     out = {"hit": None, "gray": None, "dropped": []}
+    clock = None
 
     def drop(rule, reason):
-        out["dropped"].append({"rule": rule, "reason": reason})
+        idx = clock["idx"] if clock else None
+        if idx is None and (question := _WHEN_ASK_RE.search(text)):
+            idx = question.start()
+        out["dropped"].append({"rule": rule, "reason": reason, "idx": idx})
         return out
 
     if not text or not text.strip():
@@ -268,7 +290,7 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
                     }
                     return out
             if event:
-                out["gray"] = {"text": text, "reason": "剩余时长需推算", "kind": "remain"}
+                out["gray"] = {"text": text, "reason": "剩余时长需推算", "kind": "remain", "idx": remain.start()}
         return out
 
     idx = clock["idx"]
@@ -276,7 +298,7 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
 
     if rules.is_question_clause(text, idx, kw_len=kw_len):
         return drop("Q1", "疑问句，分不清是问他还是说约定")
-    if rules.is_third_person_subject(text, idx):
+    if rules.is_third_person_clause(text, idx) or rules.is_second_person_clause(text, idx):
         return drop("P1", "说的是别人的事")
     if rules.negated_by_clause(text, idx, NEGATIONS, window=4):
         return drop("N1", "否定了，这件事不会发生")
@@ -297,6 +319,8 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
         return drop("E1", "有时间但没有对应的事")
 
     label, kind, _event_idx, _event_len = event
+    if rules.negated_by_clause(text, _event_idx, NEGATIONS, window=4):
+        return drop("N1", "否定了，这件事不会发生")
     at = resolve_at(clock["h"], clock["m"], clock["period"], now, max_hours)
     if at is None:
         return drop("T1", "这个时刻已经过去，或者太远")
@@ -305,8 +329,9 @@ def parse(text: str, now: datetime, cfg: dict, force: bool = False):
     if kind not in ("end", "arrive") and (seconds >= 23 * 3600 or seconds < 7 * 3600):
         return drop("M1", "深夜，不吵醒他")
 
-    if _VAGUE_RE.search(text) and not force:
-        out["gray"] = {"text": text, "reason": "时间说法模糊", "kind": "vague"}
+    clause = text[rules.clause_start(text, idx):rules.clause_end(text, idx + kw_len)]
+    if _VAGUE_RE.search(clause) and not force:
+        out["gray"] = {"text": text, "reason": "时间说法模糊", "kind": "vague", "idx": idx}
         return out
 
     moment = datetime.fromtimestamp(at)

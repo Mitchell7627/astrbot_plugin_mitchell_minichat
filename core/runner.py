@@ -144,6 +144,9 @@ class Runner:
             limit=_as_int((plugin.engine_cfg or {}).get("decision_log_size"), 50),
         )
         self._dec_buffer: list[dict] = []
+        # 只把本轮尚未处理且通过语境检查的片段交给普通语义识别。
+        self._llm_candidate: dict | None = None
+        self._message_text = ""
         # 约定灰度的候选（与事件灰区分开，配额也分开）
         self._appt_candidate: dict | None = None
         # 约定灰度独立配额，不吃事件灰度的额度
@@ -202,6 +205,7 @@ class Runner:
 
     async def stop(self) -> None:
         self._stopped = True
+        self._llm_candidate = None
         self.started = False
         for task in list(self.timers.values()):
             task.cancel()
@@ -1473,6 +1477,7 @@ class Runner:
                 "verdict": "reject",
                 "rule": item.get("rule") or "",
                 "reason": item.get("reason") or "",
+                "idx": item.get("idx"),
             })
         if result["gray"]:
             self._dec_buffer.append({
@@ -1481,6 +1486,7 @@ class Runner:
                 "verdict": "gray",
                 "rule": "A1",
                 "reason": result["gray"].get("reason") or "判不准",
+                "idx": result["gray"].get("idx"),
             })
             self._appt_candidate = {
                 "text": text.strip(),
@@ -2097,6 +2103,8 @@ class Runner:
                 "verdict": hit.get("verdict") or "accept",
                 "rule": hit.get("gate_rule") or "",
                 "reason": hit.get("reason") or "",
+                "idx": hit.get("idx"),
+                "applied": hit.get("applied", True),
             })
         for d in detail.get("dropped") or []:
             if isinstance(d, dict) and d.get("kw"):
@@ -2107,6 +2115,7 @@ class Runner:
                     "rule": d.get("rule") or "",
                     "reason": d.get("reason") or "",
                     "name": d.get("name") or "",
+                    "idx": d.get("idx"),
                 })
 
     def _flush_decisions(self, umo: str, text: str, before: dict, handled: bool) -> bool:
@@ -2119,7 +2128,8 @@ class Runner:
         # G1（后面接评价）是结构性灰区，问也是浪费 token。
         # 本句已经确认了事件的话就别再问：模型答 YES 会把刚记下的事件覆盖掉。
         has_accept_event = any(
-            d.get("verdict") == "accept" and d.get("kind") == "event" for d in buf
+            d.get("applied", d.get("verdict") == "accept")
+            and d.get("kind") == "event" for d in buf
         )
         self._gray_candidate = None
         for d in buf:
@@ -2153,7 +2163,7 @@ class Runner:
             if sig in seen:
                 continue
             seen.add(sig)
-            applied = d["verdict"] == "accept"
+            applied = d.get("applied", d["verdict"] == "accept")
             rec = {
                 "id": round(stamp + i * 0.001, 3),
                 "ts": stamp,
@@ -2178,8 +2188,55 @@ class Runner:
                 granted = True
             self.decisions.add(rec)
         self.decisions.maybe_save()
-        # 有判定记录就说明这句话已经被「处理过」，别让 main.py 再用大提示重判一次
+        # 保持旧布尔接口；能否再问模型由一次性的剩余片段候选决定。
         return True
+
+    def _offer_llm_candidate(self, umo: str, remaining: str) -> None:
+        """拒绝只保护所在分句；已消费部分不再送回模型。索引始终对齐原消息。"""
+        original = self._message_text
+        clauses = []
+        rejected = [
+            d for d in self._dec_buffer
+            if not d.get("applied", d.get("verdict") == "accept")
+        ]
+        # 缺少位置的旧式判定仍按保守规则处理，不能猜它否决了哪一段。
+        if any(d.get("idx") is None for d in rejected):
+            return
+        for match in re.finditer(rf"[^{re.escape(rules.CLAUSE_BOUNDARY)}]+", remaining):
+            value = match.group().strip()
+            if not value or not self._looks_active(value):
+                continue
+            start = match.start() + len(match.group()) - len(match.group().lstrip())
+            end = match.end()
+            if any(start <= int(d["idx"]) < end for d in rejected):
+                continue
+            hint = re.search("|".join(map(re.escape, self.ACTIVE_HINTS)), remaining[start:end])
+            anchor = min(end - 1, start + hint.end()) if hint else end - 1
+            if (not rules.is_self_action_clause(original, anchor)
+                    or rules.is_second_person_clause(original, anchor)
+                    or rules.is_third_person_subject(
+                        original, anchor, _split_nicknames(self.engine_cfg.get("bot_nicknames"))
+                    )
+                    or rules.negated_by_clause(
+                        original, end, self.engine._negations, window=end - start
+                    )):
+                continue
+            clauses.append(value)
+        if clauses:
+            self._llm_candidate = {
+                "umo": umo, "text": "，".join(clauses),
+                "turn_seq": _as_int(self.store.get(umo, "turn_seq"), 0),
+            }
+
+    def take_llm_candidate(self, umo: str) -> dict | None:
+        """消息入口同步取走；其他会话、旧消息和灰区复核不能借用这份候选。"""
+        candidate = self._llm_candidate
+        if not candidate or candidate["umo"] != umo:
+            return None
+        self._llm_candidate = None
+        if self._gray_candidate or not self._result_current(umo, candidate["turn_seq"]):
+            return None
+        return candidate
 
     def undo_decision(self, did) -> dict:
         """撤销一条判定：把这句话改过的状态整条还原。"""
@@ -2490,8 +2547,10 @@ class Runner:
     def update_from_message(self, umo: str, text: str) -> bool:
         """根据消息更新事件与在场状态。返回 False 表示什么都没认出。
         外层只做两件事：进门前拍快照、出门后落判定记录（含一键撤销要用的 before/after）。
-        真正的判定顺序在 `_update_inner`，一行没动。
+        真正的判定顺序在 `_update_inner`；后备候选另由消息入口同步取走。
         """
+        self._llm_candidate = None
+        self._message_text = text
         if not text:
             return False
         # 每条消息一个序号：语义识别是异步的，回来时要靠它判断结果是否已经过期
@@ -2755,10 +2814,8 @@ class Runner:
 
         # 结束词（带闸门：「吃完了的时候」这种名词化不算结束）
         stop = self.engine.stop_detail(event, text) if isinstance(event, dict) else {"stopped": False, "dropped": []}
-        if stop.get("stopped"):
-            self._note("stop", {"hit": stop, "dropped": stop.get("dropped") or []})
-        else:
-            self._note("stop", {"hit": None, "dropped": stop.get("dropped") or []})
+        # 命中不等于已执行：加速或做饭交接分支可能保留/替换当前事件。
+        self._note("stop", {"hit": None, "dropped": stop.get("dropped") or []})
         stopping = bool(stop.get("stopped"))
 
         # 命中加速词、而这句话本来会结束当前事件（典型：「快吃完了」含结束词「吃完」）：
@@ -2800,6 +2857,10 @@ class Runner:
         if stopping:
             store.pop(umo, "active_event")
             self._sync_together_until(umo, closing=True)
+            executed = {**stop, "applied": True}
+            if stop.get("verdict") == "gray":
+                executed["reason"] = f"{stop.get('reason') or '灰区结束词'}；按结束信号执行"
+            self._note("stop", {"hit": executed})
             logger.info(f"{TAG} 事件结束：{event.get('label')}")
             # 「吃完了，我正在洗澡」「吃完了我正在洗澡」：只消费结束词本身，
             # 剩下的新动作继续回炉；无标点时也不会连新谓语一起抹掉。
@@ -2820,6 +2881,7 @@ class Runner:
         self._note("event", {"hit": md if md.get("rule") else None, "dropped": md.get("dropped") or []})
         rule = md["rule"]
         if rule is None:
+            self._offer_llm_candidate(umo, text)
             return None, False
 
         if isinstance(event, dict) and event.get("name") == rule.get("name"):

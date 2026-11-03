@@ -14,6 +14,8 @@ from playwright.async_api import async_playwright, expect
 async def test_task_page_diagnostics_and_delivery_states(plugin, umo, monkeypatch):
     executable = os.environ.get("MINICHAT_CHROMIUM") or shutil.which("chromium")
     r = plugin.runner
+    r.update_from_message(umo, "我正在洗澡")
+    r.update_from_message(umo, "我要吹头")
     r.started = True
     r._trace_schedule(
         umo, "sample", [{"reason": "sample", "minutes": 20}], next_at=1234567890
@@ -48,6 +50,15 @@ async def test_task_page_diagnostics_and_delivery_states(plugin, umo, monkeypatc
                 await page.route("**/*", local_only)
                 await page.goto(f"http://127.0.0.1:{port}/")
                 await page.locator('[data-tab="tasks"]').click()
+                await page.locator('#task-list details').filter(
+                    has=page.locator("summary", has_text="最近判定")
+                ).locator("summary").click()
+                stop_row = page.locator("#task-list .log-row").filter(has_text="结束·吹头")
+                await expect(stop_row.locator(".badge")).to_have_text("已记录")
+                await expect(stop_row).to_contain_text("按结束信号执行")
+                await stop_row.locator('[data-op="undo"]').click()
+                await expect(stop_row).to_contain_text("已撤销")
+                assert plugin.store.get(umo, "active_event")["name"] == "shower"
                 await expect(page.locator("#task-list")).to_contain_text("排程原因")
                 await (
                     page.locator("#task-list details")
@@ -78,7 +89,7 @@ async def test_task_page_diagnostics_and_delivery_states(plugin, umo, monkeypatc
                 ).to_be_visible()
                 assert not errors
                 await page.screenshot(
-                    path="/tmp/minichat-task-page.png", full_page=True
+                    path=str(plugin.data_dir / "minichat-task-page.png"), full_page=True
                 )
             finally:
                 await browser.close()

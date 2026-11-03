@@ -203,6 +203,8 @@ def is_question_clause(text: str, idx: int, kw_len: int = 0, window: int = 14) -
     """命中词所在分句是不是疑问句（「吃了吗」「开会开到几点」）。"""
     start = clause_start(text, idx, window)
     end = clause_end(text, idx + kw_len)
+    if end < len(text) and text[end] in "？?":
+        return True
     clause = text[start:end]
     if any(m in clause for m in QUESTION_MARKS):
         return True
