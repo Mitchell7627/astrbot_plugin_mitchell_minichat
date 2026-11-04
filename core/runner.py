@@ -63,6 +63,7 @@ from .appointment import (
     stage_of as appointment_stage,
     wake_target_is_self,
     _alternative_clock as appointment_alternative_clock,
+    cancellation_view as appointment_cancellation_view,
 )
 
 TAG = "[Minichat]"
@@ -191,16 +192,14 @@ class Runner:
     def is_confirmation(text: str) -> bool:
         # 仅完整确认短句可沿用先前意图；疑问或附带新动作仍必须使旧结果失效。
         # 自定义关键词先走规则，是否中性还会核对候选及实际状态变化。
-        normalized = text.strip().strip('。！!～~ ').casefold()
-        # 仅允许完整的确认/安抚表达及有限语气词；不按长度放行任意短句。
-        # 取消、改口、自定义关键词仍先走原规则和状态变化校验。
-        if re.fullmatch(r'(?:不错|没关系|别急|还行|不着急|慢慢来)(?:呀|啊|啦|哦|喔|呢|嘛|吧)?', normalized):
-            return True
-        return normalized in (
-            '我知道了', '知道了', '知道啦', '收到啦', '收到', '明白了',
-            '好的', '好哒', '嗯嗯', '嗯', '你好',
-            '好', '对啊', '嗯呢', '行', '可以', 'ok',
-        )
+        normalized = text.strip().casefold()
+        # 只组合已知确认/安抚原子，允许语气词、分隔符及末尾表情；不按长度放行。
+        atom = (r'(?:我知道了|知道了|知道啦|收到啦|收到|明白了|好的|好哒|'
+                r'嗯嗯|嗯|你好|好|对啊|嗯呢|行|可以|ok|不错|没关系|没事|'
+                r'别着急|别急|还行|不着急|慢慢来)(?:呀|啊|啦|哦|喔|呢|嘛|吧|的){0,2}')
+        emoji = r'[\U0001f300-\U0001faff\u2600-\u27bf\ufe0f\u200d]'
+        return bool(re.fullmatch(r'[。！!～~ ]*' + atom +
+            r'(?:[，,、。！!～~\s]+' + atom + r')*[。！!～~\s]*(?:' + emoji + r'[。！!～~\s]*)*', normalized))
 
     def _semantic_current(self, umo: str, seq: int) -> bool:
         if not self._result_current(umo):
@@ -1483,7 +1482,7 @@ class Runner:
         remaining = re.sub(
             r"(?:这个|那个|这条|那条|这件事|原来的|全部|所有|约定|安排|提醒|预约|"
             r"凌晨|早上|早晨|上午|中午|正午|下午|午后|傍晚|晚上|夜里|今晚|晚间|今天|今早|"
-            r"已经|现在|刚刚|刚才|确定|决定|成功|参加|举行|我|把|将|给|的|都|先|已|去|了|啦|咯|呀|啊|吧)",
+            r"原计划|本来|原本|已经|现在|刚刚|刚才|确定|决定|成功|参加|举行|我|把|将|给|的|都|先|已|去|了|啦|咯|呀|啊|吧)",
             "", remaining,
         )
         unknown_item = bool(remaining.strip())
@@ -1497,12 +1496,13 @@ class Runner:
             return False, text
         all_words = {w for words in DEFAULT_EVENTS.values() for w in words}
         all_words.update(w for words in self._APPOINTMENT_ALIASES.values() for w in words)
-        for clause in re.finditer(r"[^，,。！？!?；;\n]+", text):
+        for clause in re.finditer(r"[^，,。！？!?；;\n]+", appointment_cancellation_view(text)):
             value = clause.group()
-            marker = re.search(r"取消(?:掉)?|不用了|不要了|算了|(?:不用|不要|不必|别|不再)(?=[^，,。！？!?；;\n]{0,24}(?:叫醒|喊醒|起床|起来))|不(?:去|开|上|办|参加|举行|回|到)", value)
+            marker = re.search(r"取消(?:掉)?|不用了|不要了|算了|(?:不用|不要|不必|别|不再)(?=[^，,。！？!?；;\n]{0,24}(?:叫醒|喊醒|起床|起来|提醒|通知))|不(?:去|开|上|办|参加|举行|回|到)", value)
             if marker is None or not self._cancel_action_confirmed(value, marker):
                 continue
-            wake_cancel = marker.group() in ('不用', '不要', '不必', '别', '不再')
+            stop_notice = marker.group() in ('不用', '不要', '不必', '别', '不再') and bool(re.match(r'(?:再)?(?:提醒|通知)(?:我)?(?:了)?[呀啊吧啦\s]*$', value[marker.end():]))
+            wake_cancel = marker.group() in ('不用', '不要', '不必', '别', '不再') and not stop_notice
             if wake_cancel:
                 wake = re.search(r'叫醒|喊醒|起床|起来', value)
                 normalized = value.rstrip('了啦吧呀啊哦喔 ')

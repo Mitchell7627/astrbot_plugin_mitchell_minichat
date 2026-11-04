@@ -609,6 +609,32 @@ def _alternative_clock(text, clock):
     return False
 
 
+def cancellation_view(text: str, keywords=None) -> str:
+    """等长视图：只把具体计划后紧邻的纯取消分句并回原事项，不改变日志和索引。"""
+    parts = list(re.finditer(r'[^，,。！？!?；;\n]+', text))
+    result = list(text)
+    for left, right in zip(parts, parts[1:]):
+        if text[left.end():right.start()] not in ('，', ','):
+            continue
+        clock = find_clock(left.group())
+        if not clock or not _find_event(left.group(), clock, keywords or DEFAULT_EVENTS):
+            continue
+        match = re.fullmatch(r'\s*(?:(?:但是|不过|后来|现在|结果|已经|其实|最终|但)\s*)*(?P<cancel>取消了|不用去了|不去了|不用参加了|不参加了|不用提醒我了)[呀啊啦\s]*', right.group())
+        if not match:
+            continue
+        idx = left.start() + clock['idx']
+        anchor = right.start() + match.start('cancel')
+        if any((is_guard(text, idx) or is_guard(text, anchor)) for is_guard in (
+                rules.is_reported_clause, rules.is_third_person_clause,
+                rules.is_second_person_clause, rules.is_conditional_clause,
+                rules.is_dream_clause)) or rules.is_question_clause(text, anchor, kw_len=len(match['cancel'])):
+            continue
+        for i in range(left.end(), right.end()):
+            result[i] = ' '
+        result[anchor:anchor+2] = '取消'
+    return ''.join(result)
+
+
 def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candidate=None):
     """解析一句话。
 
@@ -684,7 +710,7 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
         return drop("R1", "是转述/示例，不是本人约定")
     if rules.is_conditional_clause(text, idx):
         return drop("C1", "是假设，不是真实安排")
-    if rules.is_cancelled_clause(text, idx, kw_len=kw_len, window=None):
+    if rules.is_cancelled_clause(cancellation_view(text, keywords), idx, kw_len=kw_len, window=None):
         return drop("X1", "这个安排取消了")
     if re.search(r"(下课|放学|下班|收工|散会|考完|结束|到家|到了)[了啦咯喽]", clause):
         return drop("D1", "已经发生了")
@@ -742,6 +768,8 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
             intent = intent.replace(word, ' ' * len(word))
     if re.search(r'(?<!不是)(?:不打算|没(?:有)?打算|不准备|没(?:有)?准备|不计划|没(?:有)?计划|没(?:有)?说(?:过)?|从未说(?:过)?|不曾说(?:过)?)[\s我自己在要会再就]*$', intent):
         return drop('N1', '否定计划或否认说过，不建立约定')
+    if re.search(r'(?:不确定|尚未确定|还没确定|未确定|没(?:有)?决定|尚未决定|还没决定|可能|也许|或许|未必|不一定|大概)(?:\s|我|自己|在|要|会|再|就|去|参加|是否)*$', intent):
+        return drop('N1', '计划尚未确定，不建立约定')
     suffix = text[_event_idx + _event_len:rules.clause_end(text, _event_idx + _event_len)].strip()
     if re.match(r'(?:不成了|办不成了|开不成了|行不通了)', suffix):
         return drop('N1', '安排未能成立，不建立约定')
@@ -925,3 +953,4 @@ def build_hint(ap: dict, shot: str, now: datetime, template: str = "") -> str:
             raw=str(ap.get("raw") or ""),
             n=minutes_left,
         ) if "{" not in body else body
+

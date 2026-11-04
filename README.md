@@ -203,7 +203,7 @@ Release 中的 `.zip.sha256` 是对应 ZIP 安装包的校验文件，记录该�
 下载 ZIP 和同名 `.zip.sha256` 后，用文本编辑器打开校验文件，再计算 ZIP 的摘要进行比较。例如在 Windows PowerShell 中：
 
 ```powershell
-Get-FileHash .\astrbot_plugin_mitchell_minichat_v0.3.3.zip -Algorithm SHA256
+Get-FileHash .\astrbot_plugin_mitchell_minichat_v0.3.4.zip -Algorithm SHA256
 ```
 
 将输出的 `Hash` 与校验文件中的摘要比较（大小写不影响结果）；一致表示校验通过，不一致则应重新下载并核对版本。
