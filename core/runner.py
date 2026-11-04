@@ -191,7 +191,12 @@ class Runner:
     def is_confirmation(text: str) -> bool:
         # 仅完整确认短句可沿用先前意图；疑问或附带新动作仍必须使旧结果失效。
         # 自定义关键词先走规则，是否中性还会核对候选及实际状态变化。
-        return text.strip().strip('。！!～~ ').casefold() in (
+        normalized = text.strip().strip('。！!～~ ').casefold()
+        # 仅允许完整的确认/安抚表达及有限语气词；不按长度放行任意短句。
+        # 取消、改口、自定义关键词仍先走原规则和状态变化校验。
+        if re.fullmatch(r'(?:不错|没关系|别急|还行|不着急|慢慢来)(?:呀|啊|啦|哦|喔|呢|嘛|吧)?', normalized):
+            return True
+        return normalized in (
             '我知道了', '知道了', '知道啦', '收到啦', '收到', '明白了',
             '好的', '好哒', '嗯嗯', '嗯', '你好',
             '好', '对啊', '嗯呢', '行', '可以', 'ok',
