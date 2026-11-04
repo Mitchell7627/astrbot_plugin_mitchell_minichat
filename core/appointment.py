@@ -768,7 +768,7 @@ def _parse_one(text: str, now: datetime, cfg: dict, force: bool = False, candida
             intent = intent.replace(word, ' ' * len(word))
     if re.search(r'(?<!不是)(?:不打算|没(?:有)?打算|不准备|没(?:有)?准备|不计划|没(?:有)?计划|没(?:有)?说(?:过)?|从未说(?:过)?|不曾说(?:过)?)[\s我自己在要会再就]*$', intent):
         return drop('N1', '否定计划或否认说过，不建立约定')
-    if re.search(r'(?:不确定|尚未确定|还没确定|未确定|没(?:有)?决定|尚未决定|还没决定|可能|也许|或许|未必|不一定|大概)(?:\s|我|自己|在|要|会|再|就|去|参加|是否)*$', intent):
+    if re.search(r'(?:不确定|尚未确定|还没确定|未确定|没(?:有)?决定|尚未决定|还没决定|可能|也许|或许|未必|不一定)(?:\s|我|自己|在|要|会|再|就|去|参加|是否)*$', intent):
         return drop('N1', '计划尚未确定，不建立约定')
     suffix = text[_event_idx + _event_len:rules.clause_end(text, _event_idx + _event_len)].strip()
     if re.match(r'(?:不成了|办不成了|开不成了|行不通了)', suffix):
@@ -953,4 +953,5 @@ def build_hint(ap: dict, shot: str, now: datetime, template: str = "") -> str:
             raw=str(ap.get("raw") or ""),
             n=minutes_left,
         ) if "{" not in body else body
+
 
