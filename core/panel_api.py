@@ -1176,12 +1176,13 @@ class PanelService:
             if not isinstance(rule, dict) or not isinstance(rule.get('name'), str) or not rule['name'].strip():
                 raise PanelError("E_BAD_REQUEST", "每条规则都需要一个内部标识")
             try:
-                if rule.get('boost') not in (None, '') and not math.isfinite(float(rule['boost'])):
-                    raise ValueError('non-finite boost')
-                normalized = self.plugin.engine._normalize_rule(rule)
-                if not math.isfinite(normalized['boost']):
-                    raise ValueError('non-finite boost')
-                datetime.fromtimestamp(time.time() + normalized['ttl_minutes'] * 60)
+                # 初始化可能正因旧规则失败；校验本身不能依赖运行中的引擎，
+                # 否则面板无法保存修正后的规则来恢复插件。
+                for field in ('boost', 'boost_budget', 'ttl_minutes'):
+                    if rule.get(field) not in (None, '') and not math.isfinite(float(rule[field])):
+                        raise ValueError('non-finite rule value')
+                ttl = int(rule.get('ttl_minutes') or 45)
+                datetime.fromtimestamp(time.time() + ttl * 60)
             except (TypeError, ValueError, OverflowError, OSError):
                 raise PanelError('E_BAD_REQUEST', '规则时长或加成不合法') from None
             rule.setdefault("__template_key", "event_rule")

@@ -165,7 +165,8 @@ async def test_session_edits_cannot_interleave_with_async_rules_save(plugin,umo,
 
 
 @pytest.mark.parametrize('patch',[{'ttl_minutes':'invalid'},{'ttl_minutes':float('inf')},
-                                 {'boost':float('nan')},{'boost':float('inf')},{'name':123},{'name':['bad']}])
+                                 {'boost':float('nan')},{'boost':float('inf')},{'name':123},{'name':['bad']},
+                                 {'boost_budget':float('inf')}])
 async def test_malformed_rules_cannot_be_persisted_and_break_reload(plugin,monkeypatch,patch):
     before=copy.deepcopy(dict(plugin.config))
     save=AsyncMock()
@@ -221,3 +222,15 @@ def test_new_prompt_file_is_private_on_posix(plugin):
     assert plugin._web_overrides_path.is_file()
     if os.name=='posix':
         assert stat.S_IMODE(plugin._web_overrides_path.stat().st_mode)==0o600
+
+
+@pytest.mark.parametrize('route',['rules','config'])
+async def test_invalid_engine_can_be_repaired_from_panel_without_engine_dependency(plugin,route):
+    plugin.engine=None
+    rules=[{'name':'repaired','keywords':['修复后的活动'],'ttl_minutes':30}]
+    if route=='rules':
+        result=await plugin.panel_service.rules_save({'rules':rules})
+    else:
+        result=await plugin.panel_service.config_save({'patch':{'custom_engine':{'event_rules':rules}}})
+    assert result['saved'] and result['need_reload']
+    assert plugin.config['custom_engine']['event_rules'][0]['name']=='repaired'
