@@ -16,6 +16,8 @@ Linux 首次安装浏览器可使用 `python -m playwright install --with-deps c
 
 历史回归另跑 `python tools/run_legacy.py`。不要在同一 pytest 进程混合收集 `tests/` 和 `legacy_tests/`：历史集会替换 AstrBot 模块。Windows 测试夹具显式按 UTF-8 读取 schema；CLI 回放目前依赖 Unix 的 `time.tzset()`，在 Linux/WSL 执行。
 
+v0.3.2 起恢复此前按 `compatibility` 排除的空会话用例：空字符串、JSON空列表及列表形式均单独验证，默认历史回归包含该用例。下文旧版本的排除数量仅表示当时的验证记录。
+
 浏览器测试使用 Playwright 与 Chromium，优先选择 `MINICHAT_CHROMIUM`，其次系统 `chromium`，最后 Playwright 安装的 Chromium。没有浏览器会明确跳过该项，跳过不代表验证通过。CI 先安装浏览器再执行测试；结果以对应固定提交的 Actions 记录为准。
 
 测试使用临时数据目录、固定随机源和可控时钟；不修改真实用户数据、不发送 QQ、不调用外部模型。浏览器测试会启动并关闭一个随机本地端口的实际面板，验证任务卡片与三种发送提示。鉴权、配置保存和概率预览也由实际 FastAPI 应用或业务层验证。

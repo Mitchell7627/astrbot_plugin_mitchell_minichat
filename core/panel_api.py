@@ -12,13 +12,16 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
 import time
+from datetime import datetime
 from pathlib import Path
 
 from astrbot.api import logger
 
 from .probability import dual_forecast
 from .splitter import split_text
+from .persistence import atomic_write_json
 
 TAG = "[Minichat]"
 PLUGIN_NAME = "astrbot_plugin_mitchell_minichat"
@@ -495,6 +498,10 @@ class PanelService:
         if not isinstance(patch, dict) or not patch:
             raise PanelError("E_BAD_REQUEST", "没有可保存的内容")
 
+        engine_patch = patch.get('custom_engine')
+        if isinstance(engine_patch, dict) and 'event_rules' in engine_patch:
+            engine_patch['event_rules'] = self._validated_rules(engine_patch['event_rules'], allow_empty=True)
+
         config = self.plugin.config
         before = copy.deepcopy(dict(config))
         before_sessions = set(self.sessions())
@@ -817,20 +824,34 @@ class PanelService:
 
 
         if action == "add":
+            if self._config_lock.locked():
+                raise PanelError('E_BUSY', '配置正在保存，请稍后再试')
             umo = self._validate_umo(umo)
             if umo not in sessions:
+                before = copy.deepcopy(dict(self.plugin.config))
                 sessions.append(umo)
                 self.plugin.config["friend_settings"]["session_list"] = sessions
-                self.plugin.config.save_config()
+                try:
+                    self.plugin.config.save_config()
+                except Exception as e:
+                    _restore_mapping(self.plugin.config, before)
+                    raise PanelError('E_CONFIG_SAVE', f'写盘失败: {e}') from e
             runner = getattr(self.plugin, "runner", None)
             if runner is not None and runner.started:
                 runner.reschedule(umo, delay_minutes=1)
         elif action == "remove":
+            if self._config_lock.locked():
+                raise PanelError('E_BUSY', '配置正在保存，请稍后再试')
             if umo not in sessions:
                 raise PanelError("E_NOT_FOUND", "该会话不在列表里")
+            before = copy.deepcopy(dict(self.plugin.config))
             sessions.remove(umo)
             self.plugin.config["friend_settings"]["session_list"] = sessions
-            self.plugin.config.save_config()
+            try:
+                self.plugin.config.save_config()
+            except Exception as e:
+                _restore_mapping(self.plugin.config, before)
+                raise PanelError('E_CONFIG_SAVE', f'写盘失败: {e}') from e
             runner = getattr(self.plugin, "runner", None)
             if runner is not None:
                 runner.invalidate_session(umo)
@@ -1114,22 +1135,16 @@ class PanelService:
         }
 
     async def rules_save(self, payload: dict) -> dict:
-        payload = payload or {}
-        rules = payload.get("rules")
-        if not isinstance(rules, list) or not rules:
-            raise PanelError("E_BAD_REQUEST", "规则不能为空")
-        if len(json.dumps(rules, ensure_ascii=False).encode("utf-8")) > MAX_RULES_BYTES:
-            raise PanelError("E_BAD_REQUEST", "规则过大")
+        async with self._config_lock:
+            return await self._rules_save(payload)
 
-        for rule in rules:
-            if not isinstance(rule, dict) or not str(rule.get("name") or "").strip():
-                raise PanelError("E_BAD_REQUEST", "每条规则都需要一个内部标识")
-            rule.setdefault("__template_key", "event_rule")
+    async def _rules_save(self, payload: dict) -> dict:
+        payload = payload or {}
+        rules = self._validated_rules(payload.get('rules'))
 
         current = self.rules_get()
         if current["source"] == "config":
-            self.plugin.config["custom_engine"]["event_rules"] = rules
-            await self.plugin.config.save_config_async()
+            await self._config_save({'patch': {'custom_engine': {'event_rules': rules}}})
             return {"saved": True, "source": "config", "need_reload": True}
 
         path = self._rules_file()
@@ -1139,14 +1154,44 @@ class PanelService:
             data["away_keywords"] = payload["away_keywords"]
         if isinstance(payload.get("return_keywords"), list):
             data["return_keywords"] = payload["return_keywords"]
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=4), encoding="utf-8")
+        try:
+            atomic_write_json(path, data)
+        except OSError as e:
+            raise PanelError('E_CONFIG_SAVE', f'写规则文件失败: {e}') from e
         try:
             self.plugin.engine._load()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f'{TAG} 规则已保存但应用失败，需重载: {e}')
+            return {"saved": True, "source": "file", "need_reload": True}
         return {"saved": True, "source": "file", "need_reload": False}
 
+    def _validated_rules(self, raw, *, allow_empty=False):
+        rules = copy.deepcopy([] if raw is None and allow_empty else raw)
+        if not isinstance(rules, list) or not rules and not allow_empty:
+            raise PanelError("E_BAD_REQUEST", "规则不能为空")
+        if len(json.dumps(rules, ensure_ascii=False).encode("utf-8")) > MAX_RULES_BYTES:
+            raise PanelError("E_BAD_REQUEST", "规则过大")
+
+        for rule in rules:
+            if not isinstance(rule, dict) or not isinstance(rule.get('name'), str) or not rule['name'].strip():
+                raise PanelError("E_BAD_REQUEST", "每条规则都需要一个内部标识")
+            try:
+                if rule.get('boost') not in (None, '') and not math.isfinite(float(rule['boost'])):
+                    raise ValueError('non-finite boost')
+                normalized = self.plugin.engine._normalize_rule(rule)
+                if not math.isfinite(normalized['boost']):
+                    raise ValueError('non-finite boost')
+                datetime.fromtimestamp(time.time() + normalized['ttl_minutes'] * 60)
+            except (TypeError, ValueError, OverflowError, OSError):
+                raise PanelError('E_BAD_REQUEST', '规则时长或加成不合法') from None
+            rule.setdefault("__template_key", "event_rule")
+        return rules
+
     async def panel_restart(self, payload: dict) -> dict:
+        async with self._config_lock:
+            return await self._panel_restart(payload)
+
+    async def _panel_restart(self, payload: dict) -> dict:
         """重启独立面板。
 
         不能在请求里同步 await restart：7627 通道下等于停掉正在服务自己的服务器，
@@ -1154,28 +1199,26 @@ class PanelService:
         """
         payload = payload or {}
         host = str(payload.get("host") or "").strip() or None
-        port = _as_int(payload.get("port"), 0) or None
+        raw_port = payload.get('port')
+        try:
+            port = int(raw_port) if raw_port not in (None, '') else None
+        except (TypeError, ValueError, OverflowError):
+            raise PanelError('E_BAD_REQUEST', '端口必须是整数') from None
+        if isinstance(raw_port, float) and raw_port != port:
+            raise PanelError('E_BAD_REQUEST', '端口必须是整数')
+        port = port or None
+        if port is not None and not 1024 <= port <= 65535:
+            raise PanelError('E_BAD_REQUEST', '端口必须在1024–65535之间')
         if self._restarting:
             raise PanelError("E_BUSY", "面板正在重启")
 
-        changed = False
-        wp = self.plugin.config.get("web_panel")
-        if isinstance(wp, dict):
-            if host and wp.get("host") != host:
-                wp["host"] = host
-                changed = True
-            if port and wp.get("port") != port:
-                wp["port"] = port
-                changed = True
-        if changed:
-            try:
-                saver = getattr(self.plugin.config, "save_config_async", None)
-                if saver is not None:
-                    await saver()
-                else:
-                    self.plugin.config.save_config()
-            except Exception as e:
-                logger.warning(f"{TAG} 保存面板地址失败: {e}")
+        patch = {}
+        if host:
+            patch['host'] = host
+        if port:
+            patch['port'] = port
+        if patch:
+            await self._config_save({'patch': {'web_panel': patch}})
 
         self._restarting = True
 
@@ -1248,7 +1291,10 @@ class PanelService:
         # 只允许写入已知的两个键，避免塞进任意东西
         allowed = {"classify_sys_prompt", "reminder_hint", "appointment_hint"}
         cleaned = {k: str(v) for k, v in patch.items() if k in allowed and isinstance(v, str)}
-        self.plugin.set_web_overrides(cleaned)
+        try:
+            self.plugin.set_web_overrides(cleaned)
+        except OSError as e:
+            raise PanelError('E_CONFIG_SAVE', f'写提示词失败: {e}') from e
         return {"saved": True, "overrides": self.plugin.web_overrides_all()}
 
 

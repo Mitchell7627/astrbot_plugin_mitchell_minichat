@@ -339,10 +339,17 @@ def _dated_at(clock: dict, marker: _DayMarker, now: datetime, days: int, max_hou
     if marker.target is None or not 0 <= (marker.target - now.date()).days <= days:
         return None
     if marker.is_today:
-        at = resolve_clock(clock, now, max_hours, anchored=bool(clock.get('reverse')))
+        # 启用跨日范围时，明确日期统一按日历范围；小时限制仅约束裸钟点。
+        # future_days=0 保持旧的仅本日兼容模式。
+        dated_hours = (days + 1) * 24 if days else max_hours
+        at = resolve_clock(clock, now, dated_hours, anchored=bool(clock.get('reverse')))
         if at is not None and at <= now.timestamp() - 300:
             return None
         if at is not None and clock.get('period') != 'night' and datetime.fromtimestamp(at).date() != now.date():
+            return None
+        if (at is not None and datetime.fromtimestamp(at).date() != now.date()
+                and at - now.timestamp() > max_hours * 3600):
+            # 「今晚一点」隐含跨到次日，继续遵守既有的夜间小时保护。
             return None
         return at
     anchor = now.replace(year=marker.target.year, month=marker.target.month, day=marker.target.day,

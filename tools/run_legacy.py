@@ -14,7 +14,7 @@ def main():
     directory = root / "legacy_tests"
     env = {**os.environ, "MINICHAT_REPO": str(root), "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
     command = [sys.executable, "-m", "pytest", str(directory), "-c", str(directory / "pytest.ini"),
-               "-q", "--tb=short", "-m", "not compatibility"]
+               "-q", "--tb=short"]
     if args.junitxml:
         command.append("--junitxml=" + str(args.junitxml.resolve()))
     raise SystemExit(subprocess.call(command, cwd=root, env=env))

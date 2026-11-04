@@ -19,10 +19,11 @@ from .core.migrations import migrate_config
 from .core.panel_api import PanelPageApi, PanelService
 from .core.runner import Runner
 from .core.store import Store
+from .core.persistence import atomic_write_json
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.3.1"
+VERSION = "v0.3.2"
 
 
 class ProactiveMiniPlugin(star.Star):
@@ -106,17 +107,12 @@ class ProactiveMiniPlugin(star.Star):
         return dict(self._web_overrides)
 
     def set_web_overrides(self, patch: dict) -> None:
+        updated = dict(self._web_overrides)
         for key, val in (patch or {}).items():
             if isinstance(val, str):
-                self._web_overrides[key] = val
-        try:
-            self._web_overrides_path.parent.mkdir(parents=True, exist_ok=True)
-            self._web_overrides_path.write_text(
-                json.dumps(self._web_overrides, ensure_ascii=False, indent=4),
-                encoding="utf-8",
-            )
-        except Exception as e:
-            logger.warning(f"{TAG} 保存 web_overrides 失败: {e}")
+                updated[key] = val
+        atomic_write_json(self._web_overrides_path, updated)
+        self._web_overrides = updated
 
     async def initialize(self) -> None:
         # 面板先起：即使插件被关闭，也能打开面板把配置改回来
