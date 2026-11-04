@@ -75,3 +75,15 @@ def test_followup_cancel_keeps_independent_later_appointment(plugin,umo,clock,te
     from datetime import datetime
     plugin.runner.update_from_message(umo,text)
     assert [a['at'] for a in plugin.runner._appointments(umo)]==[datetime(2026,11,4,16).timestamp()]
+
+@pytest.mark.parametrize('text',['明天下午三点的会议不要再提醒我了','明天下午三点的会议别再提醒我了'])
+def test_stop_notice_with_again_modifier(plugin,umo,clock,text):
+    r=plugin.runner
+    r.update_from_message(umo,'明天下午三点开会')
+    r.update_from_message(umo,'后天下午三点开会')
+    original=copy.deepcopy(r._appointments(umo))
+    r.update_from_message(umo,text)
+    assert [a['id'] for a in r._appointments(umo)]==[original[1]['id']]
+    rec=next(x for x in r.decisions.items(umo) if x['rule']=='CANCEL' and x['action']=='applied')
+    r.undo_decision(rec['id'])
+    assert r._appointments(umo)==original

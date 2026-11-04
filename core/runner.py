@@ -1478,7 +1478,7 @@ class Runner:
         for word in sorted(all_words, key=len, reverse=True):
             remaining = remaining.replace(word, " ")
         if marker.group() in ('不用', '不要', '不必', '别', '不再'):
-            remaining = re.sub(r'叫|喊|让|提醒|通知|你', '', remaining)
+            remaining = re.sub(r'(?:再)?(?:提醒|通知)|叫|喊|让|你', '', remaining)
         remaining = re.sub(
             r"(?:这个|那个|这条|那条|这件事|原来的|全部|所有|约定|安排|提醒|预约|"
             r"凌晨|早上|早晨|上午|中午|正午|下午|午后|傍晚|晚上|夜里|今晚|晚间|今天|今早|"
@@ -4645,3 +4645,4 @@ class Runner:
                 pass
         except Exception as e:
             logger.debug(f"{TAG} 主动消息写回历史失败（忽略）: {e}")
+
