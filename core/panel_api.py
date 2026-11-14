@@ -21,6 +21,7 @@ from astrbot.api import logger
 
 from .probability import dual_forecast
 from .splitter import split_text
+from .reply_guard import inspect_text
 from .persistence import atomic_write_json
 
 TAG = "[Minichat]"
@@ -673,6 +674,7 @@ class PanelService:
             except Exception as e:
                 raise PanelError("E_UPSTREAM", f"生成失败: {e}")
 
+        text, _ = inspect_text(text or "")
         segments = []
         if text:
             try:
@@ -707,9 +709,11 @@ class PanelService:
         if umo not in runner.sessions():
             raise PanelError("E_NOT_FOUND", "该会话不在列表里")
         seq = _as_int(self.store.get(umo, "turn_seq"), 0)
+        cid = await runner._conversation_id(umo)
+        scene = runner._delivery_snapshot(umo)
 
         def current():
-            return runner._result_current(umo, seq)
+            return runner._result_current(umo, seq) and runner._delivery_snapshot(umo) == scene
 
         # 与定时器共用同一把会话锁：否则自动发送正在分段时，手动发送会插进去交错
         lock = runner.session_lock(umo)
@@ -725,21 +729,12 @@ class PanelService:
                         raise PanelError("E_UPSTREAM", "生成超时（90 秒）")
                     if not text:
                         raise PanelError("E_UPSTREAM", "生成为空，未发送")
-                delivered: list[str] = []
+                text, _ = inspect_text(text)
+                if not text:
+                    raise PanelError("E_UPSTREAM", "没有可发送的正文")
                 report = {}
                 try:
-                    sent_text = await runner._send_split(
-                        umo, text, sent_out=delivered, report=report, guard=current,
-                    )
-                    ok = bool(sent_text)
-                except asyncio.CancelledError:
-                    # 分段中途被取消：已送达的段落仍要写回历史，再往上抛
-                    if delivered:
-                        try:
-                            await runner._append_assistant_history(umo, "\n".join(delivered))
-                        except Exception:
-                            pass
-                    raise
+                    ok = bool(await runner.deliver(umo, text, cid=cid, report=report, guard=current))
                 except Exception as e:
                     raise PanelError("E_UPSTREAM", f"发送失败: {e}")
 
@@ -749,11 +744,6 @@ class PanelService:
                     count = (self.store.bump_unanswered(umo) if current()
                              else _as_int(state.get("unanswered"), 0))
                     self.store.save()
-                    # 只写真正送达的内容：分段中途失败时，没送到的不该被当成「她已经说过」
-                    try:
-                        await runner._append_assistant_history(umo, sent_text)
-                    except Exception:
-                        pass
                 else:
                     count = _as_int(state.get("unanswered"), 0)
 

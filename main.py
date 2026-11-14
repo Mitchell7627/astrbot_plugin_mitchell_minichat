@@ -16,6 +16,7 @@ from astrbot.core.config.astrbot_config import AstrBotConfig
 
 from .core.event_detector import EventRuleStore, extract_message_text
 from .core.migrations import migrate_config
+from .core.reply_guard import clean_final_response, clean_loaded_messages, clean_result_chain
 from .core.panel_api import PanelPageApi, PanelService
 from .core.runner import Runner
 from .core.store import Store
@@ -23,7 +24,7 @@ from .core.persistence import atomic_write_json
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.3.4"
+VERSION = "v0.3.5"
 
 
 class ProactiveMiniPlugin(star.Star):
@@ -253,6 +254,39 @@ class ProactiveMiniPlugin(star.Star):
                 task.add_done_callback(self._bg_tasks.discard)
             except Exception as e:
                 logger.debug(f"{TAG} 约定灰度任务创建失败: {e}")
+
+    # The historical test harness predates the 4.29 agent hooks.
+    @getattr(filter, "on_agent_begin", lambda **_: lambda method: method)()
+    async def guard_chat_history(self, event, run_context):
+        if self.runner and self.runner._result_current(event.unified_msg_origin):
+            originals = clean_loaded_messages(run_context.messages)
+            if originals:
+                event.set_extra("_minichat_history_originals", originals)
+
+    @getattr(filter, "on_agent_done", lambda **_: lambda method: method)()
+    async def guard_chat_reply(self, event, run_context, response):
+        getter = getattr(event, "get_extra", None)
+        if getter:
+            originals = getter("_minichat_history_originals", ())
+            for message, content in originals:
+                message.content = content
+            if originals:
+                event.set_extra("_minichat_history_originals", ())
+        if self.runner is None or not self.runner._result_current(event.unified_msg_origin):
+            return
+        reason = clean_final_response(run_context, response)
+        if reason:
+            logger.info(f"{TAG} 普通回复已处理：{reason}")
+
+    @getattr(filter, "on_decorating_result", lambda **_: lambda method: method)(priority=10000)
+    async def guard_intermediate_chat_reply(self, event):
+        if self.runner is None or not self.runner._result_current(event.unified_msg_origin):
+            return
+        result = event.get_result()
+        if result and result.chain and result.is_model_result():
+            reason = clean_result_chain(result.chain)
+            if reason:
+                logger.info(f"{TAG} 普通回复已处理：{reason}")
 
     @filter.after_message_sent()
     async def on_after_message_sent(self, event: AstrMessageEvent):

@@ -1,0 +1,199 @@
+import asyncio
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from astrbot_plugin_mitchell_minichat.core.reply_guard import FALLBACK, clean_history, inspect_text
+from astrbot_plugin_mitchell_minichat.core.migrations import (
+    LEGACY_PROACTIVE_PROMPT_V034, migrate_config,
+)
+
+
+INCIDENT = (
+    '今天辛苦啦\n坐下来歇一会儿吧\n慢慢来喵\n\n'
+    'Hmm "well" opener — he said don\'t start with that phrase. '
+    'Maybe avoid it. Let\'s do:\n\n'
+    '"先歇一会儿吧"\n"慢慢来喵"\n先歇一会儿吧\n慢慢来喵'
+)
+
+
+@pytest.mark.parametrize("text", [
+    "Hello! How was your day?", "Analysis: Your proposal needs a budget.",
+    '她说「Analysis: test」', "`<think>hint</think>`",
+    'Hmm, that sounds nice!', "头发别滴到肩膀", "摸摸头喵",
+])
+def test_clean_reply_is_unchanged(text):
+    assert inspect_text(text) == (text, None)
+
+
+def test_incident_is_removed_from_visible_and_loaded_history():
+    history = [{"role": "assistant", "content": INCIDENT}]
+    expected = INCIDENT.split("\n\n")[0]
+    assert inspect_text(INCIDENT) == (expected, "draft_removed")
+    assert clean_history(history)[0]["content"] == expected
+    assert history[0]["content"] == INCIDENT
+
+
+async def test_old_draft_is_hidden_during_generation_but_kept_on_disk(plugin, umo):
+    from astrbot.core.agent.message import Message, TextPart, dump_messages_with_checkpoints
+    from astrbot.core.provider.entities import LLMResponse
+
+    extras = {}
+    event = SimpleNamespace(unified_msg_origin=umo, set_extra=extras.__setitem__, get_extra=extras.get)
+    old = Message(role="assistant", content=[TextPart(text=INCIDENT)])
+    current = Message(role="assistant", content=[TextPart(text="新回复")])
+    wrapper = SimpleNamespace(messages=[old])
+    await plugin.guard_chat_history(event, wrapper)
+    assert old.content[0].text == INCIDENT.split("\n\n")[0]
+    wrapper.messages.append(current)
+    await plugin.guard_chat_reply(event, wrapper, LLMResponse(role="assistant", completion_text="新回复"))
+    saved = dump_messages_with_checkpoints(wrapper.messages)
+    assert saved[0]["content"][0]["text"] == INCIDENT
+    assert saved[1]["content"][0]["text"] == "新回复"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("<think>secret</think>你好喵", "你好喵"),
+    ("Analysis: internal\nFinal answer: 你好喵", "你好喵"),
+    ('Hmm "唔" opener', FALLBACK),
+    ("<think>no closing tag", FALLBACK),
+    (INCIDENT, INCIDENT.split("\n\n")[0]),
+])
+async def test_real_astrbot_final_hook_cleans_send_and_saved_message(plugin, umo, text, expected, monkeypatch):
+    from astrbot.core.agent.message import Message, TextPart
+    from astrbot.core.astr_agent_hooks import MainAgentHooks
+    from astrbot.core import astr_agent_hooks
+    from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
+    from astrbot.core.message.components import Image, Plain
+    from astrbot.core.message.message_event_result import MessageChain
+    from astrbot.core.provider.entities import LLMResponse
+
+    event = SimpleNamespace(unified_msg_origin=umo)
+    image = Image.fromURL("https://example.invalid/image.png")
+    response = LLMResponse(role="assistant", result_chain=MessageChain([Plain(text), image]))
+    messages = []
+    wrapper = SimpleNamespace(messages=messages, context=SimpleNamespace(event=event))
+
+    async def dispatch(event, event_type, *args):
+        if event_type.name == "OnAgentDoneEvent":
+            await plugin.guard_chat_reply(event, *args)
+
+    monkeypatch.setattr(astr_agent_hooks, "call_event_hook", dispatch)
+
+    runner = SimpleNamespace(run_context=wrapper, stats=SimpleNamespace(), _transition_state=lambda state: None,
+                             agent_hooks=MainAgentHooks(), _resolve_unconsumed_follow_ups=lambda: None)
+    await ToolLoopAgentRunner._complete_with_assistant_response(runner, response)
+    assert response.result_chain.chain == [Plain(expected), image]
+    assert isinstance(messages[0], Message)
+    assert [p.text for p in messages[0].content if isinstance(p, TextPart)] == [expected]
+
+
+def test_known_default_is_migrated_without_overwriting_custom_text(plugin):
+    friend = plugin.friend_cfg
+    friend["proactive_prompt"] = LEGACY_PROACTIVE_PROMPT_V034
+    assert "proactive_prompt" in migrate_config(plugin.config)
+    assert "肩膀借我" not in friend["proactive_prompt"]
+    friend["proactive_prompt"] = "我自己的主动提示词"
+    assert "proactive_prompt" not in migrate_config(plugin.config)
+    assert friend["proactive_prompt"] == "我自己的主动提示词"
+
+
+@pytest.mark.parametrize("text", [
+    "要不然磨到了", "你这样好像在汇报工作喵", "想吃面呢",
+    "加上对方在睡觉时", "两点半哥哥就去上课了",
+])
+def test_real_log_noncurrent_actions_do_not_change_scene(plugin, umo, clock, text):
+    clock.now = datetime(2026, 11, 9, 12, 45).timestamp()
+    runner = plugin.runner
+    runner.update_from_message(umo, text)
+    assert runner._proactive_scene(umo) == ["unknown", "", "", ""]
+    assert not runner.is_sleeping(umo)
+
+
+@pytest.mark.parametrize("start,end", [("我在吃饭", "吃完咯"), ("我在洗澡", "洗完咯")])
+def test_end_signal_survives_affectionate_followup(plugin, umo, clock, start, end):
+    r = plugin.runner
+    r.update_from_message(umo, start)
+    assert plugin.store.get(umo, "active_event")
+    r.update_from_message(umo, end)
+    r.update_from_message(umo, "抱抱")
+    assert plugin.store.get(umo, "active_event") is None
+
+
+def test_ordering_moves_out_of_commute_without_claiming_food_is_served(plugin, umo, clock):
+    r = plugin.runner
+    r.update_from_message(umo, "准备出门吃咯")
+    assert r._proactive_scene(umo)[1] == "commute"
+    r.update_from_message(umo, "点好咯")
+    r.update_from_message(umo, "等着吧喵")
+    assert r._proactive_scene(umo)[3] == "ordered"
+    assert "何时开始吃还不确定" in r._proactive_hint(umo)
+    r.update_from_message(umo, "好好吃")
+    assert r._proactive_scene(umo)[3] == "active"
+
+
+@pytest.mark.parametrize("first,second,third", [
+    ("肩膀借我一会儿", "那就给我搭一下肩膀", "往这边靠点，让我挨着"),
+    ("被子跑到你那边啦\n再眯一会儿", "被子被我卷过来了，往中间挪挪",
+     "挪一点，别把被子都卷走啦"),
+])
+async def test_successful_proactive_send_blocks_same_opening(plugin, umo, clock, monkeypatch, first, second, third):
+    r = plugin.runner
+    generate = AsyncMock(side_effect=[first, second, third, "头发别滴到肩膀"])
+    monkeypatch.setattr(r, "_generate", generate)
+    assert (await r._fire(umo))["sent"]
+    sent = plugin.context.send_message.await_count
+    for _ in range(2):
+        clock.now += 3600
+        assert not (await r._fire(umo))["sent"]
+    assert plugin.context.send_message.await_count == sent
+    assert plugin.store.get(umo, "unanswered") == 1
+    assert (await r._fire(umo))["sent"]
+    assert generate.await_count == 4
+
+
+async def test_original_conversation_keeps_only_successful_part(plugin, umo, clock, monkeypatch):
+    r = plugin.runner
+    current = "original"
+    h = []
+    manager = SimpleNamespace(
+        get_curr_conversation_id=AsyncMock(side_effect=lambda _: current),
+        get_conversation=AsyncMock(return_value=SimpleNamespace(history=h)),
+        update_conversation=AsyncMock(),
+    )
+    plugin.context.conversation_manager = manager
+    monkeypatch.setattr(r, "_generate", AsyncMock(return_value="第一段。第二段。"))
+
+    async def send(*args):
+        nonlocal current
+        current = "different"
+        return True
+
+    plugin.context.send_message.side_effect = send
+    report = await r._fire(umo)
+    assert report["delivery_status"] == "partial"
+    assert plugin.context.send_message.await_count == 1
+    assert manager.update_conversation.await_args.args[1] == "original"
+    saved = manager.update_conversation.await_args.kwargs["history"][-1]["content"]
+    assert saved.startswith("第一段。\n<system_reminder>Current datetime:")
+    assert "第二段" not in saved
+
+
+async def test_changed_scene_while_generating_is_rejected(plugin, umo, clock, monkeypatch):
+    r = plugin.runner
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def generate(*args, **kwargs):
+        entered.set()
+        await resume.wait()
+        return "旧场景"
+
+    monkeypatch.setattr(r, "_generate", generate)
+    fire = asyncio.create_task(r._fire(umo))
+    await asyncio.wait_for(entered.wait(), 2)
+    r._set_event(umo, r.engine.get_rule("eating"), "吃饭")
+    resume.set()
+    assert (await asyncio.wait_for(fire, 2))["reason"] == "stale_generation"
+    plugin.context.send_message.assert_not_awaited()
