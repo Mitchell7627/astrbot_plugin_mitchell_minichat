@@ -26,6 +26,7 @@ CONCERT = "还没到午休，先喝口水吧\n下周三有个音乐会，票都�
     ("好笨哦。\n下次还敢。\n嘿嘿", UNKNOWN, None, None),
     ("她念台词说『明天有个演唱会，票订好了』。\n这句读得真有气势！", UNKNOWN, None, None),
     ("洗澡的话别把水开太热喵\n刚回来就先歇一会", UNKNOWN, None, None),
+    ("茶水都快凉了，还不出来吗\n给你留了一杯喵", UNKNOWN, None, None),
     ("到学校了没？\n到家了记得说一声喵", UNKNOWN, None, None),
     ("走到哪啦？\n到了告诉我，东门今天锁着", UNKNOWN, None, None),
 ])
@@ -68,7 +69,7 @@ def test_relative_confirmation_uses_its_own_day():
     assert polish_reply("今天下午三点有个演唱会，票都定好了", UNKNOWN, [user], now=now)[0]
 
 
-@pytest.mark.parametrize("text", ["来了来了", "要沉进去了喵", "快沉下去了！"])
+@pytest.mark.parametrize("text", ["来了来了", "要沉进去了喵", "快沉下去了！", "擦好咯"])
 async def test_context_only_turn_never_classifies_as_bath(plugin, umo, monkeypatch, text):
     r = plugin.runner
     recent = AsyncMock(return_value="她：水已经放好了")
@@ -82,13 +83,13 @@ async def test_context_only_turn_never_classifies_as_bath(plugin, umo, monkeypat
 
 @pytest.mark.parametrize("newer", ["", "我正在洗澡", "我在吃饭"])
 @pytest.mark.parametrize("split", [True, False])
-async def test_clarification_only_clears_the_unconfirmed_bath(plugin, umo, clock, monkeypatch, newer, split):
+def test_clarification_only_clears_the_unconfirmed_bath(plugin, umo, clock, newer, split):
     r = plugin.runner
-    # Recreate already applied semantic state so the clarification path is
-    # exercised independently of the new prefilter.
-    monkeypatch.setattr(r, "classify_text", AsyncMock(return_value={"name": "shower", "done": False}))
-    await r.classify_with_llm(umo, "要往里面去了")
-    assert plugin.store.get(umo, "active_event")["unconfirmed_source"]
+    # A persisted unconfirmed inference from the previous version is eligible
+    # for correction and cannot supply the scene for a new proactive reply.
+    r._set_event(umo, r.engine.get_rule("shower"), "语义:shower")
+    plugin.store.get(umo, "active_event")["unconfirmed_source"] = True
+    assert r._proactive_scene(umo)[1] == ""
     if newer:
         r.update_from_message(umo, newer)
     if split:
@@ -102,6 +103,17 @@ async def test_clarification_only_clears_the_unconfirmed_bath(plugin, umo, clock
     assert r.take_llm_candidate(umo) is None
 
 
+@pytest.mark.parametrize("text,confirmed", [
+    ("擦好咯", False), ("要往里面去了", False), ("正忙着呢", False), ("浴缸擦好咯", False),
+    ("准备洗香香了", True), ("我去冲个热水澡", True), ("我正在淋浴呢", True),
+])
+async def test_semantic_shower_needs_literal_cue(plugin, umo, monkeypatch, text, confirmed):
+    r = plugin.runner
+    monkeypatch.setattr(r, "classify_text", AsyncMock(return_value={"name": "shower", "done": False}))
+    await r.classify_with_llm(umo, text)
+    assert bool(plugin.store.get(umo, "active_event")) is confirmed
+
+
 async def test_delayed_inference_cannot_cross_clarification(plugin, umo, monkeypatch):
     r = plugin.runner
     entered, finish = asyncio.Event(), asyncio.Event()
@@ -112,7 +124,7 @@ async def test_delayed_inference_cannot_cross_clarification(plugin, umo, monkeyp
         return {"name": "shower", "done": False}
 
     monkeypatch.setattr(r, "classify_text", classify)
-    pending = asyncio.create_task(r.classify_with_llm(umo, "要往里面去了"))
+    pending = asyncio.create_task(r.classify_with_llm(umo, "我去冲个热水澡"))
     await asyncio.wait_for(entered.wait(), 2)
     r.update_from_message(umo, "我说的是抱抱")
     finish.set()

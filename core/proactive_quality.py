@@ -27,7 +27,7 @@ _ARRIVAL_PROMPT = re.compile(
     r"到(?:家|学校|教室|店里)?了?.{0,4}(?:说一声|告诉我|报个?平安)"
 )
 _DESTINATION = re.compile(r"到(家|学校|教室|店里)")
-_BATH_CONTEXT = re.compile(r"洗澡|浴缸|泡澡|出浴|再泡|别泡|水.{0,5}(?:凉|热)|还没洗完")
+_BATH_CONTEXT = re.compile(r"洗澡|浴缸|浴室|泡澡|出浴|再泡下去|还没洗完澡")
 _BATH_EXIT = re.compile(r"还不出来|还没出来|起来吧|快(?:从浴缸)?出来|该出来|再泡.{0,8}晕|出来换|出来吧")
 _BATH_NOW = re.compile(r"还没洗完|还在泡|再泡|泡一会儿再出来|出来后.{0,10}(?:擦干|擦头发|换衣)")
 _BATH_DETAIL = re.compile(r"头发|擦干|毛巾|换衣|水温|别着凉")

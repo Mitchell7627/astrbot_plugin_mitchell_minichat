@@ -2876,10 +2876,13 @@ class Runner:
         return text
 
     _CONTEXT_ONLY_ACTIVITY = re.compile(
-        r"(?:我|哥哥)?(?:来了来了|来(?:了|啦|咯|喽)|(?:要|快要|快)?沉(?:进去|下去)了)[啊呀喵啦咯呢哦]*"
+        r"(?:我|哥哥)?(?:来了来了|来(?:了|啦|咯|喽)|(?:要|快要|快)?沉(?:进去|下去)了|"
+        r"擦(?:好|完)[了啦咯喽])[啊呀喵啦咯呢哦]*"
     )
     _CLARIFICATION = re.compile(r"(?:(?:我|哥哥)?的?意思是|我(?:是说|说的是))")
-    _BATH_EVIDENCE = re.compile(r"洗澡|泡澡|冲(?:个|下)?(?:凉|澡)|沐浴|淋浴|浴缸|搓澡|搓背")
+    _BATH_EVIDENCE = re.compile(
+        r"(?:洗|泡|冲)(?:个|下)?(?:热水|冷水)?澡|洗香香|冲(?:个|下)?凉|沐浴|淋浴|搓澡"
+    )
     _BATH_METAPHOR = re.compile(r"(?:沉|陷|掉|钻).{0,12}(?:抱抱|怀里)|^(?:就是|只是)?(?:说的)?(?:抱抱|拥抱)")
 
     def _clarify_activity(self, umo: str, text: str) -> tuple[str, bool]:
@@ -3498,12 +3501,10 @@ class Runner:
             if gray_fallback:
                 await self.review_gray(umo, gray_fallback)
             return
-        unconfirmed = name == "shower" and not self._BATH_EVIDENCE.search(text)
-        if unconfirmed and (event := self._active_event(umo)) and event.get("name") == "shower":
+        if name == "shower" and not self._BATH_EVIDENCE.search(text):
+            logger.debug(f"{TAG} 略过缺少洗澡线索的语义结果")
             return
         self._set_event(umo, rule, "语义:" + name, source_text=text)
-        if unconfirmed:
-            self.store.get(umo, "active_event")["unconfirmed_source"] = True
         self.store.save()
         logger.info(f"{TAG} 语义识别：{text[:16]} → {rule.get('label')}")
         # 语义识别是异步的，消息入口那次采样还没带上事件加成，这里按新状态重排一次。
@@ -3517,7 +3518,8 @@ class Runner:
     # ------------------------------------------------------------------
     def _fresh_event(self, umo: str, now: float):
         event = self.store.get(umo, "active_event")
-        if isinstance(event, dict) and now < float(event.get("expires_at") or 0):
+        if (isinstance(event, dict) and not event.get("unconfirmed_source")
+                and now < float(event.get("expires_at") or 0)):
             return event
         return None
 
