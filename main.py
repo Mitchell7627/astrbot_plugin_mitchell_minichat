@@ -24,7 +24,7 @@ from .core.persistence import atomic_write_json
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.3.8"
+VERSION = "v0.3.9"
 
 
 class ProactiveMiniPlugin(star.Star):
@@ -201,6 +201,18 @@ class ProactiveMiniPlugin(star.Star):
         if umo not in self.runner.sessions():
             return
 
+        runner = self.runner
+        has_manager = getattr(runner.context, "conversation_manager", None) is not None
+        cid = None
+        if has_manager:
+            try:
+                cid = await runner._conversation_id(umo)
+            except Exception as exc:
+                logger.debug(f"{TAG} 会话来源读取失败：{type(exc).__name__}")
+            if self.runner is not runner or not runner._result_current(umo):
+                return
+            runner.bind_message_scene(umo, cid)
+
         text = extract_message_text(event)
 
         self.store.touch_message(umo)
@@ -209,6 +221,8 @@ class ProactiveMiniPlugin(star.Star):
         pending = None
         try:
             self.runner.update_from_message(umo, text)
+            if has_manager and not cid and text.strip() and hasattr(event, "set_extra"):
+                event.set_extra("_minichat_scene_turn", self.store.get(umo, "turn_seq"))
             # 与 update 同步取走，保留原会话、消息序号及未消费片段。
             pending = self.runner.take_llm_candidate(umo)
         except Exception as e:
@@ -259,6 +273,13 @@ class ProactiveMiniPlugin(star.Star):
     @getattr(filter, "on_agent_begin", lambda **_: lambda method: method)()
     async def guard_chat_history(self, event, run_context):
         if self.runner and self.runner._result_current(event.unified_msg_origin):
+            getter = getattr(event, "get_extra", None)
+            seq = getter("_minichat_scene_turn", None) if getter else None
+            if seq is not None:
+                try:
+                    await self.runner.adopt_new_conversation(event.unified_msg_origin, seq)
+                except Exception as exc:
+                    logger.debug(f"{TAG} 新会话来源读取失败：{type(exc).__name__}")
             originals = clean_loaded_messages(run_context.messages)
             if originals:
                 event.set_extra("_minichat_history_originals", originals)

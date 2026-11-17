@@ -665,7 +665,12 @@ class PanelService:
         started = time.time()
         with _Busy(self, umo, "preview"):
             try:
-                text = await asyncio.wait_for(runner._generate(umo), timeout=90)
+                cid = await runner._conversation_id(umo)
+                snapshot = runner._delivery_snapshot(umo, cid)
+                dialogue = await runner._proactive_dialogue(umo, cid, datetime.now())
+                text = await asyncio.wait_for(runner._generate(umo, cid=cid, dialogue=dialogue), timeout=90)
+                text, _ = inspect_text(text or "")
+                text, _ = runner.ground_proactive_reply(text, snapshot, dialogue)
             except asyncio.TimeoutError:
                 raise PanelError("E_UPSTREAM", "生成超时（90 秒）")
             except PanelError:
@@ -673,7 +678,6 @@ class PanelService:
             except Exception as e:
                 raise PanelError("E_UPSTREAM", f"生成失败: {e}")
 
-        text, _ = inspect_text(text or "")
         segments = runner.prepare_segments(text)
         return {
             "umo": umo,
@@ -692,10 +696,10 @@ class PanelService:
             raise PanelError("E_NOT_FOUND", "该会话不在列表里")
         seq = _as_int(self.store.get(umo, "turn_seq"), 0)
         cid = await runner._conversation_id(umo)
-        scene = runner._delivery_snapshot(umo)
+        scene = runner._delivery_snapshot(umo, cid)
 
         def current():
-            return runner._result_current(umo, seq) and runner._delivery_snapshot(umo) == scene
+            return runner._result_current(umo, seq) and runner._delivery_snapshot(umo, cid) == scene
 
         # 与定时器共用同一把会话锁：否则自动发送正在分段时，手动发送会插进去交错
         lock = runner.session_lock(umo)
@@ -706,11 +710,12 @@ class PanelService:
             async with lock:
                 if not text:
                     try:
-                        text = await asyncio.wait_for(runner._generate(umo), timeout=90)
+                        dialogue = await runner._proactive_dialogue(umo, cid, datetime.now())
+                        text = await asyncio.wait_for(runner._generate(umo, cid=cid, dialogue=dialogue), timeout=90)
                     except asyncio.TimeoutError:
                         raise PanelError("E_UPSTREAM", "生成超时（90 秒）")
-                    if not text:
-                        raise PanelError("E_UPSTREAM", "生成为空，未发送")
+                    text, _ = inspect_text(text or "")
+                    text, _ = runner.ground_proactive_reply(text, scene, dialogue)
                 text, _ = inspect_text(text)
                 if not text:
                     raise PanelError("E_UPSTREAM", "没有可发送的正文")

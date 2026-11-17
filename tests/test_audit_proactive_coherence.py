@@ -132,7 +132,7 @@ async def test_delayed_inference_cannot_cross_clarification(plugin, umo, monkeyp
     assert r._proactive_scene(umo)[1] == ""
 
 
-async def test_wrong_scene_skips_once_and_keeps_next_cycle(plugin, umo, monkeypatch):
+async def test_wrong_scene_skips_once_and_keeps_next_cycle(plugin, umo, clock, monkeypatch):
     r = plugin.runner
     r.started = True
     generate = AsyncMock(return_value=BATH_REPLY)

@@ -11,7 +11,7 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from astrbot.api import logger
@@ -802,7 +802,7 @@ class Runner:
         return remain if remain > 0 else None
 
     def _set_event(self, umo: str, rule: dict, keyword: str, source_text: str = "",
-                   hit_idx: int | None = None, kw_len: int = 0) -> None:
+                   hit_idx: int | None = None, kw_len: int = 0, *, confirmed=True) -> None:
         now = time.time()
         ttl = self.engine.ttl_for(rule)
         # 记下事件介入前的原排程：事件结束后用它判断「恢复原计划」还是「重抽」
@@ -828,6 +828,7 @@ class Runner:
             "started_at": now,
             "expires_at": now + ttl * 60,
             "hint": rule.get("hint") or "",
+            "confirmed": confirmed,
         })
         # 事件比「在一起」更长时，在一起跟到事件结束
         self._sync_together_until(umo, {
@@ -2339,6 +2340,8 @@ class Runner:
     # ------------------------------------------------------------------
     WATCH_KEYS = ("away", "together", "active_event", "pre_event_next_at",
                   "sleep_state", "appointments", "latest_activity_signal")
+    SCENE_KEYS = ("away", "together", "active_event", "latest_activity_signal",
+                  "pre_event_next_at", "event_hit")
 
     def _dec_limit(self) -> int:
         return max(0, _as_int(self.engine_cfg.get("decision_log_size"), 50))
@@ -2514,11 +2517,13 @@ class Runner:
             raise ValueError("这条判定已经不能撤销了")
         umo = rec.get("umo")
         items = rec.get("touched") or []
-        for item in items:
-            if self.store.get(umo, item.get("key")) != item.get("after"):
-                rec["undo_state"] = "stale"
-                self.decisions.maybe_save(0)
-                raise ValueError("状态已经变了，撤销会覆盖后来发生的事")
+        scope = self.store.get(umo, "scene_conversation") or {}
+        stale_scope = (_as_float_safe(rec.get("ts")) < _as_float_safe(scope.get("since"))
+                       and any(item.get("key") in self.SCENE_KEYS for item in items))
+        if stale_scope or any(self.store.get(umo, item.get("key")) != item.get("after") for item in items):
+            rec["undo_state"] = "stale"
+            self.decisions.maybe_save(0)
+            raise ValueError("状态已经变了，撤销会覆盖后来发生的事")
         for item in items:
             key = item.get("key")
             if item.get("before") is None:
@@ -2667,7 +2672,7 @@ class Runner:
             logger.info(f"{TAG} 灰区放弃：等模型期间事件已经变了（「{text[:16]}」）")
             return
         before = self._snapshot(umo)
-        self._set_event(umo, rule, "灰区:" + name, source_text=text)
+        self._set_event(umo, rule, "灰区:" + name, source_text=text, confirmed=False)
         self.store.save()
         after = self._snapshot(umo)
         touched = [
@@ -2921,6 +2926,19 @@ class Runner:
         matches = re.finditer(rf"[^{re.escape(rules.CLAUSE_BOUNDARY)}]+", text)
         for clause in matches:
             value = clause.group().strip()
+            if (
+                (event or {}).get("name") == "shower"
+                and event.get("subject") != "her"
+                and re.fullmatch(r"(?:其实)?(?:我|哥哥)?(?:其实)?(?:没有在|没在|不在|不是在)洗澡[啊呀喵呢啦]*", value)
+                and not rules.is_question_clause(text, clause.start(), kw_len=len(value))
+                and not rules.is_reported_clause(text, clause.start())
+                and not rules.is_conditional_clause(text, clause.start())
+            ):
+                self.store.pop(umo, "active_event")
+                self._sync_together_until(umo, closing=True)
+                self._note("stop", {"hit": {"kw": value, "idx": clause.start(), "gate_rule": "CLARIFIED",
+                                            "reason": "用户明确澄清当前没有洗澡"}})
+                return self._mask_span(text, clause.start(), clause.end())
             phrasing = re.fullmatch(
                 r"(?:我(?:已经|刚刚)?|已经|刚刚)?"
                 r"(吃完(?:饭)?|洗完(?:澡)?|到|(?:快要?|马上(?:就)?|就要)(?:下课|下班|散会|收工|考完|吃完|洗完))"
@@ -3312,6 +3330,7 @@ class Runner:
                 text, md.get("idx"), len(md.get("kw") or "")
             )
             event["keyword"] = md.get("kw") or event.get("keyword")
+            event["confirmed"] = True
             event.pop("unconfirmed_source", None)
             self._sync_together_until(umo, event)
             logger.info(f"{TAG} 事件续期：{event.get('label')}")
@@ -3504,7 +3523,7 @@ class Runner:
         if name == "shower" and not self._BATH_EVIDENCE.search(text):
             logger.debug(f"{TAG} 略过缺少洗澡线索的语义结果")
             return
-        self._set_event(umo, rule, "语义:" + name, source_text=text)
+        self._set_event(umo, rule, "语义:" + name, source_text=text, confirmed=name == "shower")
         self.store.save()
         logger.info(f"{TAG} 语义识别：{text[:16]} → {rule.get('label')}")
         # 语义识别是异步的，消息入口那次采样还没带上事件加成，这里按新状态重排一次。
@@ -3673,6 +3692,35 @@ class Runner:
         manager = getattr(self.context, "conversation_manager", None)
         return await manager.get_curr_conversation_id(umo) if manager is not None else None
 
+    def bind_message_scene(self, umo, cid):
+        """Activity and presence belong to the conversation that received the user turn."""
+        previous = self.store.get(umo, "scene_conversation")
+        if isinstance(previous, dict) and previous.get("id") == cid:
+            return
+        self.invalidate_turn(umo)
+        for key in self.SCENE_KEYS:
+            self.store.pop(umo, key)
+        self.store.set(umo, "scene_conversation", {"id": cid, "since": time.time()})
+
+    async def adopt_new_conversation(self, umo, seq):
+        """AstrBot may create the first conversation after the private-message hook."""
+        previous = self.store.get(umo, "scene_conversation")
+        if not self._result_current(umo, seq) or not isinstance(previous, dict) or previous.get("id"):
+            return
+        cid = await self._conversation_id(umo)
+        if cid and self._result_current(umo, seq) and self.store.get(umo, "scene_conversation") == previous:
+            self.store.set(umo, "scene_conversation", {**previous, "id": cid})
+            self.store.save()
+
+    def _has_current_scene(self, umo, cid):
+        if getattr(self.context, "conversation_manager", None) is None:
+            return True
+        return bool(cid and (self.store.get(umo, "scene_conversation") or {}).get("id") == cid)
+
+    def _confirmed_event(self, umo, cid, now):
+        event = self._fresh_event(umo, now) if self._has_current_scene(umo, cid) else None
+        return event if event and event.get("confirmed", True) else {}
+
     @asynccontextmanager
     async def conversation_delivery_lock(self, umo):
         try:
@@ -3684,8 +3732,10 @@ class Runner:
             async with session_lock_manager.acquire_lock(umo):
                 yield
 
-    def _proactive_scene(self, umo, *, now=None):
+    def _proactive_scene(self, umo, *, now=None, cid=None):
         now = time.time() if now is None else now
+        if not self._has_current_scene(umo, cid):
+            return ["unknown", "", "", ""]
         away = self.store.get(umo, "away") or {}
         if away.get("active") and now < _as_float_safe(away.get("expires_at")):
             presence = "away"
@@ -3696,14 +3746,15 @@ class Runner:
             presence = "together"
         else:
             presence = "unknown"
-        event = self._fresh_event(umo, now) or {}
+        event = self._confirmed_event(umo, cid, now)
         phase = "returning" if event.get("return_soon") else event.get("phase", "active") if event else ""
         return [presence, event.get("name", ""), event.get("subject", ""), phase]
 
-    def _proactive_hint(self, umo):
+    def _proactive_hint(self, umo, *, cid=None):
         now = time.time()
-        presence, _, subject, phase = self._proactive_scene(umo, now=now)
-        event = self._fresh_event(umo, now) or {}
+        scene = self._proactive_scene(umo, now=now, cid=cid)
+        presence, _, subject, phase = scene
+        event = self._confirmed_event(umo, cid, now)
         parts = [{"away": "他还在外面", "together": "最近确认同处一个场景",
                   "unknown": "当前是否同处一地未知"}[presence]]
         if phase == "returning":
@@ -3713,7 +3764,7 @@ class Runner:
         elif event:
             who = {"her": "你", "together": "你们", "self": "他"}.get(subject, "当前提到的活动")
             parts.append(f"{who}：{event.get('label', '')}，目前没有结束确认")
-        else:
+        elif self._has_current_scene(umo, cid):
             signal = self.store.get(umo, "latest_activity_signal") or {}
             if signal.get("label") and 0 <= now - _as_float_safe(signal.get("at")) <= 1800:
                 parts.append(signal["label"])
@@ -3725,7 +3776,6 @@ class Runner:
                 for item in pending
             ))
         recent = quality.recent(self.store.get(umo, "proactive_recent", []), now)
-        scene = self._proactive_scene(umo, now=now)
         updates = self.store.get(umo, "proactive_topic_updates", {})
         repeated = {topic for row in recent for topic in row["topics"]
                     if updates.get(topic, 0) <= row["at"]
@@ -3737,30 +3787,50 @@ class Runner:
                          "、".join(labels.get(key, key.removeprefix("dessert:")) for key in sorted(repeated)))
         return "\n".join(parts)
 
-    def _delivery_snapshot(self, umo):
+    def _delivery_snapshot(self, umo, cid=None):
         event = self._fresh_event(umo, time.time()) or {}
-        return (self._proactive_scene(umo), copy.deepcopy(self._sleep_state(umo)),
+        return (self._proactive_scene(umo, cid=cid), copy.deepcopy(self._sleep_state(umo)),
                 self._appointments(umo), event.get("started_at"),
                 event.get("keyword"), self.store.get(umo, "last_bot_reply_at"))
 
     def _note_proactive(self, key):
         logger.info(f"{TAG} 主动消息：{key}")
 
-    async def _proactive_plan_evidence(self, umo, now):
-        history = await self._load_history(umo)
-        users = []
-        for item in reversed(history[-40:]):
-            if not isinstance(item, dict) or item.get("role") != "user":
+    async def _proactive_dialogue(self, umo, cid, now):
+        managed = getattr(self.context, "conversation_manager", None) is not None
+        if managed and not cid:
+            return []
+        history = await self._load_history(umo, cid=cid)
+        cap = self._context_settings()["history_cap"]
+        cutoff = now - timedelta(minutes=30)
+        turns, turn = [], None
+        for item in history[-cap:] if cap else history:
+            if not isinstance(item, dict):
                 continue
+            role = item.get("role")
             stamp = self._message_time(item)
-            if stamp and not timedelta(0) <= now - stamp <= timedelta(hours=24):
-                continue
-            body = self._plain_content(item.get("content")).split("<system_reminder>", 1)[0]
-            if body.strip():
-                users.append((body, stamp))
-            if len(users) == 12:
-                break
-        return users
+            recent = not stamp or cutoff <= stamp <= now
+            if role == "user":
+                turn = [item] if recent and (stamp or not managed) else None
+                if turn:
+                    turns.append(turn)
+            elif role == "assistant" and turn and recent and not item.get("tool_calls"):
+                # Keep the latest reply for tone and references for each user turn.
+                turn[1:] = [item]
+        return [item for turn in turns[-6:] for item in turn]
+
+    def _proactive_plan_evidence(self, dialogue):
+        for item in reversed(dialogue):
+            if item.get("role") == "user":
+                body = self._plain_content(item.get("content")).split("<system_reminder>", 1)[0].strip()
+                if body:
+                    yield body, self._message_time(item)
+
+    def ground_proactive_reply(self, text, snapshot, dialogue):
+        return quality.polish_reply(
+            text, snapshot[0], tuple(self._proactive_plan_evidence(dialogue)),
+            snapshot[2], now=datetime.now(),
+        )
 
     @staticmethod
     def _ground_appointment_reply(item, shot, text, now):
@@ -3850,7 +3920,7 @@ class Runner:
                 return self._result_current(umo, seq) and (
                     not self.is_sleeping(umo)
                     or bool(wake_due and self._sleep_state(umo) == wake_sleep)) and (
-                        self._delivery_snapshot(umo) == snapshot
+                        self._delivery_snapshot(umo, cid) == snapshot
                     )
             # 睡眠免打扰：说「睡了」之后静音（智能时长：近起床点到起床、远则 N 小时）
             if self.is_sleeping(umo) and not wake_due:
@@ -3917,13 +3987,19 @@ class Runner:
 
             # 待睡提醒：这次触发是「该睡了」的提醒，不是普通主动消息
             cid = await self._conversation_id(umo)
-            snapshot = self._delivery_snapshot(umo)
+            snapshot = self._delivery_snapshot(umo, cid)
             ordinary = not reminding and not shot
+            dialogue = None
             if ordinary:
+                dialogue = await self._proactive_dialogue(umo, cid, datetime.now())
+                if not can_send():
+                    result["reason"] = "stale_generation"
+                    self._note_proactive("stale_generation")
+                    return result
                 self._note_proactive("generation")
             text = await self._generate(
                 umo, reminder=reminding, appointment=shot, appointment_at=appt_at,
-                appointment_id=appt_id,
+                appointment_id=appt_id, cid=cid, dialogue=dialogue,
             )
             text, draft_reason = inspect_text(text or "")
             if draft_reason:
@@ -3955,17 +4031,7 @@ class Runner:
                 return result
 
             if ordinary:
-                now_dt = datetime.now()
-                users = ()
-                if quality.needs_plan_evidence(text):
-                    users = await self._proactive_plan_evidence(umo, now_dt)
-                    if not can_send():
-                        result["reason"] = "stale_generation"
-                        self._note_proactive("stale_generation")
-                        return result
-                text, refinements = quality.polish_reply(
-                    text, snapshot[0], users, snapshot[2], now=now_dt,
-                )
+                text, refinements = self.ground_proactive_reply(text, snapshot, dialogue)
                 for reason in sorted(refinements):
                     self._note_proactive(reason)
                 if not text:
@@ -4040,26 +4106,36 @@ class Runner:
         self, umo: str, reminder: bool = False,
         appointment: str | None = None, appointment_at: float | None = None,
         appointment_id: str | None = None,
+        *, cid=None, dialogue=None,
     ) -> str:
         cfg = self.cfg
         settings = self._context_settings()
         mode = settings["source_mode"]
+        ordinary = not reminder and not appointment
+        if ordinary and dialogue is None:
+            cid = await self._conversation_id(umo)
+            dialogue = await self._proactive_dialogue(umo, cid, datetime.now())
 
         # 只用平台流水时不需要塞会话历史，避免重复占上下文
         history = []
         if mode != "platform_message_history":
-            history = await self._load_history(umo)
+            history = dialogue if ordinary else await self._load_history(umo, cid=cid)
 
         platform_block = ""
         if mode in ("platform_message_history", "hybrid"):
-            platform_block = await self._platform_block(umo, settings)
+            platform_settings = settings
+            if ordinary:
+                platform_settings = {**settings, "proactive_since": self._platform_proactive_since(umo, cid),
+                                     "platform_history_count": min(settings["platform_history_count"],
+                                                                   6 - sum(x["role"] == "user" for x in history))}
+            platform_block = await self._platform_block(umo, platform_settings)
             if platform_block:
                 logger.info(
-                    f"{TAG} 已注入平台流水（模式={mode}，{len(platform_block)} 字）"
+                    f"{TAG} 已注入平台流水（模式={mode}）"
                 )
             elif mode == "platform_message_history":
                 logger.warning(f"{TAG} 没读到平台流水，已回退为会话历史")
-                history = await self._load_history(umo)
+                history = dialogue if ordinary else await self._load_history(umo, cid=cid)
 
         # 省 token：图片 / 思考块 / 上下文窗口（放在平台流水回退之后）
         if history:
@@ -4078,7 +4154,7 @@ class Runner:
         elif reminder:
             hint = self.reminder_hint(umo)
         else:
-            hint = self._proactive_hint(umo)
+            hint = "[已确认状态与待办]\n" + self._proactive_hint(umo, cid=cid)
         prompt = (
             template.replace("{{current_time}}", time_text())
             .replace("{{unanswered_count}}", str(unanswered))
@@ -4092,8 +4168,11 @@ class Runner:
             if item and item.get("label"):
                 prompt += f"\n第一句先说明已登记的事项「{item['label']}」，时间以这条约定为准。"
         elif not reminder:
-            prompt += ("\n整条只接一个主要话题。说完就停，下一句要有新意思。"
-                       "按对方最近确认的场景接话，具体安排以对方确认或已登记的约定为准。")
+            if "{{event_hint}}" not in template:
+                prompt += "\n" + hint
+            prompt += ("\n近期对话只用来接话，助手说过的话只作话题和语气参考。"
+                       "当前活动和具体安排以已确认状态及用户的明确陈述为准。"
+                       "状态未知时可以轻轻问候。只接一个话题，说完就停。")
 
         provider = self.context.get_using_provider(umo=umo)
         if provider is None:
@@ -4168,7 +4247,7 @@ class Runner:
     # 兼容 AstrBot 常见的几种写法：2026-10-31 14:07 / 2026/10/31 14:07 / 带秒
     _REMINDER_TS = re.compile(
         r"Current datetime:\s*([0-9]{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})"
-        r"\s+([0-9]{1,2}):([0-9]{2})"
+        r"\s+([0-9]{1,2}):([0-9]{2})(?::([0-9]{2}))?"
     )
 
     @classmethod
@@ -4192,11 +4271,7 @@ class Runner:
             if not match:
                 continue
             try:
-                return datetime.strptime(
-                    f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
-                    f" {int(match.group(4)):02d}:{match.group(5)}",
-                    "%Y-%m-%d %H:%M",
-                )
+                return datetime(*(int(part or 0) for part in match.groups()))
             except ValueError:
                 continue
         return None
@@ -4664,7 +4739,21 @@ class Runner:
     async def _platform_block(self, umo: str, settings: dict) -> str:
         """把平台流水渲染成一段可直接拼进 prompt 的文本。"""
         count = settings["platform_history_count"]
+        since = settings.get("proactive_since")
+        if since == float("inf") or count <= 0:
+            return ""
         records = await self._load_platform_records(umo, count)
+        if since is not None:
+            end = time.time()
+            recent = []
+            for record in records:
+                created = self._record_field(record, "created_at")
+                if isinstance(created, datetime):
+                    # AstrBot's legacy SQLite timestamps are naive UTC.
+                    instant = (created if created.tzinfo else created.replace(tzinfo=timezone.utc)).timestamp()
+                    if since <= instant <= end:
+                        recent.append(record)
+            records = recent
         lines = self._format_platform_lines(
             records, settings["include_bot_messages"], count
         )
@@ -4688,6 +4777,13 @@ class Runner:
             .replace("{{current_time}}", time_text())
             .replace("{{unanswered_count}}", str(unanswered))
         )
+
+    def _platform_proactive_since(self, umo, cid):
+        if not self._has_current_scene(umo, cid):
+            return float("inf")
+        window = time.time() - 1800
+        bound = self.store.get(umo, "scene_conversation") or {}
+        return max(window, _as_float_safe(bound.get("since")))
 
     @staticmethod
     def _plain_content(content) -> str:
@@ -4729,10 +4825,10 @@ class Runner:
         ]
         return "\n".join(lines)
 
-    async def _load_history(self, umo: str) -> list:
+    async def _load_history(self, umo: str, *, cid=None) -> list:
         try:
             cm = self.context.conversation_manager
-            conv_id = await cm.get_curr_conversation_id(umo)
+            conv_id = cid or await cm.get_curr_conversation_id(umo)
             if not conv_id:
                 return []
             conv = await cm.get_conversation(umo, conv_id)

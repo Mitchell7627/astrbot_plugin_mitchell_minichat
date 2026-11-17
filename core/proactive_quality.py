@@ -30,6 +30,11 @@ _DESTINATION = re.compile(r"到(家|学校|教室|店里)")
 _BATH_CONTEXT = re.compile(r"洗澡|浴缸|浴室|泡澡|出浴|再泡下去|还没洗完澡")
 _BATH_EXIT = re.compile(r"还不出来|还没出来|起来吧|快(?:从浴缸)?出来|该出来|再泡.{0,8}晕|出来换|出来吧")
 _BATH_NOW = re.compile(r"还没洗完|还在泡|再泡|泡一会儿再出来|出来后.{0,10}(?:擦干|擦头发|换衣)")
+_LONG_SOAK = re.compile(r"(?:别|不要)泡(?:得)?(?:太|这么|那么)久|泡(?:了|得)这么久")
+_IN_THERE = re.compile(r"还在(?:里头|里面|里边)|还没出来")
+_COOL_WATER = re.compile(r"水(?:都|已经|快|有点){0,3}(?:要)?凉")
+_OTHER_SOAK = re.compile(r"茶|咖啡|燕麦|泡面|泡脚|泡茶|泡衣服")
+_HYPOTHETICAL = re.compile(r"如果|假如|要是|洗澡的话|泡澡的话|洗澡时|泡澡时|下次.{0,8}(?:洗澡|泡澡)")
 _BATH_DETAIL = re.compile(r"头发|擦干|毛巾|换衣|水温|别着凉")
 _BOOKING = re.compile(r"(?:票|座位|行程)(?:都|也|刚|已经|早就|总算|是|已经都|都已经){0,3}"
                       r"(?:订好|定好|买好|买了|已订)|"
@@ -66,11 +71,6 @@ def _concrete_plan(sentence):
         _BOOKING.search(sentence) or _PLAN_DIRECTIVE.search(sentence)
         or _PLAN_CLAIM.search(sentence) and _PLAN_OBJECT.search(sentence)
     )
-
-
-def needs_plan_evidence(text):
-    return any(_concrete_plan(statement) for statement in
-               re.split(r"(?<=[。！？!?；;])|\r?\n", _QUOTED.sub(" ", text)))
 
 
 def _matched_plan(sentence, user_turns, appointments, now, anchor=""):
@@ -122,7 +122,11 @@ def polish_reply(text, scene, user_turns=(), appointments=(), *, now=None):
     sentences = split_text(text, pattern=r"[。！？!?；;\r\n]+", min_length=0,
                            balanced=False, max_segments=len(text) + 1, trim=False)
     visible = [_QUOTED.sub(" ", sentence) for sentence in sentences]
-    bath = any(_BATH_CONTEXT.search(sentence) for sentence in visible)
+    current = [content for content in visible
+               if not _HYPOTHETICAL.search(content) and not _OTHER_SOAK.search(content)]
+    bath = any(_BATH_CONTEXT.search(content) for content in current)
+    implicit_bath = (any(_LONG_SOAK.search(content) for content in current) and
+                     any(_IN_THERE.search(content) or _COOL_WATER.search(content) for content in current))
     kept, seen, reasons = [], [], set()
     plan_rejected, plan_anchor = False, ""
     for sentence, content in zip(sentences, visible):
@@ -137,7 +141,11 @@ def polish_reply(text, scene, user_turns=(), appointments=(), *, now=None):
             if _PLAN_OBJECT.search(content):
                 plan_anchor = content
         bath_exit = _BATH_EXIT.search(content)
-        if bath and (scene[1] != "shower" or scene[2] == "her") and (bath_exit or _BATH_NOW.search(content)):
+        if (scene[1] != "shower" or scene[2] == "her") and content in current and (
+            bath and (bath_exit or _BATH_NOW.search(content))
+            or implicit_bath and (_LONG_SOAK.search(content) or _IN_THERE.search(content)
+                                  or _COOL_WATER.search(content))
+        ):
             reasons.add("unconfirmed_bath")
             continue
         key = _normalize(sentence)
