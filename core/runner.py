@@ -2464,6 +2464,8 @@ class Runner:
             value = match.group().strip()
             if not value or not self._looks_active(value):
                 continue
+            if self._CONTEXT_ONLY_ACTIVITY.fullmatch(value):
+                continue
             if self.is_confirmation(value):
                 continue
             start = match.start() + len(match.group()) - len(match.group().lstrip())
@@ -2837,7 +2839,8 @@ class Runner:
             updates.update(dict.fromkeys(new_topics, time.time()))
             self.store.set(umo, "proactive_topic_updates", updates)
         try:
-            handled = self._update_inner(umo, text)
+            effective, corrected = self._clarify_activity(umo, text)
+            handled = self._update_inner(umo, effective) or corrected
         finally:
             handled = self._flush_decisions(umo, text, before, handled)
             seq = _as_int(self.store.get(umo, 'turn_seq'), 0)
@@ -2851,6 +2854,9 @@ class Runner:
             self._semantic_turns[umo] = {
                 'latest': seq, 'intent': previous.get('intent', seq - 1) if neutral else seq,
                 'neutral': neutral,
+                'clarification_at': time.time() if self._CLARIFICATION.fullmatch(
+                    text.strip().rstrip(rules.CLAUSE_BOUNDARY + "：: ")
+                ) else None,
             }
             for candidate in (self._gray_candidate, self._appt_candidate):
                 if isinstance(candidate, dict):
@@ -2868,6 +2874,44 @@ class Runner:
             ) or re.fullmatch(r"\s*(?:要不然|不然)?(?:磨|蹭|撞|碰|压|夹|烫|硌)到了[啊呀呢喵咯啦]*\s*", value):
                 text = self._mask_span(text, clause.start(), clause.end())
         return text
+
+    _CONTEXT_ONLY_ACTIVITY = re.compile(
+        r"(?:我|哥哥)?(?:来了来了|来(?:了|啦|咯|喽)|(?:要|快要|快)?沉(?:进去|下去)了)[啊呀喵啦咯呢哦]*"
+    )
+    _CLARIFICATION = re.compile(r"(?:(?:我|哥哥)?的?意思是|我(?:是说|说的是))")
+    _BATH_EVIDENCE = re.compile(r"洗澡|泡澡|冲(?:个|下)?(?:凉|澡)|沐浴|淋浴|浴缸|搓澡|搓背")
+    _BATH_METAPHOR = re.compile(r"(?:沉|陷|掉|钻).{0,12}(?:抱抱|怀里)|^(?:就是|只是)?(?:说的)?(?:抱抱|拥抱)")
+
+    def _clarify_activity(self, umo: str, text: str) -> tuple[str, bool]:
+        previous = self._semantic_turns.get(umo, {})
+        opened_at = previous.get("clarification_at")
+        follows = opened_at is not None and 0 <= time.time() - opened_at <= 30
+        prefix = self._CLARIFICATION.match(text.lstrip())
+        if not prefix and not follows:
+            return text, False
+        offset = len(text) - len(text.lstrip()) + prefix.end() if prefix else 0
+        explanation = text[offset:].lstrip(rules.CLAUSE_BOUNDARY + "：: ")
+        start = len(text) - len(explanation)
+        clause = explanation[:rules.clause_end(explanation, 0)]
+        if (not self._BATH_METAPHOR.search(clause)
+                or self._BATH_EVIDENCE.search(clause)
+                or rules.is_question_clause(text, start)
+                or rules.is_conditional_clause(text, start)
+                or rules.is_reported_clause(text, start)
+                or re.search(r"不是|并非|别|不要", clause)):
+            return text, False
+        # Mask only the explanation. Later clauses may assert a new activity.
+        masked = self._mask_span(text, 0, start + len(clause))
+        event = self._active_event(umo) or {}
+        if event.get("name") != "shower" or not event.get("unconfirmed_source"):
+            return masked, False
+        self.store.pop(umo, "active_event")
+        self._sync_together_until(umo, closing=True)
+        self._note("stop", {"hit": {"kw": clause, "idx": start,
+                                    "gate_rule": "CLARIFIED", "reason": "用户澄清了先前的活动含义"}})
+        self.store.save()
+        logger.info(f"{TAG} 用户澄清先前的活动含义，清除洗澡推断")
+        return masked, True
 
     def _activity_signal(self, umo, text, event, now):
         """Handle explicit transitions without turning them into new activities."""
@@ -3265,6 +3309,7 @@ class Runner:
                 text, md.get("idx"), len(md.get("kw") or "")
             )
             event["keyword"] = md.get("kw") or event.get("keyword")
+            event.pop("unconfirmed_source", None)
             self._sync_together_until(umo, event)
             logger.info(f"{TAG} 事件续期：{event.get('label')}")
             return None, True
@@ -3294,10 +3339,12 @@ class Runner:
         eng = self.engine_cfg
         if not bool(eng.get("enable_llm_event", True)):
             return {"skipped": "llm_event_disabled"}
-        rules = self.engine.rules_snapshot()
-        if not rules:
+        event_rules = self.engine.rules_snapshot()
+        if not event_rules:
             return {"skipped": "no_rules"}
-        if not self._looks_active(text):
+        if not self._looks_active(text) or self._CONTEXT_ONLY_ACTIVITY.fullmatch(
+            text.strip(rules.CLAUSE_BOUNDARY + " ")
+        ):
             return {"skipped": "prefilter"}
         # 关键词那层已经滤过将来时，这里再兜一次：
         # 「明早哥哥要上课」这种是在说日程，不是此刻在忙，别让模型把它落成事件。
@@ -3327,7 +3374,7 @@ class Runner:
                 if r.get("keywords")
                 else ""
             )
-            for r in rules
+            for r in event_rules
         )
         # 提示词模板：优先用 Web 覆盖，否则用内置默认。
         override = self.plugin.web_override("classify_sys_prompt") if hasattr(self.plugin, "web_override") else None
@@ -3451,7 +3498,12 @@ class Runner:
             if gray_fallback:
                 await self.review_gray(umo, gray_fallback)
             return
+        unconfirmed = name == "shower" and not self._BATH_EVIDENCE.search(text)
+        if unconfirmed and (event := self._active_event(umo)) and event.get("name") == "shower":
+            return
         self._set_event(umo, rule, "语义:" + name, source_text=text)
+        if unconfirmed:
+            self.store.get(umo, "active_event")["unconfirmed_source"] = True
         self.store.save()
         logger.info(f"{TAG} 语义识别：{text[:16]} → {rule.get('label')}")
         # 语义识别是异步的，消息入口那次采样还没带上事件加成，这里按新状态重排一次。
@@ -3692,6 +3744,22 @@ class Runner:
     def _note_proactive(self, key):
         logger.info(f"{TAG} 主动消息：{key}")
 
+    async def _proactive_plan_evidence(self, umo, now):
+        history = await self._load_history(umo)
+        users = []
+        for item in reversed(history[-40:]):
+            if not isinstance(item, dict) or item.get("role") != "user":
+                continue
+            stamp = self._message_time(item)
+            if stamp and not timedelta(0) <= now - stamp <= timedelta(hours=24):
+                continue
+            body = self._plain_content(item.get("content")).split("<system_reminder>", 1)[0]
+            if body.strip():
+                users.append((body, stamp))
+            if len(users) == 12:
+                break
+        return users
+
     @staticmethod
     def _ground_appointment_reply(item, shot, text, now):
         label = item["label"]
@@ -3885,6 +3953,22 @@ class Runner:
                 return result
 
             if ordinary:
+                now_dt = datetime.now()
+                users = ()
+                if quality.needs_plan_evidence(text):
+                    users = await self._proactive_plan_evidence(umo, now_dt)
+                    if not can_send():
+                        result["reason"] = "stale_generation"
+                        self._note_proactive("stale_generation")
+                        return result
+                text, refinements = quality.polish_reply(
+                    text, snapshot[0], users, snapshot[2], now=now_dt,
+                )
+                for reason in sorted(refinements):
+                    self._note_proactive(reason)
+                if not text:
+                    result["reason"] = "proactive_filtered"
+                    return result
                 if quality.contradictory_clock(text, datetime.now()):
                     result["reason"] = "clock_conflict"
                     self._note_proactive("clock_conflict")
@@ -4005,6 +4089,9 @@ class Runner:
             item = self._appointment_item_for(umo, appointment_at, appointment_id)
             if item and item.get("label"):
                 prompt += f"\n第一句先说明已登记的事项「{item['label']}」，时间以这条约定为准。"
+        elif not reminder:
+            prompt += ("\n整条只接一个主要话题。说完就停，下一句要有新意思。"
+                       "按对方最近确认的场景接话，具体安排以对方确认或已登记的约定为准。")
 
         provider = self.context.get_using_provider(umo=umo)
         if provider is None:
