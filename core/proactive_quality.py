@@ -63,11 +63,14 @@ def contradictory_clock(text, now):
         if "不到" in head or "没到" in head:
             if minute >= target:
                 return True
-        elif head == "已经过了":
+        elif head.startswith(("已经", "都已经")):
             if minute < target:
                 return True
-        elif abs(minute - target) >= (1 if ":" in match[2] or "：" in match[2] or clock["m"] else 5):
-            return True
+        else:
+            exact = re.match(r"\s*整", tail) or ":" in match[2] or "：" in match[2] or clock["m"]
+            if ((exact and minute != target)
+                    or (not exact and now.hour != target // 60)):
+                return True
     return False
 
 

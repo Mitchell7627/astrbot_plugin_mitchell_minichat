@@ -98,6 +98,8 @@ async def test_failed_save_cannot_roll_back_a_later_successful_save(plugin, monk
     entered, release = asyncio.Event(), asyncio.Event()
     calls = 0
     original_minimum = plugin.friend_cfg['schedule_settings']['min_interval_minutes']
+    original_maximum = plugin.friend_cfg['schedule_settings']['max_interval_minutes']
+    new_maximum = 201 if original_maximum == 200 else 200
 
     async def persist():
         nonlocal calls
@@ -113,14 +115,14 @@ async def test_failed_save_cannot_roll_back_a_later_successful_save(plugin, monk
     }}))
     await asyncio.wait_for(entered.wait(), 2)
     second = asyncio.create_task(plugin.panel_service.config_save({'patch': {
-        'friend_settings': {'schedule_settings': {'max_interval_minutes': 200}},
+        'friend_settings': {'schedule_settings': {'max_interval_minutes': new_maximum}},
     }}))
     await asyncio.sleep(0)
     release.set()
     results = await asyncio.gather(first, second, return_exceptions=True)
     assert isinstance(results[0], PanelError) and results[1]['saved']
     assert plugin.friend_cfg['schedule_settings']['min_interval_minutes'] == original_minimum
-    assert plugin.friend_cfg['schedule_settings']['max_interval_minutes'] == 200
+    assert plugin.friend_cfg['schedule_settings']['max_interval_minutes'] == new_maximum
 
 
 async def test_enable_cycle_invalidates_pending_work_and_restarts_scheduling(plugin, umo, clock, monkeypatch):
