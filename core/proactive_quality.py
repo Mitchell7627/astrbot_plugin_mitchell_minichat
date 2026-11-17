@@ -4,6 +4,8 @@ import hashlib
 import re
 import unicodedata
 
+from .appointment import find_clock
+
 
 _TOPICS = {
     "shoulder": re.compile(
@@ -13,11 +15,60 @@ _TOPICS = {
     "bed": re.compile(r"(?:挪|卷|抢|分).{0,8}被[子窝]|被[子窝].{0,10}(?:挪|卷|跑|抢)|"
                       r"再.{0,4}(?:眯|闭|赖|睡).{0,6}(?:会|五分钟|眼)|再眯|再五分钟"),
     "waiting": re.compile(r"(?:一直|还在|就在)?等(?:你|哥哥)(?:回[来家]|到家)"),
+    "arrival_check": re.compile(r"还没到|走到哪|到(?:教室|店里)了没|离店还远|到了(?:记得|说一声)"),
 }
+_DESSERT = re.compile(r"布丁|甜点|蛋糕|冰淇淋")
+_DESSERT_STATE = re.compile(r"冰箱|还剩|凉着|留(?:着|给)|买好了|摆桌上|拿出来|有得吃")
 
 
 def topics(text):
-    return sorted(name for name, pattern in _TOPICS.items() if pattern.search(text))
+    found = [name for name, pattern in _TOPICS.items() if pattern.search(text)]
+    for clause in re.split(r"[。！？!?\n；;]+", text):
+        if _DESSERT_STATE.search(clause):
+            found.extend("dessert:" + name for name in _DESSERT.findall(clause))
+    return sorted(set(found))
+
+
+def contradictory_clock(text, now):
+    """Check clear claims about now, leaving quoted times and plans alone."""
+    for match in re.finditer(
+        r"(?:^|[，。！？\n])\s*(还没到|还不到|都还没到|已经过了|已经|现在是|现在|都已经)"
+        r"\s*((?:(?:凌晨|早上|上午|中午|下午|傍晚|晚上)\s*)?"
+        r"(?:\d{1,2}[:：]\d{2}|[零〇一二两三四五六七八九十\d]{1,3}[点時时](?:半|[零〇一二两三四五六七八九十\d]{1,3}分)?))",
+        text,
+    ):
+        tail = text[match.end():]
+        if re.match(r"\s*(?:过|半|多|左右|以前|以后|之前|之后|下课|开会|(?:啦|了|喵|呢)*[吗么？?])", tail):
+            continue
+        clock = find_clock(match[2] + "钟")
+        if not clock:
+            continue
+        hour = clock["h"]
+        period = clock.get("period")
+        if period in {"night", "pm", "noon"} and hour < 12:
+            hours = [hour + 12]
+        elif period == "dawn" and hour == 12:
+            hours = [0]
+        elif period is None and 1 <= hour <= 12:
+            hours = [hour % 12, hour % 12 + 12]
+        else:
+            hours = [hour]
+        minute = now.hour * 60 + now.minute
+        target = min((h * 60 + clock["m"] for h in hours), key=lambda m: abs(m - minute))
+        # Ignore distant unqualified times and midnight rollover instead of
+        # correcting the model's intended date by guessing.
+        if abs(target - minute) > 180:
+            continue
+        head = match[1]
+        if "不到" in head or "没到" in head:
+            if minute >= target:
+                return True
+        elif head == "已经过了":
+            if minute < target:
+                return True
+        elif abs(minute - target) >= (1 if ":" in match[2] or "：" in match[2] or clock["m"] else 5):
+            return True
+    return False
 
 
 def _hash(text):
@@ -52,9 +103,10 @@ def duplicate(candidate, rows, topic_updates):
         if (set(candidate["sentences"]).intersection(prior.get("sentences", ()))
                 or grams and previous and len(grams & previous) / len(grams | previous) >= .72):
             return "similar_text"
-        if prior["scene"] == candidate["scene"] and any(
+        if any(
             topic_updates.get(topic, 0) <= prior["at"]
             for topic in set(prior["topics"]) & set(candidate["topics"])
+            if prior["scene"] == candidate["scene"] or topic.startswith("dessert:")
         ):
             return "same_topic"
     return None

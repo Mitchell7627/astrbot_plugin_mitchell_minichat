@@ -2338,7 +2338,7 @@ class Runner:
     # 判定记录（面板「最近判定」+ 一键撤销）
     # ------------------------------------------------------------------
     WATCH_KEYS = ("away", "together", "active_event", "pre_event_next_at",
-                  "sleep_state", "appointments")
+                  "sleep_state", "appointments", "latest_activity_signal")
 
     def _dec_limit(self) -> int:
         return max(0, _as_int(self.engine_cfg.get("decision_log_size"), 50))
@@ -2869,6 +2869,49 @@ class Runner:
                 text = self._mask_span(text, clause.start(), clause.end())
         return text
 
+    def _activity_signal(self, umo, text, event, now):
+        """Handle explicit transitions without turning them into new activities."""
+        matches = re.finditer(rf"[^{re.escape(rules.CLAUSE_BOUNDARY)}]+", text)
+        for clause in matches:
+            value = clause.group().strip()
+            phrasing = re.fullmatch(
+                r"(?:我(?:已经|刚刚)?|已经|刚刚)?"
+                r"(吃完(?:饭)?|洗完(?:澡)?|到|(?:快要?|马上(?:就)?|就要)(?:下课|下班|散会|收工|考完|吃完|洗完))"
+                r"[了啦咯喽哦呀喵呢]*", value,
+            )
+            if not phrasing:
+                continue
+            signal = phrasing[1]
+            # A bare 到 needs a completion particle. Queries and examples
+            # remain ordinary chat.
+            idx = clause.start() + clause.group().find(value) + phrasing.start(1)
+            if ((signal == "到" and value.endswith("到"))
+                    or rules.is_question_clause(text, idx, kw_len=len(signal))
+                    or rules.is_reported_clause(text, idx)
+                    or rules.is_conditional_clause(text, idx)
+                    or rules.is_dream_clause(text, idx)):
+                continue
+            name = (event or {}).get("name")
+            if signal.startswith(("快", "马上", "就要")):
+                self._note("stop", {"dropped": [{"kw": signal, "idx": idx, "verdict": "reject",
+                                                "rule": "NOT_YET", "reason": "还没结束"}]})
+            else:
+                label, target = (
+                    ("已到达，地点未确认", "commute") if signal == "到" else
+                    ("已经吃完", "eating") if signal.startswith("吃") else ("已经洗完澡", "shower")
+                )
+                matches_event = name == target or target == "eating" and name == "cooking"
+                if matches_event:
+                    self.store.pop(umo, "active_event")
+                    self._sync_together_until(umo, closing=True)
+                if not name or matches_event:
+                    self.store.set(umo, "latest_activity_signal", {"label": label, "at": now})
+                    self._note("stop", {"hit": {"kw": signal, "idx": idx, "gate_rule": "END",
+                                                "reason": label}})
+                    logger.info(f"{TAG} 明确状态更新：{label}")
+            return self._mask_span(text, clause.start(), clause.end())
+        return None
+
     # 一句话最多回炉几次：每轮至少遮掉一个分句，防止遮罩不收敛导致死循环。
     # 约定 + 结束词 + 交接可能连着回炉三次，留到 6 轮。
     CLAUSE_PASS_MAX = 6
@@ -2949,6 +2992,10 @@ class Runner:
             store.pop(umo, "active_event")
             self._sync_together_until(umo, closing=True)
             event = None
+
+        rest = self._activity_signal(umo, text, event, now)
+        if rest is not None:
+            return (rest if rest.strip() else None), True
 
         # 「快回来了」要先判：默认词表里「快到家」本身包含回归词「到家」，
         # 若先走回归分支，「快到家了」会把出门事件直接清掉，加速永远不生效。
@@ -3143,17 +3190,6 @@ class Runner:
 
         # 结束词（带闸门：「吃完了的时候」这种名词化不算结束）
         stop = self.engine.stop_detail(event, text) if isinstance(event, dict) else {"stopped": False, "dropped": []}
-        if isinstance(event, dict) and not stop.get("stopped"):
-            ending = {"eating": "吃完", "shower": "洗完"}.get(event.get("name"))
-            if ending:
-                for match in re.finditer(rf"(?:^|[{re.escape(rules.CLAUSE_BOUNDARY)}])\s*(?:我)?({ending})[了啦咯喽哦呀喵呢]*\s*(?=$|[{re.escape(rules.CLAUSE_BOUNDARY)}])", text):
-                    idx = match.start(1)
-                    if not (rules.is_question_clause(text, idx, kw_len=len(ending))
-                            or rules.is_reported_clause(text, idx)
-                            or rules.is_conditional_clause(text, idx)):
-                        stop = {"stopped": True, "idx": idx, "kw": ending,
-                                "gate_rule": "END", "reason": "明确结束当前活动", "dropped": []}
-                        break
         # 命中不等于已执行：加速或做饭交接分支可能保留/替换当前事件。
         self._note("stop", {"hit": None, "dropped": stop.get("dropped") or []})
         stopping = bool(stop.get("stopped"))
@@ -3623,6 +3659,10 @@ class Runner:
         elif event:
             who = {"her": "你", "together": "你们", "self": "他"}.get(subject, "当前提到的活动")
             parts.append(f"{who}：{event.get('label', '')}，目前没有结束确认")
+        else:
+            signal = self.store.get(umo, "latest_activity_signal") or {}
+            if signal.get("label") and 0 <= now - _as_float_safe(signal.get("at")) <= 1800:
+                parts.append(signal["label"])
         pending = [item for item in self._appointments(umo)
                    if item.get("at", 0) > now and item.get("stage") != "done"]
         if pending:
@@ -3633,12 +3673,14 @@ class Runner:
         recent = quality.recent(self.store.get(umo, "proactive_recent", []), now)
         scene = self._proactive_scene(umo, now=now)
         updates = self.store.get(umo, "proactive_topic_updates", {})
-        repeated = {topic for row in recent if row["scene"] == scene for topic in row["topics"]
-                    if updates.get(topic, 0) <= row["at"]}
+        repeated = {topic for row in recent for topic in row["topics"]
+                    if updates.get(topic, 0) <= row["at"]
+                    and (row["scene"] == scene or topic.startswith("dessert:"))}
         if repeated:
-            labels = {"shoulder": "重复的靠近动作", "bed": "被子和赖床", "waiting": "等人回来"}
+            labels = {"shoulder": "重复的靠近动作", "bed": "被子和赖床", "waiting": "等人回来",
+                      "arrival_check": "反复问到了没"}
             parts.append("这类开场近期用过，请换一个有上下文的话题：" +
-                         "、".join(labels[key] for key in sorted(repeated)))
+                         "、".join(labels.get(key, key.removeprefix("dessert:")) for key in sorted(repeated)))
         return "\n".join(parts)
 
     def _delivery_snapshot(self, umo):
@@ -3649,6 +3691,29 @@ class Runner:
 
     def _note_proactive(self, key):
         logger.info(f"{TAG} 主动消息：{key}")
+
+    @staticmethod
+    def _ground_appointment_reply(item, shot, text, now):
+        label = item["label"]
+        target = datetime.fromtimestamp(item["at"])
+        when = target.strftime("%H:%M")
+        clock = find_appointment_clock(text)
+        same_clock = not clock or resolve_appointment_clock(
+            clock, target - timedelta(minutes=1), 24
+        ) == target.timestamp()
+        first = re.split(r"[。！？!?\n]", text, maxsplit=1)[0]
+        if (label in first and same_clock and not quality.contradictory_clock(text, now)
+                and not re.search(r"明天|昨天|后天", text) and not item.get("deferred")):
+            return text
+        if item.get("deferred"):
+            return f"补提醒一下，你之前说的{label}喔"
+        if shot == "lead":
+            return f"提醒一下，{when}的{label}快到时间啦"
+        if shot == "follow":
+            return f"再提醒一声，{when}是你说的{label}时间喔"
+        if item.get("kind") == "wake":
+            return f"{when}啦，该起床喔"
+        return f"{when}啦，提醒你一下，你说的{label}时间到了"
 
     async def deliver(self, umo, text, *, cid, guard, report, scene=None):
         """Send and record successful segments under AstrBot's conversation lock."""
@@ -3793,10 +3858,13 @@ class Runner:
             text, draft_reason = inspect_text(text or "")
             if draft_reason:
                 self._note_proactive(draft_reason)
-            if draft_reason and not text and shot in ("due", "follow"):
+            if shot and (text or draft_reason):
                 item = self._appointment_item_for(umo, appt_at, appt_id) or {}
-                if item.get("label"):
-                    text = f"说好的时间到了，该{item['label']}啦"
+                if item.get("label") and item.get("at"):
+                    checked = self._ground_appointment_reply(item, shot, text, datetime.now())
+                    if checked != text:
+                        self._note_proactive("appointment_corrected")
+                        text = checked
             if not text:
                 result["reason"] = "empty_generation"
                 if ordinary:
@@ -3817,6 +3885,10 @@ class Runner:
                 return result
 
             if ordinary:
+                if quality.contradictory_clock(text, datetime.now()):
+                    result["reason"] = "clock_conflict"
+                    self._note_proactive("clock_conflict")
+                    return result
                 now = time.time()
                 repeat = quality.duplicate(
                     quality.fingerprint(text, now, snapshot[0]),
@@ -3928,6 +4000,11 @@ class Runner:
         )
         if platform_block:
             prompt = prompt + "\n\n" + platform_block
+        prompt += "\n当前钟点以本轮时间为准。每句单独一行，需要停顿时保留标点。"
+        if appointment:
+            item = self._appointment_item_for(umo, appointment_at, appointment_id)
+            if item and item.get("label"):
+                prompt += f"\n第一句先说明已登记的事项「{item['label']}」，时间以这条约定为准。"
 
         provider = self.context.get_using_provider(umo=umo)
         if provider is None:
@@ -4698,16 +4775,11 @@ class Runner:
                 cleaned.append(text)
         return cleaned
 
-    async def _send_split(self, umo: str, text: str, sent_out: list | None = None,
-                          report: dict | None = None, guard=None, conversation_id=None) -> str:
-        """分段发送。返回**实际送达**的文本（空串表示一段都没发出去）。
-
-        以前返回 bool，只要第一段成功就为 True，调用方随后把整段原文写进历史——
-        没送达的那几段会变成「她说过、你没读到」的幽灵记录，后面的回复会接着它演。
-        """
+    def prepare_segments(self, text: str) -> list[str]:
+        """面板预览与实际发送共用同一份分段设置。"""
         conf = self.cfg.get("segmented_reply_settings", {}) or {}
         if not bool(conf.get("enable", True)):
-            segments = [normalize_escapes(text).replace("\n", " ").strip()]
+            segments = [re.sub(r"[\r\n]+", " ", normalize_escapes(text)).strip()]
         else:
             segments = split_text(
                 text,
@@ -4725,7 +4797,13 @@ class Runner:
             segments = self._cleanup_segments(
                 segments, str(conf.get("content_cleanup_rule") or "")
             )
+        return [segment for segment in segments if segment]
 
+    async def _send_split(self, umo: str, text: str, sent_out: list | None = None,
+                          report: dict | None = None, guard=None, conversation_id=None) -> str:
+        """返回实际发送成功的段落，保持发送顺序。"""
+        conf = self.cfg.get("segmented_reply_settings", {}) or {}
+        segments = self.prepare_segments(text)
         if report is not None:
             report.update(planned_segments=len(segments), delivered_segments=0,
                           delivery_status="not_sent")

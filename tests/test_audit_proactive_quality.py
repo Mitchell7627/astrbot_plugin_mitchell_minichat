@@ -197,3 +197,101 @@ async def test_changed_scene_while_generating_is_rejected(plugin, umo, clock, mo
     resume.set()
     assert (await asyncio.wait_for(fire, 2))["reason"] == "stale_generation"
     plugin.context.send_message.assert_not_awaited()
+
+@pytest.mark.parametrize("text,limit,short,expected", [
+    ("汤刚盛好，小心烫\n先尝一小口\n闻起来真香", 1, 0,
+     ["汤刚盛好，小心烫，先尝一小口，闻起来真香"]),
+    ("出门啦\n说好去买菜的，我等了好久", 7, 8, ["出门啦，说好去买菜的，我等了好久"]),
+    ("Hello\nHow are you?", 1, 8, ["Hello How are you?"]),
+    ("先试一下。\n—\n慢慢来就好喵", 7, 0, ["先试一下。—", "慢慢来就好喵"]),
+])
+def test_split_merges_preserve_pause_and_order(text, limit, short, expected):
+    from astrbot_plugin_mitchell_minichat.core.splitter import split_text
+
+    assert split_text(text, max_segments=limit, min_length=short, balanced=False) == expected
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_preview_matches_actual_segments(plugin, umo, monkeypatch, enabled):
+    r = plugin.runner
+    r.started = True
+    text = "先休息一下\n再聊聊最近的事"
+    r.cfg["segmented_reply_settings"]["enable"] = enabled
+    monkeypatch.setattr(r, "_generate", AsyncMock(return_value=text))
+    preview = await plugin.panel_service.preview({"umo": umo})
+    await plugin.panel_service.send({"umo": umo, "text": text})
+    delivered = [call.args[1].get_plain_text() for call in plugin.context.send_message.await_args_list]
+    assert preview["segments"] == delivered
+
+
+@pytest.mark.parametrize("reply,expected", [
+    ("还没到十点呢，先休息一下", True),
+    ("还没到十一点呢，先休息一下", False),
+    ("现在十点整了", True),
+    ("现在 10:06", False),
+    ("十点下课的话记得回来", False),
+    ("「还没到十点」是昨天说的", False),
+    ("现在十点半？", False),
+])
+def test_current_time_claim(reply, expected):
+    from astrbot_plugin_mitchell_minichat.core.proactive_quality import contradictory_clock
+
+    assert contradictory_clock(reply, datetime(2026, 11, 17, 10, 6)) == expected
+
+
+async def test_wrong_clock_never_reaches_send(plugin, umo, clock, monkeypatch):
+    clock.now = datetime(2026, 11, 17, 10, 6).timestamp()
+    r = plugin.runner
+    generate = AsyncMock(return_value="还没到十点呢，先休息一下")
+    monkeypatch.setattr(r, "_generate", generate)
+    result = await r._fire(umo)
+    assert result["reason"] == "clock_conflict"
+    generate.assert_awaited_once()
+    plugin.context.send_message.assert_not_awaited()
+    assert not plugin.store.get(umo, "unanswered")
+
+
+@pytest.mark.parametrize("text", ["甜点放桌上了", "十一点半下课啦", "甜点买好了\n十二点下课吧",
+                                  "上午十点怎么样，十二点下课喔"])
+async def test_due_reply_keeps_registered_subject_and_clock(plugin, umo, clock, monkeypatch, text):
+    r = plugin.runner
+    r.update_from_message(umo, "十二点下课哦")
+    clock.now = datetime(2026, 11, 2, 12).timestamp()
+    monkeypatch.setattr(r, "_generate", AsyncMock(return_value=text))
+    assert (await r._fire(umo))["sent"]
+    sent = plugin.context.send_message.await_args_list[0].args[1].get_plain_text()
+    assert "12:00" in sent and "下课" in sent
+    assert "甜点" not in sent and "十一点" not in sent
+
+
+async def test_repeated_dessert_phrase_is_not_sent_after_scene_changes(plugin, umo, clock, monkeypatch):
+    r = plugin.runner
+    replies = AsyncMock(side_effect=["布丁我已经买好了喵", "学累了歇一下\n布丁还在冰箱里凉着",
+                                    "冰箱里那份布丁给你留着喵"])
+    monkeypatch.setattr(r, "_generate", replies)
+    assert (await r._fire(umo))["sent"]
+    clock.now += 15 * 60
+    r.update_from_message(umo, "我正在上课")
+    assert (await r._fire(umo))["reason"] == "same_topic"
+    clock.now += 15 * 60
+    r.update_from_message(umo, "布丁刚买好了，我放冰箱啦")
+    assert (await r._fire(umo))["sent"]
+
+
+@pytest.mark.parametrize("signal,hint", [("洗完澡咯", "已经洗完澡"), ("吃完咯", "已经吃完"), ("到咯", "地点未确认")])
+def test_bare_completion_with_no_live_event_never_offers_activity_model(plugin, umo, clock, signal, hint):
+    r = plugin.runner
+    r.update_from_message(umo, signal)
+    assert r.take_llm_candidate(umo) is None
+    assert not plugin.store.get(umo, "active_event")
+    assert hint in r._proactive_hint(umo)
+
+
+def test_almost_finished_lesson_preserves_active_event(plugin, umo, clock):
+    r = plugin.runner
+    r.update_from_message(umo, "我正在上课")
+    r.update_from_message(umo, "快下课了")
+    assert r._proactive_scene(umo)[1] == "study"
+    assert r.take_llm_candidate(umo) is None
+    r.update_from_message(umo, "下课了")
+    assert not plugin.store.get(umo, "active_event")

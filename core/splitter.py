@@ -230,7 +230,10 @@ def _postprocess(segments, max_segments, min_length, trim):
         else:
             s = s.strip()
         s = re.sub(r"[ \t]{2,}", " ", s)
-        if s:
+        if re.fullmatch(r"[\s，。、；：！？,.!?:;—…～~]+", s):
+            if cleaned:
+                cleaned[-1] += s
+        elif s:
             cleaned.append(s)
 
     if not cleaned:
@@ -240,20 +243,34 @@ def _postprocess(segments, max_segments, min_length, trim):
     merged = []
     for seg in cleaned:
         if merged and len(seg) < min_length:
-            merged[-1] = merged[-1] + seg
+            merged[-1] = _join_segments(merged[-1], seg)
         else:
             merged.append(seg)
     if len(merged) > 1 and len(merged[0]) < min_length:
-        merged[1] = merged[0] + merged[1]
+        merged[1] = _join_segments(merged[0], merged[1])
         merged.pop(0)
 
     # 段数超过上限时，把末尾多余的并进最后一段
     if len(merged) > max_segments:
         head = merged[: max_segments - 1]
-        tail = "".join(merged[max_segments - 1 :])
+        tail, *rest = merged[max_segments - 1 :]
+        for segment in rest:
+            tail = _join_segments(tail, segment)
         merged = head + [tail]
 
     return [s for s in merged if s.strip()]
+
+
+def _join_segments(left, right):
+    # Newline boundaries disappear during trimming. Keep their pause when
+    # short sections (or overflow sections) share one QQ bubble.
+    if CJK_CHAR.fullmatch(left[-1]) and CJK_CHAR.fullmatch(right[0]):
+        separator = "，"
+    elif ALNUM_CHAR.fullmatch(right[0]):
+        separator = " "
+    else:
+        separator = ""
+    return left + separator + right
 
 
 def calc_delay(text, *, strategy="random", random_min=0.8, random_max=3.0,

@@ -20,7 +20,6 @@ from pathlib import Path
 from astrbot.api import logger
 
 from .probability import dual_forecast
-from .splitter import split_text
 from .reply_guard import inspect_text
 from .persistence import atomic_write_json
 
@@ -675,24 +674,7 @@ class PanelService:
                 raise PanelError("E_UPSTREAM", f"生成失败: {e}")
 
         text, _ = inspect_text(text or "")
-        segments = []
-        if text:
-            try:
-                conf = self.cfg.get("segmented_reply_settings", {}) or {}
-                segments = split_text(
-                    text,
-                    pattern=str(conf.get("split_regex") or r"[。.？！?!\n…～]+"),
-                    smart=bool(conf.get("enable_smart_split", True)),
-                    max_segments=_as_int(conf.get("max_segments"), 5),
-                    min_length=_as_int(conf.get("min_segment_length"), 12),
-                    balanced=bool(conf.get("balanced_split", True)),
-                    ratio_min=_as_float(conf.get("balanced_split_ratio_min"), 0.4),
-                    ratio_max=_as_float(conf.get("balanced_split_ratio_max"), 0.9),
-                    no_split_around=conf.get("no_split_around") or [],
-                    trim=bool(conf.get("trim_edge_blank", True)),
-                )
-            except Exception:
-                segments = [text]
+        segments = runner.prepare_segments(text)
         return {
             "umo": umo,
             "text": text,
