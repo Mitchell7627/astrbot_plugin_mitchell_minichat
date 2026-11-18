@@ -11,6 +11,7 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -127,6 +128,14 @@ def time_text(now: datetime | None = None) -> str:
     now = now or datetime.now()
     week = "一二三四五六日"[now.weekday()]
     return now.strftime("%Y年%m月%d日 ") + f"周{week} " + now.strftime("%H:%M")
+
+
+@dataclass(frozen=True)
+class _ProactiveInput:
+    history: list
+    platform_block: str
+    user_turns: tuple
+    scheduled: bool = False
 
 
 class Runner:
@@ -3826,9 +3835,43 @@ class Runner:
                 if body:
                     yield body, self._message_time(item)
 
+    async def _proactive_input(self, umo, cid, now, *, dialogue=None, scheduled=False):
+        settings = self._context_settings()
+        mode = settings["source_mode"]
+        if dialogue is None:
+            dialogue = await self._proactive_dialogue(umo, cid, now)
+        history = dialogue if mode != "platform_message_history" else []
+        turns = list(self._proactive_plan_evidence(history))
+        block = ""
+        if mode in ("platform_message_history", "hybrid"):
+            platform_settings = {**settings, "proactive_since": self._platform_proactive_since(umo, cid),
+                                 "platform_history_count": min(settings["platform_history_count"], 6 - len(turns))}
+            records = await self._platform_records_for_prompt(umo, platform_settings)
+            block = await self._platform_block(umo, platform_settings, records=records)
+            if block:
+                # A platform record is evidence only if its sender is this private chat's peer.
+                key = str(umo).split(":", 2)[-1]
+                peer_ids = {key, key.rsplit("!", 1)[-1]}
+                for record in records:
+                    if str(self._record_field(record, "sender_id", "")) not in peer_ids:
+                        continue
+                    body = self._record_text(record)[:200].split("<system_reminder>", 1)[0].strip()
+                    if body:
+                        stamp = self._record_field(record, "created_at")
+                        stamp = stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+                        turns.append((body, datetime.fromtimestamp(stamp.timestamp())))
+            elif mode == "platform_message_history":
+                logger.warning(f"{TAG} 没读到平台流水，已回退为会话历史")
+                history = dialogue
+                turns = list(self._proactive_plan_evidence(history))
+        turns.sort(key=lambda turn: turn[1] or datetime.min, reverse=True)
+        return _ProactiveInput(history, block, tuple(turns[:6]), scheduled)
+
     def ground_proactive_reply(self, text, snapshot, dialogue):
+        turns = (dialogue.user_turns if isinstance(dialogue, _ProactiveInput)
+                 else tuple(self._proactive_plan_evidence(dialogue)))
         return quality.polish_reply(
-            text, snapshot[0], tuple(self._proactive_plan_evidence(dialogue)),
+            text, snapshot[0], turns,
             snapshot[2], now=datetime.now(),
         )
 
@@ -3991,7 +4034,7 @@ class Runner:
             ordinary = not reminding and not shot
             dialogue = None
             if ordinary:
-                dialogue = await self._proactive_dialogue(umo, cid, datetime.now())
+                dialogue = await self._proactive_input(umo, cid, datetime.now(), scheduled=True)
                 if not can_send():
                     result["reason"] = "stale_generation"
                     self._note_proactive("stale_generation")
@@ -4109,44 +4152,47 @@ class Runner:
         *, cid=None, dialogue=None,
     ) -> str:
         cfg = self.cfg
+        template = str(cfg.get("proactive_prompt") or "")
+        if not template:
+            logger.warning(f"{TAG} 提示词为空")
+            return ""
         settings = self._context_settings()
         mode = settings["source_mode"]
         ordinary = not reminder and not appointment
-        if ordinary and dialogue is None:
-            cid = await self._conversation_id(umo)
-            dialogue = await self._proactive_dialogue(umo, cid, datetime.now())
 
-        # 只用平台流水时不需要塞会话历史，避免重复占上下文
         history = []
-        if mode != "platform_message_history":
-            history = dialogue if ordinary else await self._load_history(umo, cid=cid)
-
         platform_block = ""
-        if mode in ("platform_message_history", "hybrid"):
-            platform_settings = settings
-            if ordinary:
-                platform_settings = {**settings, "proactive_since": self._platform_proactive_since(umo, cid),
-                                     "platform_history_count": min(settings["platform_history_count"],
-                                                                   6 - sum(x["role"] == "user" for x in history))}
-            platform_block = await self._platform_block(umo, platform_settings)
-            if platform_block:
-                logger.info(
-                    f"{TAG} 已注入平台流水（模式={mode}）"
+        if ordinary:
+            now = datetime.now()
+            if not isinstance(dialogue, _ProactiveInput):
+                cid = cid or await self._conversation_id(umo)
+                dialogue = await self._proactive_input(umo, cid, now, dialogue=dialogue)
+            scene = self._proactive_scene(umo, now=now.timestamp(), cid=cid)
+            if not quality.has_topic(scene, dialogue.user_turns, self._appointments(umo), now):
+                text = quality.light_greeting(
+                    now.timestamp(), scene, self.store.get(umo, "proactive_recent", []),
+                    self.store.get(umo, "proactive_topic_updates", {}),
                 )
-            elif mode == "platform_message_history":
-                logger.warning(f"{TAG} 没读到平台流水，已回退为会话历史")
-                history = dialogue if ordinary else await self._load_history(umo, cid=cid)
+                if dialogue.scheduled:
+                    self._note_proactive("light_greeting" if text else "light_greeting_repeated")
+                return text
+            history, platform_block = dialogue.history, dialogue.platform_block
+        else:
+            if mode != "platform_message_history":
+                history = await self._load_history(umo, cid=cid)
+            if mode in ("platform_message_history", "hybrid"):
+                platform_block = await self._platform_block(umo, settings)
+                if not platform_block and mode == "platform_message_history":
+                    logger.warning(f"{TAG} 没读到平台流水，已回退为会话历史")
+                    history = await self._load_history(umo, cid=cid)
+        if platform_block:
+            logger.info(f"{TAG} 已注入平台流水（模式={mode}）")
 
         # 省 token：图片 / 思考块 / 上下文窗口（放在平台流水回退之后）
         if history:
             history = self._prepare_contexts(history, settings)
 
         system_prompt = await self._load_persona(umo)
-
-        template = str(cfg.get("proactive_prompt") or "")
-        if not template:
-            logger.warning(f"{TAG} 提示词为空")
-            return ""
 
         unanswered = int(self.store.get(umo, "unanswered", 0) or 0)
         if appointment:
@@ -4171,8 +4217,8 @@ class Runner:
             if "{{event_hint}}" not in template:
                 prompt += "\n" + hint
             prompt += ("\n近期对话只用来接话，助手说过的话只作话题和语气参考。"
-                       "当前活动、刚发生的经历和准备好的东西需要用户依据。"
-                       "没有可接的话题就亲昵地问候，不编刚发生的事。只接一个话题，说完就停。")
+                       "所在位置、手边有什么、谁刚做完什么，只沿用用户确认或已知状态。"
+                       "不确定就开放地问，不把猜测藏进问句。只接一个话题，说完就停。")
 
         provider = self.context.get_using_provider(umo=umo)
         if provider is None:
@@ -4180,6 +4226,8 @@ class Runner:
             return ""
 
         try:
+            if ordinary and dialogue.scheduled:
+                self._note_proactive("model_request")
             resp = await asyncio.wait_for(
                 provider.text_chat(
                     prompt=prompt,
@@ -4736,12 +4784,11 @@ class Runner:
                 break
         return lines
 
-    async def _platform_block(self, umo: str, settings: dict) -> str:
-        """把平台流水渲染成一段可直接拼进 prompt 的文本。"""
+    async def _platform_records_for_prompt(self, umo: str, settings: dict):
         count = settings["platform_history_count"]
         since = settings.get("proactive_since")
         if since == float("inf") or count <= 0:
-            return ""
+            return []
         records = await self._load_platform_records(umo, count)
         if since is not None:
             end = time.time()
@@ -4754,8 +4801,14 @@ class Runner:
                     if since <= instant <= end:
                         recent.append(record)
             records = recent
+        return records
+
+    async def _platform_block(self, umo: str, settings: dict, *, records=None) -> str:
+        """把平台流水渲染成一段可直接拼进 prompt 的文本。"""
+        if records is None:
+            records = await self._platform_records_for_prompt(umo, settings)
         lines = self._format_platform_lines(
-            records, settings["include_bot_messages"], count
+            records, settings["include_bot_messages"], settings["platform_history_count"]
         )
         if not lines:
             return ""

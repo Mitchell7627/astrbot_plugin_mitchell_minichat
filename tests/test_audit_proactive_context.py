@@ -1,9 +1,10 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from astrbot_plugin_mitchell_minichat.core import proactive_quality as quality
 from astrbot_plugin_mitchell_minichat.core.proactive_quality import duplicate, fingerprint, polish_reply, topics
 
 
@@ -172,7 +173,8 @@ async def test_expired_conversation_does_not_allow_invented_proactive_experience
     monkeypatch.setattr(runner, "_generate", generate)
     assert (await runner._fire(umo))["sent"]
     generate.assert_awaited_once()
-    assert generate.await_args.kwargs["dialogue"] == []
+    context = generate.await_args.kwargs["dialogue"]
+    assert not context.history and not context.user_turns
     sent = plugin.context.send_message.await_args.args[1].get_plain_text()
     assert sent.rstrip("？?") == safe.rstrip("？?")
 
@@ -217,3 +219,115 @@ def test_dessert_pressure_shares_topic_but_user_offer_can_reopen_it():
     updates = dict.fromkeys(topics("吃蛋糕吧", from_user=True), 1.5)
     assert updates == {"dessert:蛋糕": 1.5}
     assert duplicate(second, [first], updates) is None
+
+
+@pytest.mark.parametrize("body,scene,turns,expected,reason", [
+    ("你现在在路上吗？\n到了记得告诉我", ("together", "", "", ""),
+     ["嗯嗯"], "", "unconfirmed_presence"),
+    ("抽屉里那盒备用电池还放着呢\n先拿那盒试试", UNKNOWN,
+     ["知道了"], "", "unconfirmed_inventory"),
+    ("今天拼图做完啦，你想看一下吗", UNKNOWN, [], "", "unconfirmed_experience"),
+    ("我刚写完提纲了。\n你平时喜欢什么类型的小说？\n想看一下吗？", UNKNOWN, ["我刚写完提纲"],
+     "你平时喜欢什么类型的小说？", "unsupported_followup"),
+    ("还没到吗？\n周末想聊点什么？\n到了告诉我", UNKNOWN, [],
+     "周末想聊点什么？", "unsupported_followup"),
+    ("你现在在路上吗？", UNKNOWN, ["我刚出门了"], None, None),
+    ("到教室了没？", UNKNOWN, ["我在去教室的路上"], None, None),
+    ("到教室了没？", ("away", "", "", ""), ["我在外面挑文具"], "", "unconfirmed_presence"),
+    ("你现在在路上吗？", UNKNOWN, ["我昨天在路上"], "", "unconfirmed_presence"),
+    ("你现在在路上吗？", ("away", "", "", ""), ["我在家", "我刚出门了"], "", "unconfirmed_presence"),
+    ("柜子里那盒彩纸还放着呢", UNKNOWN, ["柜子里还有彩纸"], None, None),
+    ("柜子里那盒彩纸还放着呢", UNKNOWN, ["打算买彩纸"], "", "unconfirmed_inventory"),
+    ("柜子里还有彩纸", UNKNOWN, ["没有彩纸了", "柜子里还有彩纸"], "", "unconfirmed_inventory"),
+    ("柜子里还有彩纸", UNKNOWN, ["不是柜子里有彩纸，是书包里有", "柜子里还有彩纸"],
+     "", "unconfirmed_inventory"),
+    ("我泡好茶啦", UNKNOWN, ["你刚泡好了茶"], None, None),
+    ("我泡好茶啦", UNKNOWN, ["我泡好了茶"], "", "unconfirmed_inventory"),
+    ("今天拼图做完啦，你想看一下吗", UNKNOWN, ["你刚把拼图做完了"], None, None),
+    ("今天拼图做完啦，你想看一下吗", UNKNOWN, ["你刚下班了"], "", "unconfirmed_experience"),
+    ("今天写完提纲啦", UNKNOWN, ["你还没写完提纲", "你刚写完提纲"], "", "unconfirmed_experience"),
+    ("柜子里还有彩纸吗？", UNKNOWN, ["柜子里还有彩纸吧？"], "", "unconfirmed_inventory"),
+    ("最近想练什么手工呢？\n还有机会慢慢来", UNKNOWN, [], None, None),
+    ("如果明天你出门，可以带上折伞", UNKNOWN, [], None, None),
+    ("如果柜子里还有彩纸，就剪两朵花吧", UNKNOWN, [], None, None),
+    ("展板上的台词是『柜子里还有彩纸』，这句放在开头好吗？", UNKNOWN, [], None, None),
+])
+def test_unsourced_presuppositions_and_independent_sentences(body, scene, turns, expected, reason):
+    text, reasons = polish_reply(body, scene, [(turn, None) for turn in turns])
+    assert text == (body if expected is None else expected)
+    assert reason in reasons if reason else not reasons
+
+
+async def test_weak_topic_uses_local_greetings_in_preview_and_send(plugin, umo, clock, monkeypatch):
+    r = plugin.runner
+    r.started = True
+    notes = []
+    monkeypatch.setattr(r, "_note_proactive", notes.append)
+    now = datetime.fromtimestamp(clock.now)
+    manager(plugin, ["current"], {"current": [
+        dated("user", "收到，嗯嗯～", now - timedelta(minutes=1)),
+        dated("assistant", "柜子里还有荧光笔", now),
+    ]})
+    provider = SimpleNamespace(text_chat=AsyncMock(side_effect=AssertionError("should not generate")))
+    plugin.context.get_using_provider = lambda **kw: provider
+
+    first = (await plugin.panel_service.preview({"umo": umo}))["text"]
+    assert first and "荧光笔" not in first
+    assert (await r._fire(umo))["sent"]
+    assert plugin.context.send_message.await_args.args[1].get_plain_text() == first
+    assert (await r._fire(umo))["sent"]
+    assert plugin.context.send_message.await_args.args[1].get_plain_text() != first
+    provider.text_chat.assert_not_called()
+    assert notes.count("light_greeting") == 2 and "model_request" not in notes
+    assert plugin.store.get(umo, "unanswered") == 2
+
+
+async def test_real_topic_uses_one_draft_and_only_writes_safe_segments(plugin, umo, clock, monkeypatch):
+    now = datetime.fromtimestamp(clock.now)
+    conversations = manager(plugin, ["current"], {"current": [
+        dated("user", "我在看火山纪录片", now - timedelta(minutes=2)),
+        dated("user", "知道了", now - timedelta(minutes=1)),
+    ]})
+    fake = SimpleNamespace(text_chat=AsyncMock(return_value=SimpleNamespace(
+        completion_text="哪座火山最有意思呀？\n抽屉里那盒彩色铅笔还放着呢\n先拿那盒画下来",
+        usage={"input_other": 50, "input_cached": 0, "output": 18},
+    )))
+    plugin.context.get_using_provider = lambda **kw: fake
+    runner = plugin.runner
+    notes = []
+    monkeypatch.setattr(runner, "_note_proactive", notes.append)
+    assert (await runner._fire(umo))["sent"]
+    fake.text_chat.assert_awaited_once()
+    assert plugin.context.send_message.await_count == 1
+    assert plugin.context.send_message.await_args.args[1].get_plain_text().rstrip("？?") == "哪座火山最有意思呀"
+    assert "铅笔" not in str(conversations.update_conversation.await_args)
+    assert notes.count("model_request") == 1 and notes.count("unconfirmed_inventory") == 1
+
+
+def test_light_greeting_skips_if_every_candidate_matches_recent_delivery(monkeypatch):
+    text = "今天过得怎么样呀？"
+    monkeypatch.setattr(quality, "_GREETINGS", (text,))
+    old = fingerprint(text, 10, UNKNOWN)
+    assert quality.light_greeting(20, UNKNOWN, [old], {}) == ""
+    assert quality.light_greeting(86420, UNKNOWN, [old], {}) == text
+
+
+@pytest.mark.parametrize("sender,can_ground", [("1", True), ("bot", False), ("2", False)])
+async def test_platform_history_only_uses_current_private_peer_as_evidence(plugin, umo, clock, sender, can_ground):
+    runner = plugin.runner
+    runner.cfg["context_settings"].update(use_conversation_history=False, use_platform_history=True,
+                                          include_bot_messages=True)
+    now = datetime.fromtimestamp(clock.now)
+    user_turn = dated("user", "我今天买了草莓", now)
+    manager(plugin, ["current"], {"current": [user_turn]})
+    plugin.store.set(umo, "scene_conversation", {"id": "current", "since": clock.now - 60})
+    clock_type = type(runner._message_time(user_turn))
+    plugin.context.message_history_manager = SimpleNamespace(get=AsyncMock(return_value=[
+        {"sender_id": sender, "content": "冰箱里还有梨", "created_at": clock_type.fromtimestamp(clock.now, timezone.utc)},
+    ]))
+    source = await runner._proactive_input(umo, "current", now)
+    assert source.platform_block and not source.history
+    snapshot = runner._delivery_snapshot(umo, "current")
+    text, _ = runner.ground_proactive_reply("冰箱里还有梨", snapshot, source)
+    assert bool(text) == can_ground
+    assert not (await runner._proactive_input(umo, "new-conversation", now)).user_turns

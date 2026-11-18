@@ -659,6 +659,13 @@ class PanelService:
             raise PanelError("E_BAD_REQUEST", "会话标识不合法")
         return umo
 
+    async def _generated_proactive_text(self, runner, umo, cid, snapshot):
+        dialogue = await runner._proactive_input(umo, cid, datetime.now())
+        text = await runner._generate(umo, cid=cid, dialogue=dialogue)
+        text, _ = inspect_text(text or "")
+        text, _ = runner.ground_proactive_reply(text, snapshot, dialogue)
+        return text
+
     async def preview(self, payload: dict) -> dict:
         umo = self._validate_umo((payload or {}).get("umo"))
         runner = self._require_runner()
@@ -667,10 +674,7 @@ class PanelService:
             try:
                 cid = await runner._conversation_id(umo)
                 snapshot = runner._delivery_snapshot(umo, cid)
-                dialogue = await runner._proactive_dialogue(umo, cid, datetime.now())
-                text = await asyncio.wait_for(runner._generate(umo, cid=cid, dialogue=dialogue), timeout=90)
-                text, _ = inspect_text(text or "")
-                text, _ = runner.ground_proactive_reply(text, snapshot, dialogue)
+                text = await asyncio.wait_for(self._generated_proactive_text(runner, umo, cid, snapshot), timeout=90)
             except asyncio.TimeoutError:
                 raise PanelError("E_UPSTREAM", "生成超时（90 秒）")
             except PanelError:
@@ -710,12 +714,9 @@ class PanelService:
             async with lock:
                 if not text:
                     try:
-                        dialogue = await runner._proactive_dialogue(umo, cid, datetime.now())
-                        text = await asyncio.wait_for(runner._generate(umo, cid=cid, dialogue=dialogue), timeout=90)
+                        text = await asyncio.wait_for(self._generated_proactive_text(runner, umo, cid, scene), timeout=90)
                     except asyncio.TimeoutError:
                         raise PanelError("E_UPSTREAM", "生成超时（90 秒）")
-                    text, _ = inspect_text(text or "")
-                    text, _ = runner.ground_proactive_reply(text, scene, dialogue)
                 text, _ = inspect_text(text)
                 if not text:
                     raise PanelError("E_UPSTREAM", "没有可发送的正文")

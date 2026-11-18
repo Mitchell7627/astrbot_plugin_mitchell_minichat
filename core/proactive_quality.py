@@ -33,7 +33,7 @@ _DESSERT_ACTOR = re.compile(r"([我你])(?:还|先|也|已经|刚|亲自|特地|
 _CLAUSE_BREAK = re.compile(r"[，,、。！？!?；;\n]+")
 _IMAGINED = re.compile(r"如果|假如|要是|假设|假装|想象|的话")
 _FICTIONAL = re.compile(r"^(?:我们|我|就|来|不如|一起|再){0,4}(?:假装|想象)")
-_QUESTION = re.compile(r"[?？]|要不要|会不会|是不是|(?:吗|么)[喵呀呢啊。！\s]*$")
+_QUESTION = re.compile(r"[?？]|要不要|会不会|是不是|(?:吗|么|了没(?:有)?)[喵呀呢啊。！\s]*$")
 _SPECULATION = re.compile(r"听说|据说|好像|大概|可能|应该|估计|吧[喵呀呢啊。！\s]*$")
 _RECENT_DEED = re.compile(
     r"^(?P<actor>我|你)?\s*(?:今天|刚才|刚刚|这会儿)?\s*(?:已经|刚|才)?\s*"
@@ -44,11 +44,77 @@ _RECENT_SIGHT = re.compile(
     r"(?P<lead>.{0,8}?)(?:看见|看到|瞧见|遇见|遇到|碰见)(?:了)?(?P<object>.{2,32})$"
 )
 
+_SOCIAL_ONLY = re.compile(
+    r"(?:(?:好[的呀啊啦喵哦]?|嗯+|哦+|噢+|啊+|喵+|哈+|嘿+|在吗|收到|知道了|我知道了|明白了|行[呀啊吧]?|"
+    r"可以[呀啊]?|是的|对[呀啊哦]?|没事|谢谢|早安|晚安|你好|抱抱|亲亲|贴贴|摸摸头|啵+|么么+|"
+    r"喜欢你|想你了?|爱你|你在吗|哥哥|姐姐|宝贝|mua+|ok(?:ay)?|yes|yep|lol|hi|hey|hello|3|"
+    r"[喔咯呢诶欸呀啦哒呜唔]+))+", re.I,
+)
+_CHAT_MARKER = re.compile(r"\[CQ:[^\]\n]+\]|\[(?:表情|图片|语音|视频|动画表情|贴纸|戳一戳)(?::[^\]\n]*)?\]")
+_GREETINGS = (
+    "想来跟你说句话，有空再理我呀", "我来冒个泡，今天过得怎么样呀？",
+    "欸，分我一点你的注意力嘛", "给你留个抱抱，想领的时候自己来拿呀",
+    "随便聊点什么吧，想到哪儿说到哪儿呀", "忽然想叫你一声，就这样也挺好",
+    "偷偷来打个招呼，不催你回啦", "有想聊的事就跟我说，没想好也行呀",
+    "给你比个心，这句不用回也算收到啦", "要是正好有空，陪我闲聊一小会儿嘛",
+    "我来招招手，你慢慢忙你的呀", "分你一点好心情，希望刚好用得上",
+)
+_USER_OUTSIDE = re.compile(
+    r"(?:在(?:外面|外头|外边|路上|回去的路上)|(?:还)?没(?:回家|回来|到家)|"
+    r"(?:刚|已经)出门|还没回(?:过?来|去|[呢呀吗喵\s。？！!?]|$)|"
+    r"还没到(?:家|学校|教室|店里|公司|宿舍|车站|那儿|那里|(?=[喵呀呢啊哦吗么吧\s]*$))|"
+    r"走到哪(?!一步|个阶段)|离店还远|"
+    r"(?:到家|到学校|到教室|到店里|回家|回来)(?:了)?(?:没[有]?|了[吗么]|了吗))"
+)
+_OUTSIDE_SUBJECT = re.compile(r"(?:你们|你|哥哥|姐姐|他|她|我)(?:现在|这会儿|还|已经|刚|是不是|该不会|一直|都|又){0,4}$")
+_AWAY_TAIL = re.compile(r"^(?:(?:要是|如果)(?:你|哥哥|姐姐)?还没回|(?:到(?:家|店里|教室)?|回家)了?(?:再|记得|就|跟我|告诉我)|路上(?:慢点|小心)|(?:先|就先)(?:把|给你).{0,12}(?:焐热|暖好))")
+_AWAY_NEGATIVE = re.compile(r"(?:我|咱俩|我们|^)(?:现在|其实|一直|已经|刚|还|早就|都|又){0,4}(?:在家|在一起|回到家|没出门|不在外面|到家了|回来了|回家了|在你身边|在你旁边|在一起吗)")
+_AWAY_POSITIVE = re.compile(r"^(?:我)?(?:现在|这会儿|还|刚刚|刚|已经|仍然|仍){0,3}(?:在外面|在外头|在外边|在路上|在(?:回家|去.{1,12})的路上|没到家|没回家|出门了)")
+
+_STORAGE = (r"冰箱|冷藏(?:柜|室)|冷冻(?:柜|室)|柜子|抽屉|桌(?:子)?上|篮子|烤箱|锅里|厨房")
+_EXISTENCE = r"(?:还)?(?:有|剩(?:下|着)?|留着|放着|摆着|躺着)"
+_GONE = r"(?:已经)?(?:没有|没剩|不剩|吃完|吃光|用完|扔掉|卖光|空了|没了)"
+_AMOUNT = r"(?:(?:那|这|一|两|几|[二三四五六七八九十\d]+)(?:袋|盒|包|份|块|瓶|杯|盘|碗|个|张|颗|条|串|把|本|支|件))"
+_ITEM_END = r"(?:还(?:有|剩|在|放|摆|躺|留)|没了|没有|没剩|吃完|吃光|用完|扔掉|放着|摆着|躺着|留着|[了呢喵呀啊哦喔啦咯吧吗么]+$|$)"
+_INVENTORY_HEAD = re.compile(
+    rf"(?P<place>{_STORAGE})(?:里面|里|内|上)?(?:现在|其实|已经|就|真的|还|都|又){{0,3}}"
+    rf"(?P<verb>{_GONE}|{_EXISTENCE}|(?={_AMOUNT}))\s*(?:{_AMOUNT})?"
+    rf"(?P<item>[\w\u4e00-\u9fff]{{1,18}}?)(?={_ITEM_END})", re.I,
+)
+_STOCK_HEAD = re.compile(
+    rf"^(?P<place>家里|这儿|这里)?(?:现在|目前)?\s*(?P<verb>还(?:有|剩(?:下|着)?)|没有|没剩)\s*"
+    rf"(?P<amount>{_AMOUNT})?(?P<item>[\w\u4e00-\u9fff]{{1,18}}?)(?={_ITEM_END})"
+)
+_INVENTORY_TAIL = re.compile(
+    rf"^(?:{_AMOUNT})?(?P<item>[\w\u4e00-\u9fff]{{1,18}}?)"
+    rf"(?P<verb>{_GONE}|(?:还)?(?:在|放在|摆在|放进))(?:(?P<place>{_STORAGE}))?"
+    r"(?:里面|里|内|上)?[了喵呀呢吧咯啊吗么啦哦喔]*$"
+)
+_PREPARATION = r"(?:烤好|煮好|做好|泡好|烧好|热好|准备好|备好|切好|洗好|包好|买好|煮好了?|做了|买了)"
+_PREP = re.compile(
+    rf"^(?P<actor>我|你|哥哥|姐姐)?(?:今天|刚刚|刚才|刚|已经|早就|都|先|给你|给我|帮你|帮我){{0,5}}"
+    rf"(?P<negative>没有|还没|没)?(?:(?P<action>{_PREPARATION})(?:了)?(?:{_AMOUNT})?"
+    rf"(?P<item>[\w\u4e00-\u9fff]{{1,18}}?)|(?:{_AMOUNT})?(?P<item_first>[\w\u4e00-\u9fff]{{1,18}}?)"
+    rf"(?:(?P<suffix_actor>我|你)(?:刚刚|刚|已经|早就|都|给你|给我){{0,4}})?"
+    rf"(?P<action_last>{_PREPARATION}))[了喵呀呢咯啊啦吗么哦喔吧]*$"
+)
+_FINISH_LEAD = r"(?P<actor>我|你|他|她|哥哥|姐姐)?(?:今天|刚刚|刚才|刚|已经|才|总算|这会儿|刚把|把){0,5}(?P<negative>没有|还没|没)?"
+_FINISH = re.compile(
+    rf"^{_FINISH_LEAD}(?:(?P<activity>[\w\u4e00-\u9fff]{{1,14}}?)(?P<done>收工|完工|做完|结束|弄完|忙完|录完|拍完|写完)|"
+    r"(?P<verb>录制|录|拍|写|剪|画|练|修)完(?:了)?(?P<object>[\w\u4e00-\u9fff]{1,14}?))"
+    r"[了喵呀呢咯啊啦吗么吧哦喔]*$"
+)
+_NOT_FACT = re.compile(r"^(?:我|你|他|她|我们|哥哥|姐姐)?(?:如果|假如|要是|只要|假设|假装|想象|下次|等到|等你|等我|明天|后天|昨天|前天|待会|等会|打算|想要|想吃|想去|提议|刚想到|能不能|要不要)")
+_ITEM_META = re.compile(r"^(?:什么|东西|点什么|一点|一些|好吃的|没有|没了|了|呢|啊|呀|吧|喵|咯|吗|么|在|了没|我|你|他|她|它|谁|机会|时间|点困|点饿|点累)$")
+_SUPPLY_TAIL = re.compile(r"^(?:(?:那|就|你|我|哥哥|姐姐|来|先|我们|一起|要不|要不要|咱们){0,6}(?:包|拿|端|吃掉|热|煮)(?:来|吧|了|点|一下|那|这个|那个|饺子|还是|不如)|(?:不然|否则|那就|你选一个))")
+_WORK_TAIL = re.compile(r"^(?:(?:你|哥哥|姐姐)?(?:听没听|听了没|听了吗|听过没|(?:要不要|想不想|想听|来)听(?:一下|一段|一会|听|吗|么|看)|给你听|(?:要不要|想不想|想)看(?:一下|一段|看)))")
+
 _ARRIVAL_PROMPT = re.compile(
     r"还没到(?:吗|呢|[？?]|$)|走到哪|到(?:家|学校|教室|店里)了没|离店还远|"
     r"到(?:家|学校|教室|店里)?了?.{0,4}(?:说一声|告诉我|报个?平安)"
 )
 _DESTINATION = re.compile(r"到(家|学校|教室|店里)")
+_TRIP_TARGET = re.compile(r"(?:出发去|在去|去|往|赶去)(学校|教室|店里)(?:了|的路上|路上)")
 _BATH_CONTEXT = re.compile(r"洗澡|浴缸|浴室|泡澡|出浴|再泡下去|还没洗完澡")
 _BATH_EXIT = re.compile(r"还不出来|还没出来|起来吧|快(?:从浴缸)?出来|该出来|再泡.{0,8}晕|出来换|出来吧")
 _BATH_NOW = re.compile(r"还没洗完|还在泡|再泡|泡一会儿再出来|出来后.{0,10}(?:擦干|擦头发|换衣)")
@@ -187,6 +253,143 @@ def _recent_evidence(user_turns):
     return personal, desserts
 
 
+def has_topic(scene, user_turns, appointments, now):
+    if scene[0] == "away" or scene[1] or any(
+        item.get("at", 0) > now.timestamp() and item.get("stage") != "done" for item in appointments
+    ):
+        return True
+    for body, _ in user_turns:
+        for clause in _CLAUSE_BREAK.split(_CHAT_MARKER.sub(" ", body)):
+            key = _normalize(clause)
+            if key and not _SOCIAL_ONLY.fullmatch(key):
+                return True
+    return False
+
+
+def light_greeting(at, scene, rows, topic_updates):
+    rows = recent(rows, at)
+    return next((text for text in _GREETINGS if not duplicate(fingerprint(text, at, scene), rows, topic_updates)), "")
+
+
+def _item(text):
+    key = _normalize(text or "")
+    return "" if _ITEM_META.fullmatch(key) else key
+
+
+def _bot_actor(actor, *, user):
+    if actor == "你":
+        return "bot" if user else "user"
+    if actor == "我" or not actor:
+        return "user" if user else "bot"
+    return ("user" if not user else "third") if actor in {"哥哥", "姐姐"} else actor
+
+
+def _premises(clause, *, user=False):
+    """Yield bounded factual claims as (kind, actor, action/place, object, polarity)."""
+    clause = clause.strip()
+    if not clause or _NOT_FACT.search(clause):
+        return
+    for pattern in (_INVENTORY_TAIL, _INVENTORY_HEAD, _STOCK_HEAD):
+        m = pattern.search(clause)
+        if not m:
+            continue
+        item = _item(m["item"])
+        place = m.groupdict().get("place") or ""
+        negative = bool(re.fullmatch(_GONE, m["verb"]) or re.search(r"(?:并非|不是|并没有)\s*$", clause[:m.start()]))
+        if item and (place or pattern is _STOCK_HEAD and m["amount"]
+                     or negative and (user or pattern is _INVENTORY_TAIL)):
+            yield "stock", "", place, item, not negative
+            break
+
+    m = _PREP.fullmatch(clause)
+    if m and re.search(r"^.{0,6}(?:刚|已经|早就)|[了咯啦吗么哦喔]$", clause):
+        item = _item(m["item"] or m["item_first"])
+        action = m["action"] or m["action_last"]
+        action = action[0] if action != "准备好" else "备"
+        if item:
+            yield "prep", _bot_actor(m["actor"] or m["suffix_actor"], user=user), action, item, not m["negative"]
+
+    m = _FINISH.fullmatch(clause)
+    if m:
+        if m["verb"]:
+            detail = _item(m["verb"] + (m["object"] or ""))
+        else:
+            detail = _item(m["activity"])
+        if detail and not re.search(r"(?:不了|就|只要|能不能|要不要|可以|打算|想等|想去|什么时候|怎么|没|不必)", detail):
+            yield "finish", _bot_actor(m["actor"], user=user), "completed", detail, not m["negative"]
+
+
+def _verified_claim(claim, evidence, now):
+    kind, actor, action, item, positive = claim
+    for other, stamp in evidence:
+        if stamp and stamp.date() != now.date() and kind == "finish":
+            continue
+        other_kind, other_actor, other_action, other_item, affirmed = other
+        if other_actor != actor or item != other_item:
+            continue
+        if kind == other_kind and (action == other_action or kind == "stock" and (not action or not other_action)):
+            return positive == affirmed and (not positive or kind != "stock" or not action or action == other_action)
+    return False
+
+
+def _presence_evidence(scene, user_turns):
+    for body, _ in user_turns:
+        body = _QUOTED.sub(" ", body)
+        for clause in reversed(_CLAUSE_BREAK.split(body)):
+            clause = clause.strip()
+            if not clause or _NOT_FACT.search(clause) or _SPECULATION.search(clause):
+                continue
+            if _AWAY_NEGATIVE.search(clause) or re.search(r"不是(?:一直|都)?在一起[吗么]", clause):
+                return False
+            if (_AWAY_POSITIVE.search(clause) or _TRIP_TARGET.search(clause) and clause.startswith(("我", "正在", "出发"))) and not _QUESTION.search(body.strip()):
+                return True
+    return scene[0] == "away" or scene[3] == "returning" and scene[2] == "self"
+
+
+def _assumes_away(content):
+    for clause in _CLAUSE_BREAK.split(content):
+        clause = clause.strip()
+        match = _USER_OUTSIDE.search(clause)
+        if not match:
+            continue
+        if _AWAY_TAIL.match(clause):
+            return True
+        if _NOT_FACT.search(clause) or re.search(r"从外面.{0,4}回|以前|每次|下次|的时候", clause):
+            continue
+        subject = _OUTSIDE_SUBJECT.search(clause[:match.start()])
+        if not subject or not subject.group().startswith(("我", "他", "她")):
+            return True
+    return False
+
+
+def _trip_target_matches(content, user_turns):
+    targets = set(_DESTINATION.findall(content)) - {"家"}
+    if not targets:
+        return True
+    for body, _ in user_turns:
+        body = _QUOTED.sub(" ", body)
+        if _QUESTION.search(body.strip()) or _IMAGINED.search(body):
+            continue
+        for clause in reversed(_CLAUSE_BREAK.split(body)):
+            clause = clause.strip()
+            if not clause or _NOT_FACT.search(clause) or _SPECULATION.search(clause):
+                continue
+            if re.search(r"(?:不去|改去|换去|取消行程|已经到了|已经到|我到了)", clause):
+                return False
+            trip = set(_TRIP_TARGET.findall(clause))
+            if trip and not clause.startswith(("你", "他", "她")):
+                return targets.issubset(trip)
+    return False
+
+
+def _dependent_on(content, rejected):
+    return bool(
+        "away" in rejected and _AWAY_TAIL.match(content) or
+        "stock" in rejected and _SUPPLY_TAIL.match(content) or
+        "finish" in rejected and _WORK_TAIL.match(content)
+    )
+
+
 def polish_reply(text, scene, user_turns=(), appointments=(), *, now=None):
     """Filter clear contradictions and repeated actions before QQ segmentation."""
     now = now or datetime.now()
@@ -201,8 +404,17 @@ def polish_reply(text, scene, user_turns=(), appointments=(), *, now=None):
     kept, seen, reasons = [], [], set()
     user_turns = tuple(user_turns)
     personal, desserts = _recent_evidence(user_turns)
+    evidence = [
+        (claim, stamp) for body, stamp in user_turns
+        for part in reversed(re.split(r"(?<=[。！？!?；;\n])", _QUOTED.sub(" ", body)))
+        if not _QUESTION.search(part.strip()) and not _IMAGINED.search(part)
+        for clause in reversed(_CLAUSE_BREAK.split(part)) if not _SPECULATION.search(clause.strip())
+        for claim in _premises(clause, user=True)
+    ]
+    away = _presence_evidence(scene, user_turns)
     dessert_names = {name for _, name, _ in desserts}
     plan_rejected, plan_anchor = False, ""
+    rejected = set()
     for sentence, content in zip(sentences, visible):
         if plan_rejected and _PLAN_TAIL.search(content.strip()):
             reasons.add("unsupported_plan")
@@ -226,15 +438,36 @@ def polish_reply(text, scene, user_turns=(), appointments=(), *, now=None):
             clause for clause in _CLAUSE_BREAK.split(content)
             if not _QUESTION.search(clause) and not _IMAGINED.search(clause)
         ]
+        missing = [] if _FICTIONAL.search(content.strip()) else [
+            claim for clause in _CLAUSE_BREAK.split(content) for claim in _premises(clause)
+            if not _verified_claim(claim, evidence, now)
+            and not (claim[0] in {"stock", "prep"} and _DESSERT.search(claim[3]))
+        ]
+        if (not _FICTIONAL.search(content.strip()) and _assumes_away(content)
+                and (not away or not _trip_target_matches(content, user_turns))):
+            rejected.add("away")
+            reasons.add("unconfirmed_presence")
+            continue
+        if missing:
+            for kind, *_ in missing:
+                rejected.add("finish" if kind == "finish" else "stock")
+                reasons.add("unconfirmed_experience" if kind == "finish" else "unconfirmed_inventory")
+            continue
+        if _dependent_on(content.strip(), rejected):
+            reasons.add("unsupported_followup")
+            continue
         if any(set(_recent_claims(clause)) - personal for clause in claims):
             reasons.add("unconfirmed_experience")
             continue
         if any(
             _dessert_claims(clause) - desserts or _DESSERT_PRESSURE.search(clause)
             and any(name not in dessert_names for name in _DESSERT.findall(clause))
-            for clause in claims
+            for clause in ([] if _FICTIONAL.search(content.strip()) else
+                           [part for part in _CLAUSE_BREAK.split(content) if not _IMAGINED.search(part)
+                            and not _NOT_FACT.search(part.strip())])
         ):
             reasons.add("unconfirmed_dessert")
+            rejected.add("stock")
             continue
         key = _normalize(sentence)
         arrival = _ARRIVAL_PROMPT.search(content)

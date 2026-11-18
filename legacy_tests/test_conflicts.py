@@ -6,7 +6,7 @@ import json
 import subprocess
 import sys
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -115,7 +115,10 @@ def test_generation_context_source_routing(runner, kind):
         conf['use_platform_history'] = kind != 'conversation'
         runner._load_history = AsyncMock(return_value=[{'role': 'user', 'content': 'history'}])
         runner._load_persona = AsyncMock(return_value='persona')
-        runner._platform_block = AsyncMock(return_value='' if kind == 'empty_platform_fallback' else 'platform')
+        runner._load_platform_records = AsyncMock(return_value=[{
+            'sender_id': UMO.split(':', 2)[-1], 'content': 'platform',
+            'created_at': datetime.now(timezone.utc) - timedelta(seconds=1),
+        }] if kind in ('platform', 'hybrid') else [])
         provider = SimpleNamespace(text_chat=AsyncMock(return_value=SimpleNamespace(completion_text='hello')))
         runner.context.get_using_provider = Mock(return_value=provider)
         await runner._generate(UMO)
@@ -435,7 +438,7 @@ def test_regression_zero_width_split_regex_cannot_hang():
     try:
         result = subprocess.run([sys.executable, '-c',
             "from core.splitter import split_text; print(split_text('hello', pattern=r'\\s*'))"],
-            cwd=REPO, capture_output=True, timeout=2)
+            cwd=REPO, capture_output=True, timeout=15)  # Includes Windows interpreter startup.
     except subprocess.TimeoutExpired:
         pytest.fail('A valid user-supplied regex with an empty match hangs smart_split indefinitely')
     assert result.returncode == 0, result.stderr

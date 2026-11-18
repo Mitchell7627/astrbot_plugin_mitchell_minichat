@@ -19,7 +19,7 @@ CONCERT = "还没到午休，先喝口水吧\n下周三有个音乐会，票都�
     (BATH_REPLY, UNKNOWN, "", "unconfirmed_bath"),
     (BATH_REPLY, ("together", "shower", "her", "active"), "", "unconfirmed_bath"),
     (BATH_REPLY, BATH, BATH_REPLY.splitlines()[0] + "\n" + BATH_REPLY.splitlines()[-1], "same_reply"),
-    (ARRIVAL, UNKNOWN, "\n".join(ARRIVAL.splitlines()[:2]), "same_reply"),
+    (ARRIVAL, ("away", "", "", ""), "\n".join(ARRIVAL.splitlines()[:2]), "same_reply"),
     (CONCERT, UNKNOWN, CONCERT.splitlines()[0], "unsupported_plan"),
     ("晚安喵。\n被子盖好啦。\n晚安喵！", UNKNOWN, "晚安喵。\n被子盖好啦。", "same_reply"),
     ("今天风好大\n先找个暖和的地方\n我等你把故事讲完喵", UNKNOWN, None, None),
@@ -27,8 +27,8 @@ CONCERT = "还没到午休，先喝口水吧\n下周三有个音乐会，票都�
     ("她念台词说『明天有个演唱会，票订好了』。\n这句读得真有气势！", UNKNOWN, None, None),
     ("洗澡的话别把水开太热喵\n刚回来就先歇一会", UNKNOWN, None, None),
     ("茶水都快凉了，还不出来吗\n给你留了一杯喵", UNKNOWN, None, None),
-    ("到学校了没？\n到家了记得说一声喵", UNKNOWN, None, None),
-    ("走到哪啦？\n到了告诉我，东门今天锁着", UNKNOWN, None, None),
+    ("到家了没？\n到了去洗把脸吧", ("away", "", "", ""), None, None),
+    ("走到哪啦？\n到了告诉我，东门今天锁着", ("away", "", "", ""), None, None),
 ])
 def test_reply_sentence_filter(body, scene, expected, reason):
     assert polish_reply(body, scene) == (body if expected is None else expected, {reason} if reason else set())
