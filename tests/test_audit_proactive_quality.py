@@ -269,6 +269,9 @@ async def test_due_reply_keeps_registered_subject_and_clock(plugin, umo, clock, 
 
 async def test_repeated_dessert_phrase_is_not_sent_after_scene_changes(plugin, umo, clock, monkeypatch):
     r = plugin.runner
+    monkeypatch.setattr(r, "_proactive_dialogue", AsyncMock(return_value=[
+        {"role": "user", "content": "你已经买好了布丁，冰箱里还有布丁，布丁给我留着"},
+    ]))
     replies = AsyncMock(side_effect=["布丁我已经买好了喵", "学累了歇一下\n布丁还在冰箱里凉着",
                                     "冰箱里那份布丁给你留着喵"])
     monkeypatch.setattr(r, "_generate", replies)

@@ -2834,7 +2834,7 @@ class Runner:
         self._appt_candidate = None
         self._sleep_seen_in_message = False
         handled = False
-        new_topics = quality.topics(text) if not (
+        new_topics = quality.topics(text, from_user=True) if not (
             rules.is_reported_clause(text, len(text) - 1)
             or rules.is_conditional_clause(text, len(text) - 1)
             or re.search(r"别|不要|别再|不用", text)
@@ -4171,8 +4171,8 @@ class Runner:
             if "{{event_hint}}" not in template:
                 prompt += "\n" + hint
             prompt += ("\n近期对话只用来接话，助手说过的话只作话题和语气参考。"
-                       "当前活动和具体安排以已确认状态及用户的明确陈述为准。"
-                       "状态未知时可以轻轻问候。只接一个话题，说完就停。")
+                       "当前活动、刚发生的经历和准备好的东西需要用户依据。"
+                       "没有可接的话题就亲昵地问候，不编刚发生的事。只接一个话题，说完就停。")
 
         provider = self.context.get_using_provider(umo=umo)
         if provider is None:

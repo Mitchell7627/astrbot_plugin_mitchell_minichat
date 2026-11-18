@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from astrbot_plugin_mitchell_minichat.core.proactive_quality import polish_reply
+from astrbot_plugin_mitchell_minichat.core.proactive_quality import duplicate, fingerprint, polish_reply, topics
 
 
 UNKNOWN = ["unknown", "", "", ""]
@@ -158,3 +158,62 @@ async def test_generated_panel_preview_cannot_offer_wrong_scene(plugin, umo, mon
     monkeypatch.setattr(r, "_generate", AsyncMock(return_value=INCIDENT))
     assert (await plugin.panel_service.preview({"umo": umo}))["segments"] == []
     plugin.context.send_message.assert_not_awaited()
+
+
+async def test_expired_conversation_does_not_allow_invented_proactive_experience(plugin, umo, clock, monkeypatch):
+    runner = plugin.runner
+    now = datetime.fromtimestamp(clock.now)
+    safe = "晚上想吃点什么喵？"
+    generated = "我今天下班早，刚到家\n回家路上遇到一只白猫在晒太阳，可悠闲了\n" + safe
+    old = now - timedelta(minutes=45)
+    manager(plugin, ["target"], {"target": [dated("user", "午饭吃完了，聊点别的吧", old),
+                                            dated("assistant", "冰箱里还有布丁", old)]})
+    generate = AsyncMock(return_value=generated)
+    monkeypatch.setattr(runner, "_generate", generate)
+    assert (await runner._fire(umo))["sent"]
+    generate.assert_awaited_once()
+    assert generate.await_args.kwargs["dialogue"] == []
+    sent = plugin.context.send_message.await_args.args[1].get_plain_text()
+    assert sent.rstrip("？?") == safe.rstrip("？?")
+
+
+@pytest.mark.parametrize("body,history,allow", [
+    ("冰淇淋我留好了，下午再拿出来", [], False),
+    ("你再不来我就先把冰淇淋吃掉", [], False),
+    ("布丁我留着了", ["我留了布丁给你"], False),
+    ("布丁我留着了喵", ["布丁没留", "你给我留了布丁"], False),
+    ("布丁我留着了喵", ["你给我留了布丁"], True),
+    ("冰箱里还有布丁", ["吃布丁吧"], False),
+    ("冰箱里还有布丁", ["冰箱里还有布丁"], True),
+    ("冰箱里还有布丁", ["布丁吃完了", "冰箱里还有布丁"], False),
+    ("晚上想一起吃布丁吗？", [], True),
+    ("如果冰箱还有布丁，晚上就一起吃吧", [], True),
+    ("如果你想吃，布丁我已经留好了", [], False),
+    ("刚下班喵", ["我刚下班"], False),
+    ("刚下班喵", ["你刚下班吧？"], False),
+    ("刚下班喵", ["你刚下班了"], True),
+    ("刚到家喵", ["你刚下班了"], False),
+    ("路上碰见一只橘猫", ["你路上看见一只黑猫"], False),
+    ("路上碰见一只橘猫", ["你路上没看见一只橘猫"], False),
+    ("路上碰见一只橘猫", ["你路上看见一只橘猫"], True),
+    ("刚想到你，想抱抱喵", [], True),
+    ("假装我刚到家，一起进去吧", [], True),
+    ("台词是「我刚到家，路上撞见一只橘猫」", [], True),
+])
+def test_proactive_experience_and_food_require_matching_user_evidence(body, history, allow):
+    output, reasons = polish_reply(body, UNKNOWN, [(text, None) for text in history])
+    if allow:
+        assert (output, reasons) == (body, set())
+    else:
+        assert not output and reasons.intersection({"unconfirmed_experience", "unconfirmed_dessert"})
+
+
+def test_dessert_pressure_shares_topic_but_user_offer_can_reopen_it():
+    first = fingerprint("蛋糕给你留着，下午再一起吃", 1, UNKNOWN)
+    second = fingerprint("你再不回来我就先把蛋糕吃掉", 2, UNKNOWN)
+    assert duplicate(second, [first], {}) == "same_topic"
+    assert not topics("你吃了没", from_user=True)
+    assert not topics("我不想吃蛋糕", from_user=True)
+    updates = dict.fromkeys(topics("吃蛋糕吧", from_user=True), 1.5)
+    assert updates == {"dessert:蛋糕": 1.5}
+    assert duplicate(second, [first], updates) is None

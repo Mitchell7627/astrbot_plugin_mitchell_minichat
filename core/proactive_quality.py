@@ -21,6 +21,28 @@ _TOPICS = {
 }
 _DESSERT = re.compile(r"布丁|甜点|蛋糕|冰淇淋")
 _DESSERT_STATE = re.compile(r"冰箱|还剩|凉着|留(?:着|给)|买好了|摆桌上|拿出来|有得吃")
+_DESSERT_PRESSURE = re.compile(r"(?:再不|不来|不吃).{0,16}(?:就|先).{0,16}吃(?:掉|了|完)|(?:就|先).{0,12}把.{0,12}吃(?:掉|了|完)")
+_DESSERT_INVITE = re.compile(r"想吃|一起吃|要吃|想来点|吃.{0,10}(?:吧|喵|咯|啦)(?:[。！？!?]|$)")
+_DESSERT_FACTS = {
+    "reserved": re.compile(r"留(?:好|了|着|给)|给.{0,6}留"),
+    "bought": re.compile(r"买(?:好|了)|刚买"),
+    "stock": re.compile(r"还剩|还有|有得吃|凉着|在冰箱|冰箱.{0,5}(?:有|放|里那|里还)|摆桌上|放(?:在|进)?冰箱"),
+}
+_DESSERT_GONE = re.compile(r"吃完|吃光|吃掉了|没有|没剩|没留|没买|不剩|不留")
+_DESSERT_ACTOR = re.compile(r"([我你])(?:还|先|也|已经|刚|亲自|特地|帮你|给你|给我){0,4}(?:留|买)")
+_CLAUSE_BREAK = re.compile(r"[，,、。！？!?；;\n]+")
+_IMAGINED = re.compile(r"如果|假如|要是|假设|假装|想象|的话")
+_FICTIONAL = re.compile(r"^(?:我们|我|就|来|不如|一起|再){0,4}(?:假装|想象)")
+_QUESTION = re.compile(r"[?？]|要不要|会不会|是不是|(?:吗|么)[喵呀呢啊。！\s]*$")
+_SPECULATION = re.compile(r"听说|据说|好像|大概|可能|应该|估计|吧[喵呀呢啊。！\s]*$")
+_RECENT_DEED = re.compile(
+    r"^(?P<actor>我|你)?\s*(?:今天|刚才|刚刚|这会儿)?\s*(?:已经|刚|才)?\s*"
+    r"(?P<deed>收工|下班|到家)(?P<tail>[^，。！？；\n]*)$"
+)
+_RECENT_SIGHT = re.compile(
+    r"^(?P<actor>我|你)?\s*(?:刚才|刚刚|今天|回来的时候|回家路上|路上|刚)"
+    r"(?P<lead>.{0,8}?)(?:看见|看到|瞧见|遇见|遇到|碰见)(?:了)?(?P<object>.{2,32})$"
+)
 
 _ARRIVAL_PROMPT = re.compile(
     r"还没到(?:吗|呢|[？?]|$)|走到哪|到(?:家|学校|教室|店里)了没|离店还远|"
@@ -116,6 +138,55 @@ def _matched_plan(sentence, user_turns, appointments, now, anchor=""):
     return False
 
 
+def _recent_claims(clause, *, user=False):
+    for pattern, kind in ((_RECENT_DEED, "deed"), (_RECENT_SIGHT, "sight")):
+        match = pattern.fullmatch(clause.strip())
+        if not match or (match["actor"] != "你" if user else match["actor"] == "你"):
+            continue
+        if kind == "sight":
+            if re.search(r"没|未|不", match["lead"]):
+                continue
+            detail = re.sub(r"^一?[只个位]", "", match["object"])
+            yield kind, _normalize(re.sub(r"[喵呀呢啊]+$", "", detail))
+        else:
+            tail = match["tail"]
+            if re.match(r"\s*(?:了)?(?:后|之前|的时候|就|再|告诉|记得)", tail):
+                continue
+            if re.search(r"刚|已经|才|了|早|晚|咯|喽|啦", clause):
+                yield kind, "home" if match["deed"] == "到家" else "off_work"
+
+
+def _dessert_claims(clause, *, user=False):
+    names = _DESSERT.findall(clause)
+    if not names or _DESSERT_GONE.search(clause):
+        return set()
+    actor = _DESSERT_ACTOR.search(clause)
+    if actor:
+        owner = "bot" if actor[1] == ("你" if user else "我") else "user"
+    else:
+        owner = ""
+    return {(kind, name, owner if kind != "stock" else "")
+            for name in names for kind, pattern in _DESSERT_FACTS.items() if pattern.search(clause)}
+
+
+def _recent_evidence(user_turns):
+    personal, desserts, withdrawn = set(), set(), set()
+    for body, _ in user_turns:
+        body = _QUOTED.sub(" ", body)
+        for sentence in reversed(re.split(r"(?<=[。！？!?；;\n])", body)):
+            if _QUESTION.search(sentence.strip()) or _IMAGINED.search(sentence):
+                continue
+            for clause in reversed(_CLAUSE_BREAK.split(sentence)):
+                if _SPECULATION.search(clause.strip()):
+                    continue
+                personal.update(_recent_claims(clause, user=True))
+                if _DESSERT_GONE.search(clause):
+                    withdrawn.update(_DESSERT.findall(clause))
+                desserts.update(claim for claim in _dessert_claims(clause, user=True) if claim[1] not in withdrawn)
+    desserts.update((kind, name, "") for kind, name, owner in tuple(desserts) if owner)
+    return personal, desserts
+
+
 def polish_reply(text, scene, user_turns=(), appointments=(), *, now=None):
     """Filter clear contradictions and repeated actions before QQ segmentation."""
     now = now or datetime.now()
@@ -128,6 +199,9 @@ def polish_reply(text, scene, user_turns=(), appointments=(), *, now=None):
     implicit_bath = (any(_LONG_SOAK.search(content) for content in current) and
                      any(_IN_THERE.search(content) or _COOL_WATER.search(content) for content in current))
     kept, seen, reasons = [], [], set()
+    user_turns = tuple(user_turns)
+    personal, desserts = _recent_evidence(user_turns)
+    dessert_names = {name for _, name, _ in desserts}
     plan_rejected, plan_anchor = False, ""
     for sentence, content in zip(sentences, visible):
         if plan_rejected and _PLAN_TAIL.search(content.strip()):
@@ -147,6 +221,20 @@ def polish_reply(text, scene, user_turns=(), appointments=(), *, now=None):
                                   or _COOL_WATER.search(content))
         ):
             reasons.add("unconfirmed_bath")
+            continue
+        claims = [] if _FICTIONAL.search(content.strip()) else [
+            clause for clause in _CLAUSE_BREAK.split(content)
+            if not _QUESTION.search(clause) and not _IMAGINED.search(clause)
+        ]
+        if any(set(_recent_claims(clause)) - personal for clause in claims):
+            reasons.add("unconfirmed_experience")
+            continue
+        if any(
+            _dessert_claims(clause) - desserts or _DESSERT_PRESSURE.search(clause)
+            and any(name not in dessert_names for name in _DESSERT.findall(clause))
+            for clause in claims
+        ):
+            reasons.add("unconfirmed_dessert")
             continue
         key = _normalize(sentence)
         arrival = _ARRIVAL_PROMPT.search(content)
@@ -171,10 +259,13 @@ def polish_reply(text, scene, user_turns=(), appointments=(), *, now=None):
     return ("\n".join(kept) if reasons else text), reasons
 
 
-def topics(text):
+def topics(text, *, from_user=False):
     found = [name for name, pattern in _TOPICS.items() if pattern.search(text)]
-    for clause in re.split(r"[。！？!?\n；;]+", text):
-        if _DESSERT_STATE.search(clause):
+    for clause in re.split(r"[。！？!?\n；;]+", _QUOTED.sub(" ", text)):
+        if from_user and re.search(r"不想|不吃|不要|算了|取消|没买|没有|如果|假如|假装", clause):
+            continue
+        if (_DESSERT_STATE.search(clause) or _DESSERT_PRESSURE.search(clause)
+                or from_user and _DESSERT_INVITE.search(clause)):
             found.extend("dessert:" + name for name in _DESSERT.findall(clause))
     return sorted(set(found))
 
