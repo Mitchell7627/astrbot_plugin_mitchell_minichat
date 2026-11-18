@@ -24,7 +24,7 @@ from .core.persistence import atomic_write_json
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.3.9"
+VERSION = "v0.3.10"
 
 
 class ProactiveMiniPlugin(star.Star):
