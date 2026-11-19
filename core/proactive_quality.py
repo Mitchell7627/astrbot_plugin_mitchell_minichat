@@ -44,21 +44,16 @@ _RECENT_SIGHT = re.compile(
     r"(?P<lead>.{0,8}?)(?:看见|看到|瞧见|遇见|遇到|碰见)(?:了)?(?P<object>.{2,32})$"
 )
 
+_AFFECTION = r"(?:抱(?:抱|一下)|亲(?:亲|一下)|贴贴|蹭蹭|摸摸头|啵+|么么+|mua+|(?:有点|好|很)?想你了?|喜欢你|爱你)"
+_AFFECTIVE_SIGNAL = re.compile(_AFFECTION, re.I)
 _SOCIAL_ONLY = re.compile(
     r"(?:(?:好[的呀啊啦喵哦]?|嗯+|哦+|噢+|啊+|喵+|哈+|嘿+|在吗|收到|知道了|我知道了|明白了|行[呀啊吧]?|"
-    r"可以[呀啊]?|是的|对[呀啊哦]?|没事|谢谢|早安|晚安|你好|抱抱|亲亲|贴贴|摸摸头|啵+|么么+|"
-    r"喜欢你|想你了?|爱你|你在吗|哥哥|姐姐|宝贝|mua+|ok(?:ay)?|yes|yep|lol|hi|hey|hello|3|"
+    rf"可以[呀啊]?|是的|对[呀啊哦]?|没事|谢谢|早安|晚安|你好|{_AFFECTION}|"
+    r"你在吗|哥哥|姐姐|宝贝|ok(?:ay)?|yes|yep|lol|hi|hey|hello|3|"
     r"[喔咯呢诶欸呀啦哒呜唔]+))+", re.I,
 )
 _CHAT_MARKER = re.compile(r"\[CQ:[^\]\n]+\]|\[(?:表情|图片|语音|视频|动画表情|贴纸|戳一戳)(?::[^\]\n]*)?\]")
-_GREETINGS = (
-    "想来跟你说句话，有空再理我呀", "我来冒个泡，今天过得怎么样呀？",
-    "欸，分我一点你的注意力嘛", "给你留个抱抱，想领的时候自己来拿呀",
-    "随便聊点什么吧，想到哪儿说到哪儿呀", "忽然想叫你一声，就这样也挺好",
-    "偷偷来打个招呼，不催你回啦", "有想聊的事就跟我说，没想好也行呀",
-    "给你比个心，这句不用回也算收到啦", "要是正好有空，陪我闲聊一小会儿嘛",
-    "我来招招手，你慢慢忙你的呀", "分你一点好心情，希望刚好用得上",
-)
+_GREETINGS = ("嗨～",)
 _USER_OUTSIDE = re.compile(
     r"(?:在(?:外面|外头|外边|路上|回去的路上)|(?:还)?没(?:回家|回来|到家)|"
     r"(?:刚|已经)出门|还没回(?:过?来|去|[呢呀吗喵\s。？！!?]|$)|"
@@ -259,11 +254,36 @@ def has_topic(scene, user_turns, appointments, now):
     ):
         return True
     for body, _ in user_turns:
-        for clause in _CLAUSE_BREAK.split(_CHAT_MARKER.sub(" ", body)):
+        for clause in _CLAUSE_BREAK.split(_CHAT_MARKER.sub(" ", _QUOTED.sub(" ", body))):
             key = _normalize(clause)
             if key and not _SOCIAL_ONLY.fullmatch(key):
                 return True
     return False
+
+
+def affection_turns(user_turns):
+    """Only direct affection from the latest two turns, never quotes or scene facts."""
+    turns = []
+    for body, _ in user_turns[:2]:
+        body = _CHAT_MARKER.sub(" ", _QUOTED.sub(" ", body)).strip()
+        key = _normalize(body)
+        if len(body) <= 80 and _SOCIAL_ONLY.fullmatch(key) and _AFFECTIVE_SIGNAL.search(key):
+            turns.append(body)
+    return turns
+
+
+def waiting_after_outreach(rows, last_user_message):
+    # Use actual successful deliveries, including ones already saved by older versions.
+    # This is an idle-episode limit, independent of the 24-hour wording deduplication.
+    if not isinstance(rows, list):
+        return False
+    return any(isinstance(row, dict) and isinstance(row.get("at"), (int, float))
+               and row["at"] >= last_user_message for row in rows)
+
+
+def first_affective_sentence(text):
+    return next(iter(split_text(text, pattern=r"[。！？!?；;\r\n]+", min_length=0,
+                                smart=False, balanced=False, trim=True)), "")
 
 
 def light_greeting(at, scene, rows, topic_updates):

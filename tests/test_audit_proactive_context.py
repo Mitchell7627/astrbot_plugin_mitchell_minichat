@@ -258,28 +258,85 @@ def test_unsourced_presuppositions_and_independent_sentences(body, scene, turns,
     assert reason in reasons if reason else not reasons
 
 
-async def test_weak_topic_uses_local_greetings_in_preview_and_send(plugin, umo, clock, monkeypatch):
+@pytest.mark.parametrize("quiet_text", ["收到", "[表情]", "「抱抱」", "👍"])
+async def test_neutral_idle_episode_sends_at_most_one_local_greeting(plugin, umo, clock, monkeypatch, quiet_text):
     r = plugin.runner
     r.started = True
     notes = []
     monkeypatch.setattr(r, "_note_proactive", notes.append)
     now = datetime.fromtimestamp(clock.now)
-    manager(plugin, ["current"], {"current": [
-        dated("user", "收到，嗯嗯～", now - timedelta(minutes=1)),
-        dated("assistant", "柜子里还有荧光笔", now),
-    ]})
+    manager(plugin, ["current"], {"current": [dated("user", quiet_text, now - timedelta(minutes=1))]})
     provider = SimpleNamespace(text_chat=AsyncMock(side_effect=AssertionError("should not generate")))
     plugin.context.get_using_provider = lambda **kw: provider
-
-    first = (await plugin.panel_service.preview({"umo": umo}))["text"]
-    assert first and "荧光笔" not in first
+    preview = await plugin.panel_service.preview({"umo": umo})
+    assert preview["text"] and len(preview["segments"]) == 1
     assert (await r._fire(umo))["sent"]
-    assert plugin.context.send_message.await_args.args[1].get_plain_text() == first
-    assert (await r._fire(umo))["sent"]
-    assert plugin.context.send_message.await_args.args[1].get_plain_text() != first
+    assert plugin.context.send_message.await_args.args[1].get_plain_text() == preview["segments"][0]
+    clock.now += 86401  # Losing the 24-hour wording dedupe must not reopen this idle episode.
+    result = await r._fire(umo)
+    assert not result["sent"] and result["reason"] == "outreach_waiting_for_reply"
+    assert (await plugin.panel_service.preview({"umo": umo}))["text"] == ""
     provider.text_chat.assert_not_called()
-    assert notes.count("light_greeting") == 2 and "model_request" not in notes
-    assert plugin.store.get(umo, "unanswered") == 2
+    assert notes.count("light_greeting") == notes.count("outreach_waiting_for_reply") == 1
+    assert plugin.store.get(umo, "unanswered") == plugin.context.send_message.await_count == 1
+
+
+async def test_affection_keeps_persona_and_only_sends_one_grounded_sentence(plugin, umo, clock, monkeypatch):
+    r = plugin.runner
+    now = datetime.fromtimestamp(clock.now)
+    history = [dated("user", "贴贴，啵啵～", now - timedelta(minutes=1)),
+               dated("assistant", "柜子里那盒电池已经准备好", now)]
+    conversations = manager(plugin, ["current"], {"current": history})
+    notes = []
+    monkeypatch.setattr(r, "_note_proactive", notes.append)
+    monkeypatch.setattr(r, "_load_persona", AsyncMock(return_value="TEST_PERSONA"))
+    plugin.friend_cfg["segmented_reply_settings"].update(split_regex="[，,。]+", min_segment_length=0)
+    provider = SimpleNamespace(text_chat=AsyncMock(return_value=SimpleNamespace(
+        completion_text="柜子里那盒电池还在呢。好呀，抱紧一点。再摸摸头。",
+    )))
+    plugin.context.get_using_provider = lambda **kw: provider
+    assert (await r._fire(umo))["sent"]
+    provider.text_chat.assert_awaited_once()
+    args = provider.text_chat.await_args.kwargs
+    assert args["system_prompt"] == "TEST_PERSONA"
+    assert "贴贴" in args["prompt"] and "电池" not in args["prompt"] and not args["contexts"]
+    sent = plugin.context.send_message.await_args.args[1].get_plain_text()
+    assert sent.rstrip("。") == "好呀，抱紧一点"
+    assert plugin.context.send_message.await_count == 1
+    assert "电池" not in conversations.update_conversation.await_args.kwargs["history"][-1]["content"]
+    assert {"affection_request", "unconfirmed_inventory"} <= set(notes)
+    assert (await r._fire(umo))["reason"] == "outreach_waiting_for_reply"
+    provider.text_chat.assert_awaited_once()
+
+    clock.now += 60
+    plugin.store.touch_message(umo)
+    plugin.store.reset_unanswered(umo)
+    history.append(dated("user", "好想你呀", datetime.fromtimestamp(clock.now)))
+    provider.text_chat.return_value = SimpleNamespace(completion_text="我也想你呀。")
+    assert (await r._fire(umo))["sent"]
+    assert plugin.context.send_message.await_count == 2 and provider.text_chat.await_count == 2
+
+
+async def test_failed_greeting_does_not_count_or_close_the_idle_episode(plugin, umo, clock):
+    r = plugin.runner
+    r.started = True
+    plugin.context.send_message.side_effect = [False, True]
+    assert not (await r._fire(umo))["sent"]
+    assert plugin.store.get(umo, "unanswered", 0) == 0
+    assert (await plugin.panel_service.send({"umo": umo}))["sent"]
+    assert (await r._fire(umo))["reason"] == "outreach_waiting_for_reply"
+    assert plugin.context.send_message.await_count == 2
+
+
+@pytest.mark.parametrize("turns,expected", [
+    (["收到", "贴贴"], ["贴贴"]),
+    (["嗯", "哦", "抱抱"], []),
+    (["『抱抱』", "我不想抱抱"], []),
+    (["如果有空就亲亲"], []),
+    (["好想你呀", "亲一下"], ["好想你呀", "亲一下"]),
+])
+def test_direct_affection_comes_only_from_last_two_turns(turns, expected):
+    assert quality.affection_turns([(turn, None) for turn in turns]) == expected
 
 
 async def test_real_topic_uses_one_draft_and_only_writes_safe_segments(plugin, umo, clock, monkeypatch):

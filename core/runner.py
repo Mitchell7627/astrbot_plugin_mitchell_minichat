@@ -136,6 +136,8 @@ class _ProactiveInput:
     platform_block: str
     user_turns: tuple
     scheduled: bool = False
+    outreach: str = "topic"
+    affection: tuple[str, ...] = ()
 
 
 class Runner:
@@ -3800,7 +3802,8 @@ class Runner:
         event = self._fresh_event(umo, time.time()) or {}
         return (self._proactive_scene(umo, cid=cid), copy.deepcopy(self._sleep_state(umo)),
                 self._appointments(umo), event.get("started_at"),
-                event.get("keyword"), self.store.get(umo, "last_bot_reply_at"))
+                event.get("keyword"), self.store.get(umo, "last_bot_reply_at"),
+                self.store.get(umo, "last_message_at"))
 
     def _note_proactive(self, key):
         logger.info(f"{TAG} 主动消息：{key}")
@@ -3865,15 +3868,30 @@ class Runner:
                 history = dialogue
                 turns = list(self._proactive_plan_evidence(history))
         turns.sort(key=lambda turn: turn[1] or datetime.min, reverse=True)
-        return _ProactiveInput(history, block, tuple(turns[:6]), scheduled)
+        turns = tuple(turns[:6])
+        scene = self._proactive_scene(umo, now=now.timestamp(), cid=cid)
+        outreach, affection = "topic", ()
+        if not quality.has_topic(scene, turns, self._appointments(umo), now):
+            # Use the inbound event timestamp even for pictures/reactions without text.
+            latest_history = max((stamp.timestamp() for _, stamp in turns if stamp), default=0)
+            latest_user = max(latest_history, _as_float_safe(self.store.get(umo, "last_message_at")))
+            if quality.waiting_after_outreach(self.store.get(umo, "proactive_recent", []), latest_user):
+                outreach = "quiet"
+            else:
+                affection = tuple(quality.affection_turns(turns))
+                outreach = "affection" if affection else "greeting"
+        return _ProactiveInput(history, block, turns, scheduled, outreach, affection)
 
     def ground_proactive_reply(self, text, snapshot, dialogue):
         turns = (dialogue.user_turns if isinstance(dialogue, _ProactiveInput)
                  else tuple(self._proactive_plan_evidence(dialogue)))
-        return quality.polish_reply(
+        polished, reasons = quality.polish_reply(
             text, snapshot[0], turns,
             snapshot[2], now=datetime.now(),
         )
+        if isinstance(dialogue, _ProactiveInput) and dialogue.outreach == "affection":
+            polished = quality.first_affective_sentence(polished)
+        return polished, reasons
 
     @staticmethod
     def _ground_appointment_reply(item, shot, text, now):
@@ -3898,7 +3916,7 @@ class Runner:
             return f"{when}啦，该起床喔"
         return f"{when}啦，提醒你一下，你说的{label}时间到了"
 
-    async def deliver(self, umo, text, *, cid, guard, report, scene=None):
+    async def deliver(self, umo, text, *, cid, guard, report, scene=None, single=False):
         """Send and record successful segments under AstrBot's conversation lock."""
         delivered = []
         async with self.conversation_delivery_lock(umo):
@@ -3908,7 +3926,7 @@ class Runner:
             sent = ""
             try:
                 sent = await self._send_split(umo, text, sent_out=delivered, report=report,
-                                              guard=guard, conversation_id=cid)
+                                              guard=guard, conversation_id=cid, single=single)
                 return sent
             finally:
                 sent_text = sent or "\n".join(delivered)
@@ -4055,6 +4073,9 @@ class Runner:
                         self._note_proactive("appointment_corrected")
                         text = checked
             if not text:
+                if ordinary and dialogue.outreach == "quiet":
+                    result["reason"] = "outreach_waiting_for_reply"
+                    return result
                 result["reason"] = "empty_generation"
                 if ordinary:
                     self._note_proactive("empty")
@@ -4095,7 +4116,8 @@ class Runner:
                     self._note_proactive(repeat)
                     return result
             sent_text = await self.deliver(umo, text, cid=cid, guard=can_send, report=result,
-                                           scene=snapshot[0] if ordinary else None)
+                                           scene=snapshot[0] if ordinary else None,
+                                           single=ordinary and dialogue.outreach == "affection")
             ok = bool(sent_text)
             result["sent"] = ok
             if result["reason"] != "stale_generation":
@@ -4162,13 +4184,18 @@ class Runner:
 
         history = []
         platform_block = ""
+        affectionate = False
         if ordinary:
             now = datetime.now()
             if not isinstance(dialogue, _ProactiveInput):
                 cid = cid or await self._conversation_id(umo)
                 dialogue = await self._proactive_input(umo, cid, now, dialogue=dialogue)
-            scene = self._proactive_scene(umo, now=now.timestamp(), cid=cid)
-            if not quality.has_topic(scene, dialogue.user_turns, self._appointments(umo), now):
+            if dialogue.outreach == "quiet":
+                if dialogue.scheduled:
+                    self._note_proactive("outreach_waiting_for_reply")
+                return ""
+            if dialogue.outreach == "greeting":
+                scene = self._proactive_scene(umo, now=now.timestamp(), cid=cid)
                 text = quality.light_greeting(
                     now.timestamp(), scene, self.store.get(umo, "proactive_recent", []),
                     self.store.get(umo, "proactive_topic_updates", {}),
@@ -4176,7 +4203,9 @@ class Runner:
                 if dialogue.scheduled:
                     self._note_proactive("light_greeting" if text else "light_greeting_repeated")
                 return text
-            history, platform_block = dialogue.history, dialogue.platform_block
+            affectionate = dialogue.outreach == "affection"
+            if not affectionate:
+                history, platform_block = dialogue.history, dialogue.platform_block
         else:
             if mode != "platform_message_history":
                 history = await self._load_history(umo, cid=cid)
@@ -4194,31 +4223,38 @@ class Runner:
 
         system_prompt = await self._load_persona(umo)
 
-        unanswered = int(self.store.get(umo, "unanswered", 0) or 0)
-        if appointment:
-            hint = self.appointment_hint(umo, appointment, appointment_at, appointment_id)
-        elif reminder:
-            hint = self.reminder_hint(umo)
+        if affectionate:
+            # Keep the persona, but don't inject old scene details or the general outreach template.
+            signals = json.dumps(list(reversed(dialogue.affection)), ensure_ascii=False)
+            prompt = ("沿用你平时的说话方式。接住对方最近表达的亲近，只主动说一句短话。"
+                      "不催回复，不解释你在主动找话题，不猜地点、活动、物品或下一步安排。"
+                      "只输出这一句。最近的情绪表达：" + signals)
         else:
-            hint = "[已确认状态与待办]\n" + self._proactive_hint(umo, cid=cid)
-        prompt = (
-            template.replace("{{current_time}}", time_text())
-            .replace("{{unanswered_count}}", str(unanswered))
-            .replace("{{event_hint}}", hint)
-        )
-        if platform_block:
-            prompt = prompt + "\n\n" + platform_block
-        prompt += "\n当前钟点以本轮时间为准。每句单独一行，需要停顿时保留标点。"
-        if appointment:
-            item = self._appointment_item_for(umo, appointment_at, appointment_id)
-            if item and item.get("label"):
-                prompt += f"\n第一句先说明已登记的事项「{item['label']}」，时间以这条约定为准。"
-        elif not reminder:
-            if "{{event_hint}}" not in template:
-                prompt += "\n" + hint
-            prompt += ("\n近期对话只用来接话，助手说过的话只作话题和语气参考。"
-                       "所在位置、手边有什么、谁刚做完什么，只沿用用户确认或已知状态。"
-                       "不确定就开放地问，不把猜测藏进问句。只接一个话题，说完就停。")
+            unanswered = int(self.store.get(umo, "unanswered", 0) or 0)
+            if appointment:
+                hint = self.appointment_hint(umo, appointment, appointment_at, appointment_id)
+            elif reminder:
+                hint = self.reminder_hint(umo)
+            else:
+                hint = "[已确认状态与待办]\n" + self._proactive_hint(umo, cid=cid)
+            prompt = (
+                template.replace("{{current_time}}", time_text())
+                .replace("{{unanswered_count}}", str(unanswered))
+                .replace("{{event_hint}}", hint)
+            )
+            if platform_block:
+                prompt = prompt + "\n\n" + platform_block
+            prompt += "\n当前钟点以本轮时间为准。每句单独一行，需要停顿时保留标点。"
+            if appointment:
+                item = self._appointment_item_for(umo, appointment_at, appointment_id)
+                if item and item.get("label"):
+                    prompt += f"\n第一句先说明已登记的事项「{item['label']}」，时间以这条约定为准。"
+            elif not reminder:
+                if "{{event_hint}}" not in template:
+                    prompt += "\n" + hint
+                prompt += ("\n近期对话只用来接话，助手说过的话只作话题和语气参考。"
+                           "所在位置、手边有什么、谁刚做完什么，只沿用用户确认或已知状态。"
+                           "不确定就开放地问，不把猜测藏进问句。只接一个话题，说完就停。")
 
         provider = self.context.get_using_provider(umo=umo)
         if provider is None:
@@ -4228,6 +4264,8 @@ class Runner:
         try:
             if ordinary and dialogue.scheduled:
                 self._note_proactive("model_request")
+                if affectionate:
+                    self._note_proactive("affection_request")
             resp = await asyncio.wait_for(
                 provider.text_chat(
                     prompt=prompt,
@@ -5013,10 +5051,10 @@ class Runner:
                 cleaned.append(text)
         return cleaned
 
-    def prepare_segments(self, text: str) -> list[str]:
+    def prepare_segments(self, text: str, *, single=False) -> list[str]:
         """面板预览与实际发送共用同一份分段设置。"""
         conf = self.cfg.get("segmented_reply_settings", {}) or {}
-        if not bool(conf.get("enable", True)):
+        if single or not bool(conf.get("enable", True)):
             segments = [re.sub(r"[\r\n]+", " ", normalize_escapes(text)).strip()]
         else:
             segments = split_text(
@@ -5038,10 +5076,11 @@ class Runner:
         return [segment for segment in segments if segment]
 
     async def _send_split(self, umo: str, text: str, sent_out: list | None = None,
-                          report: dict | None = None, guard=None, conversation_id=None) -> str:
+                          report: dict | None = None, guard=None, conversation_id=None,
+                          *, single=False) -> str:
         """返回实际发送成功的段落，保持发送顺序。"""
         conf = self.cfg.get("segmented_reply_settings", {}) or {}
-        segments = self.prepare_segments(text)
+        segments = self.prepare_segments(text, single=single)
         if report is not None:
             report.update(planned_segments=len(segments), delivered_segments=0,
                           delivery_status="not_sent")

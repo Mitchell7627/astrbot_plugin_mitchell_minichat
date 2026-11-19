@@ -664,7 +664,7 @@ class PanelService:
         text = await runner._generate(umo, cid=cid, dialogue=dialogue)
         text, _ = inspect_text(text or "")
         text, _ = runner.ground_proactive_reply(text, snapshot, dialogue)
-        return text
+        return text, dialogue.outreach
 
     async def preview(self, payload: dict) -> dict:
         umo = self._validate_umo((payload or {}).get("umo"))
@@ -674,7 +674,9 @@ class PanelService:
             try:
                 cid = await runner._conversation_id(umo)
                 snapshot = runner._delivery_snapshot(umo, cid)
-                text = await asyncio.wait_for(self._generated_proactive_text(runner, umo, cid, snapshot), timeout=90)
+                text, outreach = await asyncio.wait_for(
+                    self._generated_proactive_text(runner, umo, cid, snapshot), timeout=90
+                )
             except asyncio.TimeoutError:
                 raise PanelError("E_UPSTREAM", "生成超时（90 秒）")
             except PanelError:
@@ -682,7 +684,7 @@ class PanelService:
             except Exception as e:
                 raise PanelError("E_UPSTREAM", f"生成失败: {e}")
 
-        segments = runner.prepare_segments(text)
+        segments = runner.prepare_segments(text, single=outreach == "affection")
         return {
             "umo": umo,
             "text": text,
@@ -712,9 +714,12 @@ class PanelService:
 
         with _Busy(self, umo, "send"):
             async with lock:
+                outreach = None
                 if not text:
                     try:
-                        text = await asyncio.wait_for(self._generated_proactive_text(runner, umo, cid, scene), timeout=90)
+                        text, outreach = await asyncio.wait_for(
+                            self._generated_proactive_text(runner, umo, cid, scene), timeout=90
+                        )
                     except asyncio.TimeoutError:
                         raise PanelError("E_UPSTREAM", "生成超时（90 秒）")
                 text, _ = inspect_text(text)
@@ -722,7 +727,9 @@ class PanelService:
                     raise PanelError("E_UPSTREAM", "没有可发送的正文")
                 report = {}
                 try:
-                    ok = bool(await runner.deliver(umo, text, cid=cid, report=report, guard=current))
+                    ok = bool(await runner.deliver(umo, text, cid=cid, report=report, guard=current,
+                                                   scene=scene[0] if outreach else None,
+                                                   single=outreach == "affection"))
                 except Exception as e:
                     raise PanelError("E_UPSTREAM", f"发送失败: {e}")
 
