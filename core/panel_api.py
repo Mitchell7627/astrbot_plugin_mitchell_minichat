@@ -664,7 +664,7 @@ class PanelService:
         text = await runner._generate(umo, cid=cid, dialogue=dialogue)
         text, _ = inspect_text(text or "")
         text, _ = runner.ground_proactive_reply(text, snapshot, dialogue)
-        return text, dialogue.outreach
+        return text
 
     async def preview(self, payload: dict) -> dict:
         umo = self._validate_umo((payload or {}).get("umo"))
@@ -674,7 +674,7 @@ class PanelService:
             try:
                 cid = await runner._conversation_id(umo)
                 snapshot = runner._delivery_snapshot(umo, cid)
-                text, outreach = await asyncio.wait_for(
+                text = await asyncio.wait_for(
                     self._generated_proactive_text(runner, umo, cid, snapshot), timeout=90
                 )
             except asyncio.TimeoutError:
@@ -684,7 +684,7 @@ class PanelService:
             except Exception as e:
                 raise PanelError("E_UPSTREAM", f"生成失败: {e}")
 
-        segments = runner.prepare_segments(text, single=outreach == "affection")
+        segments = runner.prepare_segments(text)
         return {
             "umo": umo,
             "text": text,
@@ -714,10 +714,10 @@ class PanelService:
 
         with _Busy(self, umo, "send"):
             async with lock:
-                outreach = None
-                if not text:
+                automatic = not text
+                if automatic:
                     try:
-                        text, outreach = await asyncio.wait_for(
+                        text = await asyncio.wait_for(
                             self._generated_proactive_text(runner, umo, cid, scene), timeout=90
                         )
                     except asyncio.TimeoutError:
@@ -728,8 +728,7 @@ class PanelService:
                 report = {}
                 try:
                     ok = bool(await runner.deliver(umo, text, cid=cid, report=report, guard=current,
-                                                   scene=scene[0] if outreach else None,
-                                                   single=outreach == "affection"))
+                                                   scene=scene[0] if automatic else None))
                 except Exception as e:
                     raise PanelError("E_UPSTREAM", f"发送失败: {e}")
 

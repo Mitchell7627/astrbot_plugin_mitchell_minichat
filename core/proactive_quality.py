@@ -9,6 +9,9 @@ from .appointment import _day_markers, find_clock, resolve_clock
 from .splitter import split_text
 
 
+NO_SEND = "[[NO_SEND]]"
+
+
 _TOPICS = {
     "shoulder": re.compile(
         r"(?:借|给|搭|靠|挨).{0,8}肩膀|肩膀.{0,12}(?:借|搭|靠|挨|给你)|"
@@ -281,9 +284,40 @@ def waiting_after_outreach(rows, last_user_message):
                and row["at"] >= last_user_message for row in rows)
 
 
-def first_affective_sentence(text):
-    return next(iter(split_text(text, pattern=r"[。！？!?；;\r\n]+", min_length=0,
-                                smart=False, balanced=False, trim=True)), "")
+_GESTURES = (
+    (re.compile(r"贴贴|贴一下|贴(?:着|紧)"), re.compile(r"^(?P<gesture>贴贴|贴一下)就(?P=gesture)")),
+    (re.compile(r"抱抱|抱一下|抱(?:着|紧)"), re.compile(r"^(?P<gesture>抱抱|抱一下)就(?P=gesture)")),
+    (re.compile(r"亲亲|亲一下|亲一口"), re.compile(r"^(?P<gesture>亲亲|亲一下)就(?P=gesture)")),
+)
+# This continuation depends on the invitation that was just discarded.
+_ECHO_TAIL = re.compile(r"^谁先松手谁(?:就)?输[了吧呀呗啦喵哦啊。！？!?]*$")
+
+
+def trim_answered_echo(text, user, replies):
+    """Skip a bare repeat of the latest affectionate exchange, not a fresh follow-up."""
+    if not text or not replies or not affection_turns([(user, None)]):
+        return text, set()
+    def split(value):
+        return split_text(value, pattern=r"[。！？!?；;\r\n]+", min_length=0,
+                          smart=False, balanced=False, trim=True)
+
+    earlier = {_normalize(sentence) for reply in replies for sentence in split(reply)}
+    answered = [echo for gesture, echo in _GESTURES if gesture.search(user)
+                and any(gesture.search(_QUOTED.sub(" ", reply)) for reply in replies)]
+    kept, removed, removed_invitation = [], False, False
+    for sentence in split(text):
+        head, *rest = re.split(r"[，,]", sentence, maxsplit=1)
+        tail = rest[0].strip() if rest else ""
+        bare_echo = any(echo.fullmatch(head.strip().rstrip("了吧呀呗啦喵哦啊。！？!?")) for echo in answered)
+        key = _normalize(sentence)
+        if (bare_echo and (not tail or _ECHO_TAIL.fullmatch(tail))
+                or key and key in earlier
+                or removed_invitation and _ECHO_TAIL.fullmatch(sentence.strip())):
+            removed = True
+            removed_invitation = removed_invitation or bare_echo
+            continue
+        kept.append(sentence)
+    return ("\n".join(kept), {"answered_echo"}) if removed else (text, set())
 
 
 def light_greeting(at, scene, rows, topic_updates):

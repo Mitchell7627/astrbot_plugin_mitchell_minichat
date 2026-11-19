@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from astrbot_plugin_mitchell_minichat.core import panel_api, runner as runner_module
 from astrbot_plugin_mitchell_minichat.core import proactive_quality as quality
 from astrbot_plugin_mitchell_minichat.core.proactive_quality import duplicate, fingerprint, polish_reply, topics
 
@@ -281,40 +282,83 @@ async def test_neutral_idle_episode_sends_at_most_one_local_greeting(plugin, umo
     assert plugin.store.get(umo, "unanswered") == plugin.context.send_message.await_count == 1
 
 
-async def test_affection_keeps_persona_and_only_sends_one_grounded_sentence(plugin, umo, clock, monkeypatch):
+async def test_affection_uses_complete_dialogue_persona_and_normal_segmentation(plugin, umo, clock, monkeypatch):
     r = plugin.runner
     now = datetime.fromtimestamp(clock.now)
-    history = [dated("user", "贴贴，啵啵～", now - timedelta(minutes=1)),
+    history = [dated("user", "抱抱呀", now - timedelta(minutes=1)),
+               dated("assistant", "那就抱着吧", now),
                dated("assistant", "柜子里那盒电池已经准备好", now)]
     conversations = manager(plugin, ["current"], {"current": history})
     notes = []
     monkeypatch.setattr(r, "_note_proactive", notes.append)
     monkeypatch.setattr(r, "_load_persona", AsyncMock(return_value="TEST_PERSONA"))
-    plugin.friend_cfg["segmented_reply_settings"].update(split_regex="[，,。]+", min_segment_length=0)
+    plugin.friend_cfg["segmented_reply_settings"].update(
+        split_regex=r"[。\n]+", min_segment_length=0, enable_smart_split=False, balanced_split=False,
+    )
     provider = SimpleNamespace(text_chat=AsyncMock(return_value=SimpleNamespace(
-        completion_text="柜子里那盒电池还在呢。好呀，抱紧一点。再摸摸头。",
+        completion_text="柜子里那盒电池还在呢。刚才那句有点可爱。偷偷笑了一下。",
     )))
     plugin.context.get_using_provider = lambda **kw: provider
     assert (await r._fire(umo))["sent"]
     provider.text_chat.assert_awaited_once()
     args = provider.text_chat.await_args.kwargs
     assert args["system_prompt"] == "TEST_PERSONA"
-    assert "贴贴" in args["prompt"] and "电池" not in args["prompt"] and not args["contexts"]
-    sent = plugin.context.send_message.await_args.args[1].get_plain_text()
-    assert sent.rstrip("。") == "好呀，抱紧一点"
-    assert plugin.context.send_message.await_count == 1
+    assert quality.NO_SEND in args["prompt"] and "发前在心里过一遍" in args["prompt"]
+    assert [(row["role"], row["content"].splitlines()[0]) for row in args["contexts"]] == [
+        ("user", "抱抱呀"), ("assistant", "那就抱着吧"), ("assistant", "柜子里那盒电池已经准备好"),
+    ]
+    sent = [call.args[1].get_plain_text().rstrip("。") for call in plugin.context.send_message.await_args_list]
+    assert sent == ["刚才那句有点可爱", "偷偷笑了一下"]
     assert "电池" not in conversations.update_conversation.await_args.kwargs["history"][-1]["content"]
-    assert {"affection_request", "unconfirmed_inventory"} <= set(notes)
+    assert {"model_request", "unconfirmed_inventory"} <= set(notes)
     assert (await r._fire(umo))["reason"] == "outreach_waiting_for_reply"
     provider.text_chat.assert_awaited_once()
 
-    clock.now += 60
-    plugin.store.touch_message(umo)
-    plugin.store.reset_unanswered(umo)
-    history.append(dated("user", "好想你呀", datetime.fromtimestamp(clock.now)))
-    provider.text_chat.return_value = SimpleNamespace(completion_text="我也想你呀。")
-    assert (await r._fire(umo))["sent"]
-    assert plugin.context.send_message.await_count == 2 and provider.text_chat.await_count == 2
+
+@pytest.mark.parametrize("draft,reason", [
+    ("[[NO_SEND]]", "proactive_self_skip"),
+    ("<think>内部检查</think>\n [[no_send]]\n不小心跟在标记后的正文", "proactive_self_skip"),
+    ("抱抱就抱抱，谁先松手谁输呀", "proactive_filtered"),
+    ("抱抱就抱抱。谁先松手谁输呀。", "proactive_filtered"),
+])
+async def test_self_skip_or_answered_echo_never_sends_or_updates_history(plugin, umo, clock, monkeypatch, draft, reason):
+    r = plugin.runner
+    r.started = True
+    monkeypatch.setattr(panel_api, "datetime", runner_module.datetime)
+    now = datetime.fromtimestamp(clock.now)
+    conversations = manager(plugin, ["current"], {"current": [
+        dated("user", "抱抱呀", now - timedelta(minutes=1)), dated("assistant", "那就抱着吧", now),
+    ]})
+    notes = []
+    monkeypatch.setattr(r, "_note_proactive", notes.append)
+    provider = SimpleNamespace(text_chat=AsyncMock(return_value=SimpleNamespace(completion_text=draft)))
+    plugin.context.get_using_provider = lambda **kw: provider
+    result = await r._fire(umo)
+    assert not result["sent"] and result["reason"] == reason
+    provider.text_chat.assert_awaited_once()
+    assert notes.count("model_request") == 1
+    assert ("answered_echo" if reason == "proactive_filtered" else reason) in notes
+    preview = await plugin.panel_service.preview({"umo": umo})
+    assert preview["text"] == "" and preview["segments"] == []
+    with pytest.raises(panel_api.PanelError, match="没有可发送的正文"):
+        await plugin.panel_service.send({"umo": umo})
+    assert provider.text_chat.await_count == 3  # One per attempt, across timer, preview and panel send.
+    plugin.context.send_message.assert_not_awaited()
+    conversations.update_conversation.assert_not_awaited()
+    assert plugin.store.get(umo, "unanswered", 0) == 0
+    assert not plugin.store.get(umo, "proactive_recent")
+
+
+@pytest.mark.parametrize("draft,replies,expected", [
+    ("抱抱就抱抱呀。你那句把我逗笑了。", ["那就抱着吧"], "你那句把我逗笑了"),
+    ("抱抱就抱抱，刚才为什么突然笑呀？", ["那就抱着吧"], "抱抱就抱抱，刚才为什么突然笑呀"),
+    ("抱抱就抱抱呀！", [], "抱抱就抱抱呀"),
+    ("✨", ["♥"], "✨"),
+    ("你会说『抱抱就抱抱』吗？", ["那就抱着吧"], "你会说『抱抱就抱抱』吗"),
+    ("要是你又想抱一下，我还是会笑的。", ["那就抱着吧"], "要是你又想抱一下，我还是会笑的"),
+])
+def test_answered_echo_keeps_new_unanswered_and_quoted_content(draft, replies, expected):
+    assert quality.trim_answered_echo(draft, "抱抱呀", replies)[0].rstrip("。！？") == expected
 
 
 async def test_failed_greeting_does_not_count_or_close_the_idle_episode(plugin, umo, clock):
