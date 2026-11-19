@@ -139,17 +139,16 @@ def test_ordering_moves_out_of_commute_without_claiming_food_is_served(plugin, u
     ("被子跑到你那边啦\n再眯一会儿", "被子被我卷过来了，往中间挪挪",
      "挪一点，别把被子都卷走啦"),
 ])
-async def test_successful_proactive_send_blocks_same_opening(plugin, umo, clock, monkeypatch, first, second, third):
+async def test_recent_opening_does_not_block_checked_message(plugin, umo, clock, monkeypatch, first, second, third):
     r = plugin.runner
     generate = AsyncMock(side_effect=[first, second, third, "头发别滴到肩膀"])
     monkeypatch.setattr(r, "_generate", generate)
     assert (await r._fire(umo))["sent"]
-    sent = plugin.context.send_message.await_count
+    plugin.friend_cfg["schedule_settings"]["max_unanswered_times"] = 0
     for _ in range(2):
         clock.now += 3600
-        assert not (await r._fire(umo))["sent"]
-    assert plugin.context.send_message.await_count == sent
-    assert plugin.store.get(umo, "unanswered") == 1
+        assert (await r._fire(umo))["sent"]
+    assert plugin.store.get(umo, "unanswered") == 3
     assert (await r._fire(umo))["sent"]
     assert generate.await_count == 4
 
@@ -267,7 +266,7 @@ async def test_due_reply_keeps_registered_subject_and_clock(plugin, umo, clock, 
     assert "甜点" not in sent and "十一点" not in sent
 
 
-async def test_repeated_dessert_phrase_is_not_sent_after_scene_changes(plugin, umo, clock, monkeypatch):
+async def test_recent_dessert_topic_does_not_block_a_grounded_new_message(plugin, umo, clock, monkeypatch):
     r = plugin.runner
     monkeypatch.setattr(r, "_proactive_dialogue", AsyncMock(return_value=[
         {"role": "user", "content": "你已经买好了布丁，冰箱里还有布丁，布丁给我留着"},
@@ -278,7 +277,7 @@ async def test_repeated_dessert_phrase_is_not_sent_after_scene_changes(plugin, u
     assert (await r._fire(umo))["sent"]
     clock.now += 15 * 60
     r.update_from_message(umo, "我正在上课")
-    assert (await r._fire(umo))["reason"] == "same_topic"
+    assert (await r._fire(umo))["sent"]
     clock.now += 15 * 60
     r.update_from_message(umo, "布丁刚买好了，我放冰箱啦")
     assert (await r._fire(umo))["sent"]

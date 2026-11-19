@@ -52,11 +52,10 @@ _AFFECTIVE_SIGNAL = re.compile(_AFFECTION, re.I)
 _SOCIAL_ONLY = re.compile(
     r"(?:(?:好[的呀啊啦喵哦]?|嗯+|哦+|噢+|啊+|喵+|哈+|嘿+|在吗|收到|知道了|我知道了|明白了|行[呀啊吧]?|"
     rf"可以[呀啊]?|是的|对[呀啊哦]?|没事|谢谢|早安|晚安|你好|{_AFFECTION}|"
-    r"你在吗|哥哥|姐姐|宝贝|ok(?:ay)?|yes|yep|lol|hi|hey|hello|3|"
+    r"你在吗|哥哥|姐姐|宝贝|笨笨(?:的)?|小笨蛋|ok(?:ay)?|yes|yep|lol|hi|hey|hello|3|"
     r"[喔咯呢诶欸呀啦哒呜唔]+))+", re.I,
 )
 _CHAT_MARKER = re.compile(r"\[CQ:[^\]\n]+\]|\[(?:表情|图片|语音|视频|动画表情|贴纸|戳一戳)(?::[^\]\n]*)?\]")
-_GREETINGS = ("嗨～",)
 _USER_OUTSIDE = re.compile(
     r"(?:在(?:外面|外头|外边|路上|回去的路上)|(?:还)?没(?:回家|回来|到家)|"
     r"(?:刚|已经)出门|还没回(?:过?来|去|[呢呀吗喵\s。？！!?]|$)|"
@@ -275,15 +274,6 @@ def affection_turns(user_turns):
     return turns
 
 
-def waiting_after_outreach(rows, last_user_message):
-    # Use actual successful deliveries, including ones already saved by older versions.
-    # This is an idle-episode limit, independent of the 24-hour wording deduplication.
-    if not isinstance(rows, list):
-        return False
-    return any(isinstance(row, dict) and isinstance(row.get("at"), (int, float))
-               and row["at"] >= last_user_message for row in rows)
-
-
 _GESTURES = (
     (re.compile(r"贴贴|贴一下|贴(?:着|紧)"), re.compile(r"^(?P<gesture>贴贴|贴一下)就(?P=gesture)")),
     (re.compile(r"抱抱|抱一下|抱(?:着|紧)"), re.compile(r"^(?P<gesture>抱抱|抱一下)就(?P=gesture)")),
@@ -320,9 +310,24 @@ def trim_answered_echo(text, user, replies):
     return ("\n".join(kept), {"answered_echo"}) if removed else (text, set())
 
 
-def light_greeting(at, scene, rows, topic_updates):
-    rows = recent(rows, at)
-    return next((text for text in _GREETINGS if not duplicate(fingerprint(text, at, scene), rows, topic_updates)), "")
+_IDLE_LOCATION = re.compile(
+    r"(?:还|仍|继续|正|现在|这会儿|刚才|刚)(?:在|坐在|躺在|窝在|趴在|是在|从)?"
+    r"(?:沙发|被窝|床上|浴室|浴缸)(?:上|里|旁|边)?(?:坐|躺|窝|趴|睡)?"
+    r"|(?:沙发|被窝|床上)(?:上|里)?(?:睡醒|醒来|爬起来)"
+)
+
+
+def check_idle_scene(text):
+    """An older exchange cannot establish where either person is right now."""
+    kept, removed = [], False
+    for sentence in split_text(text, pattern=r"[。！？!?；;\r\n]+", min_length=0,
+                               smart=False, balanced=False, trim=True):
+        clause = _QUOTED.sub(" ", sentence)
+        if _IDLE_LOCATION.search(clause) and not _IMAGINED.search(clause):
+            removed = True
+        else:
+            kept.append(sentence)
+    return ("\n".join(kept) if removed else text), removed
 
 
 def _item(text):
@@ -555,6 +560,142 @@ def topics(text, *, from_user=False):
                 or from_user and _DESSERT_INVITE.search(clause)):
             found.extend("dessert:" + name for name in _DESSERT.findall(clause))
     return sorted(set(found))
+
+
+_NO_REPLY = re.compile(r"(?:你|哥哥|姐姐)(?:你|怎么|还|一直|到现在|现在|根本|又|都|也|是不是){0,6}(?:没(?:有)?|不)(?:回(?:我|消息|话|复)|理我)")
+_MEAL = re.compile(r"吃饭|饭点|吃(?:午饭|晚饭|午餐|晚餐|午觉后的饭)|(?:早|午|晚)[饭餐]|饭(?:又|不会|都|已经|好了)|做饭|弄(?:点)?吃的")
+_MEAL_INVITE = re.compile(r"(?:一起|一块|咱俩|我们).{0,5}吃|吃饭(?:吧|去)|我.{0,6}(?:去|要|会)吃饭")
+_MEAL_PRESSURE = re.compile(r"^(?:你|哥哥|姐姐)?(?:不要|不吃|不来吃)(?:的话|也行)[，, ]*(?:那)?我(?:可)?就(?:先)?自己吃")
+_ASSUMED_YES = re.compile(r"(?:那)?就当(?:你|哥哥|姐姐|对方)(?:已经|是|也)?(?:应了|答应了|同意了|默认了)")
+_PLAN_CANCEL = re.compile(r"取消|不去了|不吃了|不吃饭|改期|改天|不去吃|先不吃|还没定|没说好")
+_DIRECT_YES = re.compile(r"^\s*(?:好(?:呀|啊|喵|哦|的)?|行(?:啊|呀|喵)?|同意|说好了|就这么定)(?:[，。！!\s]|$)")
+_TIMING = re.compile(r"(?:还(?:只)?差|还(?:只)?有|再(?:等|过))(?P<n>[零〇一二两三四五六七八九十几\d]{1,3})\s*分钟(?P<end>[^。！?？\n]{0,8}(?:就(?:要|该)?到点|就(?:要|该)?开饭|就(?:要|该)?吃饭|就是饭点))?")
+_TIME_CONTEXT = re.compile(r"到点|饭点|时间还没到|几点开始|几点吃|几点去|还没到时间")
+_TIMING_NEEDS_PROOF = re.compile(r"饭点(?:快到了|差不多到了)|快到(?:饭点|约定的时间)(?:了|啦)?")
+_TIME_NUMS = {c:i for i,c in enumerate("零一二三四五六七八九")}
+_TIME_NUMS.update({"两":2,"〇":0})
+_RELATIVE_MEAL = re.compile(r"(?P<n>[一二两三四五六七八九十\d]{1,3})\s*分钟(?:以?后|再).{0,8}(?:一起吃|去吃|吃饭|开饭)")
+
+
+def _minutes(value):
+    if value.isascii() and value.isdigit():
+        return int(value)
+    if value in _TIME_NUMS:
+        return _TIME_NUMS[value]
+    if "十" in value:
+        a, b = value.split("十", 1)
+        if (not a or a in _TIME_NUMS) and (not b or b in _TIME_NUMS):
+            return 10 * _TIME_NUMS.get(a, 1) + _TIME_NUMS.get(b, 0)
+    return None
+
+
+def _user_is_speaking_fact(body):
+    return bool(body.strip() and not _IMAGINED.search(body) and not _QUESTION.search(body.strip()))
+
+
+def _meal_supported(turns, appointments, now):
+    for body, _ in turns:
+        visible = _QUOTED.sub(" ", body)
+        if not _user_is_speaking_fact(visible):
+            continue
+        if _PLAN_CANCEL.search(visible) and (_MEAL.search(visible) or _MEAL_INVITE.search(visible)):
+            return False
+        if _MEAL_INVITE.search(visible) and not re.search(r"想吃|不想|还没决定|打算", visible):
+            return True
+    return any(_MEAL.search(item.get("label", "")) and item.get("stage") != "done"
+               and item.get("at", 0) >= now.timestamp() - 60 for item in appointments)
+
+
+def _confirmed_countdown(m, meal, turns, appointments, now):
+    for body, stamp in turns:
+        visible = _QUOTED.sub(" ", body)
+        if not _user_is_speaking_fact(visible):
+            continue
+        if _PLAN_CANCEL.search(visible) and ((meal and _MEAL.search(visible)) or _TIME_CONTEXT.search(visible)):
+            return False
+        if not ((_MEAL.search(visible) or _MEAL_INVITE.search(visible)) if meal else _PLAN_OBJECT.search(visible)):
+            continue
+        relative = _RELATIVE_MEAL.search(visible) if meal else None
+        clock = find_clock(visible)
+        if not relative and not clock:
+            continue
+        dates = {marker.target for marker in _day_markers(visible, now)}
+        if dates and dates != {now.date()}:
+            return False
+        if relative and stamp:
+            minutes = _minutes(relative["n"])
+            at = stamp.timestamp() + minutes * 60 if minutes is not None else None
+        else:
+            at = resolve_clock(clock, now, 1) if clock else None
+        return _matches_countdown(at, m, now)  # A newer explicit time overrides an old one.
+    active = [item for item in appointments if item.get("stage") != "done"
+              and (not meal or _MEAL.search(item.get("label", "")))
+              and now.timestamp() - 60 <= item.get("at", 0) <= now.timestamp() + 3600]
+    return len(active) == 1 and _matches_countdown(active[0]["at"], m, now)
+
+
+def _matches_countdown(at, match, now):
+    if at is None:
+        return False
+    remaining = (at - now.timestamp()) / 60
+    if remaining < 0:
+        return False
+    value = _minutes(match["n"]) if match else None
+    return abs(remaining - value) <= 1 if value is not None else remaining <= 15
+
+
+def _review_sentences(text):
+    return split_text(text, pattern=r"[。！？!?；;\r\n]+", min_length=0,
+                      balanced=False, max_segments=len(text) + 1, trim=False)
+
+
+def needs_timing_check(text):
+    return bool(_TIMING.search(text) or _TIMING_NEEDS_PROOF.search(text) or _ASSUMED_YES.search(text))
+
+
+def check_chat_timing(text, turns, appointments, now):
+    """Only police a claimed deadline/assent, not ordinary role play or meal suggestions."""
+    if not needs_timing_check(text):
+        return text, None
+    return _trim_chat_timing(text, turns, appointments, now)
+
+
+def _trim_chat_timing(text, turns, appointments, now):
+    latest = turns[0][0] if turns else ""
+    visible_text = _QUOTED.sub(" ", text)
+    meal_context = bool(_MEAL.search(visible_text) or _MEAL.search(latest))
+    kept, edited = [], False
+    for sentence in _review_sentences(text):
+        content = _QUOTED.sub(" ", sentence)
+        match = _TIMING.search(content)
+        implicit = bool(re.match(r"^\s*(?:反正|都|也|这会儿|其实)*\s*(?:还|再)", content))
+        meal = bool(_MEAL.search(content) or (meal_context and (implicit or _ASSUMED_YES.search(content))))
+        disputed_assent = (meal and _ASSUMED_YES.search(content)
+                           and not (_DIRECT_YES.search(latest) and _user_is_speaking_fact(latest) and not _PLAN_CANCEL.search(latest)
+                                    or _meal_supported(turns, appointments, now)))
+        unsupported_time = ((match is not None and (meal or match["end"] or implicit and _TIME_CONTEXT.search(latest))
+                             or _TIMING_NEEDS_PROOF.search(content))
+                            and not _confirmed_countdown(match, meal, turns, appointments, now))
+        if (disputed_assent or unsupported_time) and _user_is_speaking_fact(content):
+            edited = True
+        else:
+            kept.append(sentence)
+    return ("\n".join(kept), "unconfirmed_schedule") if edited else (text, None)
+
+
+def check_proactive_assumptions(text, user_turns, appointments, now, replied):
+    clean, timing = check_chat_timing(text, user_turns, appointments, now)
+    reasons = {timing} if timing else set()
+    kept = []
+    for sentence in _review_sentences(clean):
+        content = _QUOTED.sub(" ", sentence).strip()
+        if replied is not False and _NO_REPLY.search(content) and not _IMAGINED.search(content):
+            reasons.add("reply_received" if replied else "no_reply_unverified")
+        elif _MEAL_PRESSURE.search(content) and not _meal_supported(user_turns, appointments, now):
+            reasons.add("unconfirmed_meal_pressure")
+        else:
+            kept.append(sentence)
+    return ("\n".join(kept), reasons) if reasons else (text, set())
 
 
 def contradictory_clock(text, now):

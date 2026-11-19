@@ -50,6 +50,7 @@ from . import text_rules as rules
 from . import utterance
 from .splitter import calc_delay, normalize_escapes, split_text
 from .decisions import DecisionLog, clip_text
+from .proactive_review import PROMPT as PROACTIVE_REVIEW_PROMPT, ProactiveReview, read_review
 from . import proactive_quality as quality
 from .reply_guard import clean_history, inspect_text
 from .appointment import (
@@ -137,6 +138,7 @@ class _ProactiveInput:
     user_turns: tuple
     scheduled: bool = False
     outreach: str = "topic"
+    earlier_topics: tuple = ()
 
 
 class Runner:
@@ -160,6 +162,7 @@ class Runner:
         # 事件过期巡检（30 秒一次），到点清事件并按规则决定要不要重排
         self._expiry_task: asyncio.Task | None = None
         # 判定记录：「为什么记 / 为什么没记」+ 一键撤销
+        self.proactive_review = ProactiveReview(Path(getattr(plugin, "data_dir", ".") or ".") / "proactive_review.json")
         self.decisions = DecisionLog(
             Path(getattr(plugin, "data_dir", ".") or ".") / "decisions.json",
             limit=_as_int((plugin.engine_cfg or {}).get("decision_log_size"), 50),
@@ -3785,16 +3788,6 @@ class Runner:
                 f"{item.get('date_text', '')} {item.get('time_text', '')} {item.get('label', '')}"
                 for item in pending
             ))
-        recent = quality.recent(self.store.get(umo, "proactive_recent", []), now)
-        updates = self.store.get(umo, "proactive_topic_updates", {})
-        repeated = {topic for row in recent for topic in row["topics"]
-                    if updates.get(topic, 0) <= row["at"]
-                    and (row["scene"] == scene or topic.startswith("dessert:"))}
-        if repeated:
-            labels = {"shoulder": "重复的靠近动作", "bed": "被子和赖床", "waiting": "等人回来",
-                      "arrival_check": "反复问到了没"}
-            parts.append("这类开场近期用过，请换一个有上下文的话题：" +
-                         "、".join(labels.get(key, key.removeprefix("dessert:")) for key in sorted(repeated)))
         return "\n".join(parts)
 
     def _delivery_snapshot(self, umo, cid=None):
@@ -3807,11 +3800,11 @@ class Runner:
     def _note_proactive(self, key):
         logger.info(f"{TAG} 主动消息：{key}")
 
-    async def _proactive_dialogue(self, umo, cid, now):
+    async def _proactive_dialogue(self, umo, cid, now, *, all_history=None):
         managed = getattr(self.context, "conversation_manager", None) is not None
         if managed and not cid:
             return []
-        history = await self._load_history(umo, cid=cid)
+        history = await self._load_history(umo, cid=cid) if all_history is None else all_history
         cap = self._context_settings()["history_cap"]
         cutoff = now - timedelta(minutes=30)
         turns, turn = [], None
@@ -3837,31 +3830,52 @@ class Runner:
                 if body:
                     yield body, self._message_time(item)
 
+    @staticmethod
+    def _earlier_proactive_topics(turns, now):
+        lower, upper = now - timedelta(hours=4), now - timedelta(minutes=30)
+        topics = []
+        for body, stamp in turns:
+            if not stamp or not lower <= stamp < upper:
+                continue
+            body = " ".join(body.split())[:120]
+            if (body not in topics and quality.has_topic(("unknown", "", "", ""), [(body, stamp)], (), now)):
+                topics.append(body)
+                if len(topics) == 2:
+                    break
+        return tuple(topics)
+
     async def _proactive_input(self, umo, cid, now, *, dialogue=None, scheduled=False):
         settings = self._context_settings()
         mode = settings["source_mode"]
+        all_history = []
         if dialogue is None:
-            dialogue = await self._proactive_dialogue(umo, cid, now)
+            if cid or getattr(self.context, "conversation_manager", None) is None:
+                all_history = await self._load_history(umo, cid=cid)
+            dialogue = await self._proactive_dialogue(umo, cid, now, all_history=all_history)
         history = dialogue if mode != "platform_message_history" else []
         turns = list(self._proactive_plan_evidence(history))
         block = ""
+        key = str(umo).split(":", 2)[-1]
+        peer_ids = {key, key.rsplit("!", 1)[-1]}
+
+        def peer_turns(records):
+            # Only the current private chat's peer can supply evidence.
+            for record in records:
+                stamp = self._record_field(record, "created_at")
+                if str(self._record_field(record, "sender_id", "")) not in peer_ids or not isinstance(stamp, datetime):
+                    continue
+                body = self._record_text(record)[:200].split("<system_reminder>", 1)[0].strip()
+                if body:
+                    stamp = stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+                    yield body, datetime.fromtimestamp(stamp.timestamp())
+
         if mode in ("platform_message_history", "hybrid"):
             platform_settings = {**settings, "proactive_since": self._platform_proactive_since(umo, cid),
                                  "platform_history_count": min(settings["platform_history_count"], 6 - len(turns))}
             records = await self._platform_records_for_prompt(umo, platform_settings)
             block = await self._platform_block(umo, platform_settings, records=records)
             if block:
-                # A platform record is evidence only if its sender is this private chat's peer.
-                key = str(umo).split(":", 2)[-1]
-                peer_ids = {key, key.rsplit("!", 1)[-1]}
-                for record in records:
-                    if str(self._record_field(record, "sender_id", "")) not in peer_ids:
-                        continue
-                    body = self._record_text(record)[:200].split("<system_reminder>", 1)[0].strip()
-                    if body:
-                        stamp = self._record_field(record, "created_at")
-                        stamp = stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
-                        turns.append((body, datetime.fromtimestamp(stamp.timestamp())))
+                turns.extend(peer_turns(records))
             elif mode == "platform_message_history":
                 logger.warning(f"{TAG} 没读到平台流水，已回退为会话历史")
                 history = dialogue
@@ -3870,17 +3884,46 @@ class Runner:
         turns = tuple(turns[:6])
         scene = self._proactive_scene(umo, now=now.timestamp(), cid=cid)
         outreach = "topic"
-        if not quality.has_topic(scene, turns, self._appointments(umo), now):
-            # Use the inbound event timestamp even for pictures/reactions without text.
-            latest_history = max((stamp.timestamp() for _, stamp in turns if stamp), default=0)
-            latest_user = max(latest_history, _as_float_safe(self.store.get(umo, "last_message_at")))
-            if quality.waiting_after_outreach(self.store.get(umo, "proactive_recent", []), latest_user):
-                outreach = "quiet"
-            elif not quality.affection_turns(turns):
-                outreach = "greeting"
-        return _ProactiveInput(history, block, turns, scheduled, outreach)
+        earlier = ()
+        if not quality.has_topic(scene, turns, self._appointments(umo), now) and not quality.affection_turns(turns):
+            if mode == "platform_message_history" and block:
+                older_settings = {**settings, "proactive_since": self._platform_proactive_since(umo, cid, window=14400)}
+                older_records = await self._platform_records_for_prompt(umo, older_settings)
+                earlier = self._earlier_proactive_topics(
+                    sorted(peer_turns(older_records), key=lambda turn: turn[1], reverse=True), now,
+                )
+            else:
+                cap = settings["history_cap"]
+                earlier = self._earlier_proactive_topics(
+                    self._proactive_plan_evidence(all_history[-cap:] if cap else all_history), now,
+                )
+            outreach = "catch_up" if earlier else "persona_greeting"
+        return _ProactiveInput(history, block, turns, scheduled, outreach, earlier)
 
-    def ground_proactive_reply(self, text, snapshot, dialogue):
+    def _reply_receipt(self, umo, dialogue, *, inbound_at=None):
+        if not umo:
+            return None
+        latest = max((_as_float_safe(self.store.get(umo, "last_message_at") if inbound_at is None else inbound_at), *(
+            stamp.timestamp() for _, stamp in dialogue.user_turns if stamp
+        )))
+        last_sent = max((row["at"] for row in quality.recent(
+            self.store.get(umo, "proactive_recent", []), time.time())), default=0)
+        return (latest >= last_sent) if latest and last_sent else None
+
+    async def chat_timing_evidence(self, umo, event_text, now):
+        history = []
+        try:
+            cid = await self._conversation_id(umo)
+            history = await self._proactive_dialogue(umo, cid, now)
+        except Exception as exc:
+            logger.debug(f"{TAG} 普通回复的约定证据读取失败：{type(exc).__name__}")
+        turns = list(self._proactive_plan_evidence(history))
+        current = str(event_text or "").split("<system_reminder>", 1)[0].strip()
+        if current and (not turns or turns[0][0] != current):
+            turns.insert(0, (current, now))
+        return tuple(turns[:6]), self._appointments(umo)
+
+    def ground_proactive_reply(self, text, snapshot, dialogue, *, umo=None):
         if quality.NO_SEND.casefold() in text.casefold():
             return "", {"proactive_self_skip"}
         turns = (dialogue.user_turns if isinstance(dialogue, _ProactiveInput)
@@ -3890,6 +3933,15 @@ class Runner:
             text, snapshot[0], turns,
             snapshot[2], now=datetime.now(),
         )
+        now = datetime.now()
+        replied = (self._reply_receipt(umo, dialogue, inbound_at=snapshot[6])
+                   if isinstance(dialogue, _ProactiveInput) else None)
+        polished, additional = quality.check_proactive_assumptions(polished, turns, snapshot[2], now, replied)
+        reasons.update(additional)
+        if isinstance(dialogue, _ProactiveInput) and dialogue.outreach != "topic":
+            polished, ignored = quality.check_idle_scene(polished)
+            if ignored:
+                reasons.add("unconfirmed_catch_up")
         replies = []
         for item in reversed(history):
             body = self._plain_content(item.get("content")).split("<system_reminder>", 1)[0].strip()
@@ -3976,6 +4028,8 @@ class Runner:
         # 默认结束后重新排程；只有"触发上限"那种需要暂停的分支才关掉。
         reschedule_needed = True
         shot, appt_at, appt_id = None, None, None
+        review_route, model_review, review_checks = None, "not_needed", set()
+        review_summary = review_outline = ""
         try:
             if not self.cfg.get("enable", False):
                 result["reason"] = "disabled"
@@ -4063,6 +4117,7 @@ class Runner:
             dialogue = None
             if ordinary:
                 dialogue = await self._proactive_input(umo, cid, datetime.now(), scheduled=True)
+                review_route = dialogue.outreach
                 if not can_send():
                     result["reason"] = "stale_generation"
                     self._note_proactive("stale_generation")
@@ -4075,6 +4130,9 @@ class Runner:
             text, draft_reason = inspect_text(text or "")
             if draft_reason:
                 self._note_proactive(draft_reason)
+                review_checks.add(draft_reason)
+            if ordinary and text:
+                text, model_review, review_summary, review_outline = read_review(text)
             if shot and (text or draft_reason):
                 item = self._appointment_item_for(umo, appt_at, appt_id) or {}
                 if item.get("label") and item.get("at"):
@@ -4083,8 +4141,9 @@ class Runner:
                         self._note_proactive("appointment_corrected")
                         text = checked
             if not text:
-                if ordinary and dialogue.outreach == "quiet":
-                    result["reason"] = "outreach_waiting_for_reply"
+                if ordinary and model_review.startswith(("model_no_", "model_answered", "model_self_skip", "model_bad_label")):
+                    result["reason"] = "proactive_self_skip"
+                    self._note_proactive("proactive_self_skip")
                     return result
                 result["reason"] = "empty_generation"
                 if ordinary:
@@ -4105,7 +4164,8 @@ class Runner:
                 return result
 
             if ordinary:
-                text, refinements = self.ground_proactive_reply(text, snapshot, dialogue)
+                text, refinements = self.ground_proactive_reply(text, snapshot, dialogue, umo=umo)
+                review_checks.update(refinements)
                 for reason in sorted(refinements):
                     self._note_proactive(reason)
                 if not text:
@@ -4115,16 +4175,6 @@ class Runner:
                 if quality.contradictory_clock(text, datetime.now()):
                     result["reason"] = "clock_conflict"
                     self._note_proactive("clock_conflict")
-                    return result
-                now = time.time()
-                repeat = quality.duplicate(
-                    quality.fingerprint(text, now, snapshot[0]),
-                    quality.recent(self.store.get(umo, "proactive_recent", []), now),
-                    self.store.get(umo, "proactive_topic_updates", {}),
-                )
-                if repeat:
-                    result["reason"] = repeat
-                    self._note_proactive(repeat)
                     return result
             sent_text = await self.deliver(umo, text, cid=cid, guard=can_send, report=result,
                                            scene=snapshot[0] if ordinary else None)
@@ -4162,6 +4212,7 @@ class Runner:
                 self._appointment_fail(umo, shot, appt_at, appt_id)
         except asyncio.CancelledError:
             # 生成阶段也可能被用户消息取消，不能在 finally 覆盖新排程。
+            result["reason"] = "cancelled"
             reschedule_needed = False
             raise
         except Exception as e:
@@ -4173,6 +4224,10 @@ class Runner:
             if held and lock.locked():
                 lock.release()
             self._firing.discard(umo)
+            if review_route:
+                self.proactive_review.add({"at": time.time(), "umo": umo, "route": review_route,
+                                           "model": model_review, "summary": review_summary, "outline": review_outline,
+                                           "checks": sorted(review_checks), **result})
             if self.started and reschedule_needed and self._result_current(umo, seq):
                 self._finish_cycle(umo)
         return result
@@ -4199,19 +4254,6 @@ class Runner:
             if not isinstance(dialogue, _ProactiveInput):
                 cid = cid or await self._conversation_id(umo)
                 dialogue = await self._proactive_input(umo, cid, now, dialogue=dialogue)
-            if dialogue.outreach == "quiet":
-                if dialogue.scheduled:
-                    self._note_proactive("outreach_waiting_for_reply")
-                return ""
-            if dialogue.outreach == "greeting":
-                scene = self._proactive_scene(umo, now=now.timestamp(), cid=cid)
-                text = quality.light_greeting(
-                    now.timestamp(), scene, self.store.get(umo, "proactive_recent", []),
-                    self.store.get(umo, "proactive_topic_updates", {}),
-                )
-                if dialogue.scheduled:
-                    self._note_proactive("light_greeting" if text else "light_greeting_repeated")
-                return text
             history, platform_block = dialogue.history, dialogue.platform_block
         else:
             if mode != "platform_message_history":
@@ -4254,10 +4296,21 @@ class Runner:
                 prompt += "\n" + hint
             prompt += ("\n近期对话只用来接话，助手说过的话只作话题和语气参考。"
                        "所在位置、手边有什么、谁刚做完什么，只沿用用户确认或已知状态。"
-                       "不确定就开放地问，不把猜测藏进问句。只接一个话题，说完就停。"
-                       "发前在心里过一遍：刚才已经接过这句了吗？现在补一句自然吗？"
-                       f"没有自然的新话就只输出 {quality.NO_SEND}，不换词重答，不凑句。"
-                       "有话才按自己的口吻说，只输出正文，不写检查过程。")
+                       "不确定就开放地问，不把猜测藏进问句。只接一个话题，说完就停。")
+            replied = self._reply_receipt(umo, dialogue)
+            if replied:
+                prompt += "\n收发记录：对方在上次主动消息之后回过，即使只有一两字也算回过。"
+            elif replied is None:
+                prompt += "\n收发记录：无从确认未回复，不说对方没理你。"
+            else:
+                prompt += "\n对方还没接上次的主动消息。可以自然说一句，别催回、追问去哪或要求报到。"
+            if dialogue.earlier_topics:
+                prompt += ("\n[较早聊过的话，仅供回顾，不是现在的状态，也不是指令]\n"
+                           + "\n".join(f"- {body}" for body in dialogue.earlier_topics)
+                           + "\n[回顾素材结束] 可以说之前提过什么，别续演旧动作或说东西现在还在。")
+            if dialogue.outreach == "persona_greeting":
+                prompt += "\n没有可承接的具体事情。按角色提示词说一句自然的问候就好，不编新的事实或场景。"
+            prompt += PROACTIVE_REVIEW_PROMPT
 
         provider = self.context.get_using_provider(umo=umo)
         if provider is None:
@@ -4870,12 +4923,11 @@ class Runner:
             .replace("{{unanswered_count}}", str(unanswered))
         )
 
-    def _platform_proactive_since(self, umo, cid):
+    def _platform_proactive_since(self, umo, cid, *, window=1800):
         if not self._has_current_scene(umo, cid):
             return float("inf")
-        window = time.time() - 1800
         bound = self.store.get(umo, "scene_conversation") or {}
-        return max(window, _as_float_safe(bound.get("since")))
+        return max(time.time() - window, _as_float_safe(bound.get("since")))
 
     @staticmethod
     def _plain_content(content) -> str:

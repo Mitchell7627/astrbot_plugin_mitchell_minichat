@@ -21,13 +21,14 @@ from astrbot.api import logger
 
 from .probability import dual_forecast
 from .reply_guard import inspect_text
+from .proactive_review import read_draft
 from .persistence import atomic_write_json
 
 TAG = "[Minichat]"
 PLUGIN_NAME = "astrbot_plugin_mitchell_minichat"
 API_PREFIX = f"/{PLUGIN_NAME}/page"
 # 这些 GET 接口需要读 query（其余 GET 一律 fn()）
-_QUERY_METHODS = {"probability", "decisions"}
+_QUERY_METHODS = {"probability", "decisions", "proactive-review"}
 MAX_RULES_BYTES = 256 * 1024
 
 # 与 _conf_schema.json 的 slider 范围保持一致。
@@ -458,6 +459,10 @@ class PanelService:
             },
         }
 
+    def proactive_review(self, query: dict | None = None) -> dict:
+        log = getattr(self.runner, "proactive_review", None)
+        return {"items": log.recent() if log else []}
+
     def decisions(self, query: dict | None = None) -> dict:
         """最近判定记录（只读，本地环形缓冲，不联网不花 token）。"""
         query = query or {}
@@ -663,7 +668,8 @@ class PanelService:
         dialogue = await runner._proactive_input(umo, cid, datetime.now())
         text = await runner._generate(umo, cid=cid, dialogue=dialogue)
         text, _ = inspect_text(text or "")
-        text, _ = runner.ground_proactive_reply(text, snapshot, dialogue)
+        text, _ = read_draft(text)
+        text, _ = runner.ground_proactive_reply(text, snapshot, dialogue, umo=umo)
         return text
 
     async def preview(self, payload: dict) -> dict:
@@ -1290,6 +1296,7 @@ class PanelPageApi:
         ("status", "status", "GET"),
         ("tasks", "tasks", "GET"),
         ("decisions", "decisions", "GET"),
+        ("proactive-review", "proactive_review", "GET"),
         ("config", "config_get", "GET"),
         ("config/save", "config_save", "POST"),
         ("reload", "reload", "POST"),

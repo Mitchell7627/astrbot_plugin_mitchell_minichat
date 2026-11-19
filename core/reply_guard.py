@@ -87,7 +87,15 @@ def clean_history(history: list) -> list:
     return result
 
 
-def clean_final_response(run_context, response) -> str | None:
+def response_text(response):
+    if response is None or getattr(response, "role", "") != "assistant":
+        return ""
+    chain = getattr(response, "result_chain", None)
+    visible = [p for p in chain.chain if isinstance(p, Plain)] if chain else []
+    return "".join(p.text for p in visible) if visible else response.completion_text or ""
+
+
+def clean_final_response(run_context, response, *, refine=None) -> str | None:
     """Use on_agent_done, before AstrBot yields the chain or persists its messages."""
     if response is None or getattr(response, "role", "") != "assistant":
         return None
@@ -95,9 +103,12 @@ def clean_final_response(run_context, response) -> str | None:
     visible = [p for p in chain.chain if isinstance(p, Plain)] if chain else []
     text = "".join(p.text for p in visible) if visible else response.completion_text
     clean, reason = inspect_text(text or "")
+    if refine and clean:
+        clean, content_reason = refine(clean)
+        reason = content_reason or reason
     if not reason:
         return None
-    clean = clean or FALLBACK
+    clean = clean or ("你刚才说的是哪件事呀？" if reason == "unconfirmed_schedule" else FALLBACK)
     if visible:
         first = visible[0]
         first.text = clean

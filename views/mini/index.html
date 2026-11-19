@@ -23,6 +23,7 @@
   <nav class="tabs" id="tabs">
     <button class="tab active" data-tab="overview">概览</button>
     <button class="tab" data-tab="tasks">任务</button>
+    <button class="tab" data-tab="review">发前自检</button>
     <button class="tab" data-tab="prob">概率</button>
     <button class="tab" data-tab="config">配置</button>
   </nav>
@@ -49,6 +50,15 @@
         </div>
       </div>
       <div id="task-list" class="stack"></div>
+      <div class="row"><button class="btn sm ghost" data-act="review-open">查看主动消息发前自检</button></div>
+    </section>
+
+    <section class="view hidden" data-view="review">
+      <div class="card">
+        <div class="card-head"><h3>主动消息 · 发前自检</h3><button class="btn sm ghost" data-act="review-refresh">刷新</button></div>
+        <p class="note">最近 30 次普通主动尝试。查看她参考了什么、准备怎么接，以及程序核对和实际送达。独立面板设置登录密码后可查看更具体的一句说明。普通聊天、睡眠和约定提醒不列在这里。</p>
+      </div>
+      <div class="stack" id="review-list" aria-live="polite"></div>
     </section>
 
     <section class="view hidden" data-view="prob">
@@ -224,6 +234,6 @@
   <span class="fab-label">保存</span>
 </div>
 <script src="./lib.js?v=0.2.13"></script>
-<script src="./app.js?v=0.2.13"></script>
+<script src="./app.js?v=0.3.14"></script>
 </body>
 </html>

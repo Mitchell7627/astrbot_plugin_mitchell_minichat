@@ -208,6 +208,58 @@
   }
 
   // ---------------------------------------------------------------- 渲染：任务
+  const reviewModel = {
+    model_follow_up: "有自然的新话可接", model_confirmed_topic: "有已确认的话题",
+    model_greeting: "按角色口吻问候",
+    model_answered: "上一句已经接过", model_no_context: "没有可靠的话题",
+    model_no_natural_line: "没有自然的新话", model_self_skip: "选择不发",
+    model_bad_label: "自检标签无法读取", model_unreported: "未返回自检标签", not_needed: "未调用模型",
+  };
+  const reviewReasons = {
+    delivery: "完成发送检查", proactive_self_skip: "模型选择跳过或标签异常", proactive_filtered: "核对后没有可发送内容",
+    clock_conflict: "与当前时间不符", same_text: "与近期消息重复", similar_text: "与近期消息相似", same_topic: "重复近期话题",
+    outreach_waiting_for_reply: "已有主动消息，等对方回复", social_answered: "打趣已接过，没有新话题",
+    stale_generation: "生成期间对话状态变了", empty_generation: "没有可发送的正文",
+    sleeping: "进入睡眠免打扰", cancelled: "本轮已取消", error: "处理异常",
+  };
+  const reviewChecks = {
+    draft_removed: "已去掉草稿", draft_blocked: "整条草稿已拦截", answered_echo: "已去掉重复的接话",
+    reply_received: "你已经回过，去掉「没理我」", no_reply_unverified: "没有记录能证明未回复",
+    unconfirmed_meal_pressure: "没有确认一起吃饭，去掉催促", unconfirmed_schedule: "没有确认时间或同意，去掉倒计时或承诺",
+    same_reply: "已去掉同一条里的重复句", unconfirmed_presence: "所在位置未确认", unconfirmed_bath: "洗澡状态未确认",
+    unconfirmed_dessert: "甜点状态未确认", unconfirmed_inventory: "物品状态未确认", unconfirmed_experience: "经历未确认",
+    unsupported_followup: "后一句依赖已删掉的前提", unsupported_plan: "安排未确认",
+    unconfirmed_catch_up: "较早的对话不能确认当前场景",
+  };
+  const reviewBasis = {
+    RECENT: "最近的对话可以接着聊", RECALL: "想起之前聊过的事", APPOINTMENT: "有已确认的约定可接",
+    NO_TOPIC: "没有具体话题", ANSWERED: "刚才的话已经接过",
+  };
+  const reviewIntent = { QUESTION: "想问一句新的", CONTINUE: "想顺着聊一句", GREET: "想按自己的口吻打个招呼", WAIT: "想先等一等" };
+
+  async function loadReview() {
+    const data = await api("GET", "proactive-review");
+    const items = data.items || [];
+    $("#review-list").innerHTML = items.length ? items.map((item) => {
+      const time = new Date(item.at * 1000).toLocaleString("zh-CN", { hour12: false });
+      const sent = item.delivered_segments, planned = item.planned_segments;
+      const status = sent ? (sent === planned ? "已发送" : "部分发送") : (planned ? "未送达" : "未发送");
+      const route = ({
+        greeting: "旧版本地问候", topic: "接近期话题", catch_up: "接之前聊过的事", persona_greeting: "角色问候",
+      })[item.route] || "本地判断";
+      const details = (item.checks || []).map((key) => reviewChecks[key]).filter(Boolean);
+      const [basis, intent] = (item.outline || "").split("/");
+      const rationale = item.summary || (reviewBasis[basis] && reviewIntent[intent] ? reviewBasis[basis] + "，" + reviewIntent[intent] + "。" : "");
+      return `<article class="card review-row">
+        <div class="card-head"><h3>${esc(time)}</h3><span class="badge ${sent ? "ok" : "warn"}">${esc(status)}${sent || planned ? ` · ${sent}/${planned} 段` : ""}</span></div>
+        <div class="note">${esc(route)} · ${esc(reviewModel[item.model] || "未分类")}</div>
+        ${rationale ? `<p class="review-summary"><strong>她的说明：</strong>${esc(rationale)}</p>` : ""}
+        <div class="note">程序核对：${esc(reviewReasons[item.reason] || "已结束")}</div>
+        ${details.length ? `<ul>${details.map((detail) => `<li>${esc(detail)}</li>`).join("")}</ul>` : ""}
+      </article>`;
+    }).join("") : '<div class="card note">还没有自检记录。下一次普通主动尝试后会在这里显示。</div>';
+  }
+
   function renderTasks() {
     const t = state.tasks;
     if (!t) return;
@@ -1644,6 +1696,7 @@
       const git = $("#ov-git");
       if (git) git.classList.toggle("hidden", state.tab !== "overview");
       if (state.tab === "prob") loadProbability().catch(showErr);
+      if (state.tab === "review") loadReview().catch(showErr);
       return;
     }
 
@@ -1652,6 +1705,8 @@
     const act = el.dataset.act;
 
     if (act === "refresh") return refreshAll().catch(showErr);
+    if (act === "review-open") return $('[data-tab="review"]').click();
+    if (act === "review-refresh") return withBusy(el, loadReview).catch(showErr);
     if (act === "reload-prob") return withBusy(el, () => loadProbability()).catch(showErr);
     if (act === "prob-resched") return probResched();
     if (act === "prob-save-all") return saveProbAll(el);
@@ -1714,7 +1769,9 @@
   // 任务页每 12 秒自己刷新一次：事件、排程时间都是后台在变，
   // 只渲染一次的话会一直停在打开页面那一刻的快照上。
   setInterval(async () => {
-    if (state.tab !== "tasks" || document.hidden || state.busy.size) return;
+    if (document.hidden || state.busy.size) return;
+    if (state.tab === "review") return loadReview().catch(() => {});
+    if (state.tab !== "tasks") return;
     // 焦点在任务列表里（正在看判定、点按钮）时跳过这一轮，别把折叠区合上
     const list = $("#task-list");
     if (list && list.contains(document.activeElement)) return;

@@ -260,26 +260,30 @@ def test_unsourced_presuppositions_and_independent_sentences(body, scene, turns,
 
 
 @pytest.mark.parametrize("quiet_text", ["收到", "[表情]", "「抱抱」", "👍"])
-async def test_neutral_idle_episode_sends_at_most_one_local_greeting(plugin, umo, clock, monkeypatch, quiet_text):
+async def test_neutral_idle_episode_uses_persona_and_configured_unanswered_cap(plugin, umo, clock, monkeypatch, quiet_text):
     r = plugin.runner
     r.started = True
     notes = []
     monkeypatch.setattr(r, "_note_proactive", notes.append)
     now = datetime.fromtimestamp(clock.now)
     manager(plugin, ["current"], {"current": [dated("user", quiet_text, now - timedelta(minutes=1))]})
-    provider = SimpleNamespace(text_chat=AsyncMock(side_effect=AssertionError("should not generate")))
+    monkeypatch.setattr(r, "_load_persona", AsyncMock(return_value="TEST_PERSONA"))
+    plugin.friend_cfg["schedule_settings"]["max_unanswered_times"] = 2
+    provider = SimpleNamespace(text_chat=AsyncMock(return_value=SimpleNamespace(
+        completion_text="[[SEND:GREETING]]\n[[REVIEW:没什么事要接，就来问声好。]]\n来陪你待一会儿喵",
+    )))
     plugin.context.get_using_provider = lambda **kw: provider
     preview = await plugin.panel_service.preview({"umo": umo})
     assert preview["text"] and len(preview["segments"]) == 1
     assert (await r._fire(umo))["sent"]
     assert plugin.context.send_message.await_args.args[1].get_plain_text() == preview["segments"][0]
-    clock.now += 86401  # Losing the 24-hour wording dedupe must not reopen this idle episode.
-    result = await r._fire(umo)
-    assert not result["sent"] and result["reason"] == "outreach_waiting_for_reply"
-    assert (await plugin.panel_service.preview({"umo": umo}))["text"] == ""
-    provider.text_chat.assert_not_called()
-    assert notes.count("light_greeting") == notes.count("outreach_waiting_for_reply") == 1
-    assert plugin.store.get(umo, "unanswered") == plugin.context.send_message.await_count == 1
+    clock.now += 65
+    assert (await r._fire(umo))["sent"]  # Identical wording no longer blocks a later attempt.
+    assert (await r._fire(umo))["reason"] == "unanswered_limit"
+    assert all(call.kwargs["system_prompt"] == "TEST_PERSONA" for call in provider.text_chat.await_args_list)
+    assert provider.text_chat.await_count == 3  # Preview plus two scheduled sends.
+    assert notes.count("model_request") == 2
+    assert plugin.store.get(umo, "unanswered") == plugin.context.send_message.await_count == 2
 
 
 async def test_affection_uses_complete_dialogue_persona_and_normal_segmentation(plugin, umo, clock, monkeypatch):
@@ -303,7 +307,7 @@ async def test_affection_uses_complete_dialogue_persona_and_normal_segmentation(
     provider.text_chat.assert_awaited_once()
     args = provider.text_chat.await_args.kwargs
     assert args["system_prompt"] == "TEST_PERSONA"
-    assert quality.NO_SEND in args["prompt"] and "发前在心里过一遍" in args["prompt"]
+    assert "[[NO_SEND:NO_NATURAL_LINE]]" in args["prompt"] and "发前在心里过一遍" in args["prompt"]
     assert [(row["role"], row["content"].splitlines()[0]) for row in args["contexts"]] == [
         ("user", "抱抱呀"), ("assistant", "那就抱着吧"), ("assistant", "柜子里那盒电池已经准备好"),
     ]
@@ -311,8 +315,6 @@ async def test_affection_uses_complete_dialogue_persona_and_normal_segmentation(
     assert sent == ["刚才那句有点可爱", "偷偷笑了一下"]
     assert "电池" not in conversations.update_conversation.await_args.kwargs["history"][-1]["content"]
     assert {"model_request", "unconfirmed_inventory"} <= set(notes)
-    assert (await r._fire(umo))["reason"] == "outreach_waiting_for_reply"
-    provider.text_chat.assert_awaited_once()
 
 
 @pytest.mark.parametrize("draft,reason", [
@@ -361,15 +363,19 @@ def test_answered_echo_keeps_new_unanswered_and_quoted_content(draft, replies, e
     assert quality.trim_answered_echo(draft, "抱抱呀", replies)[0].rstrip("。！？") == expected
 
 
-async def test_failed_greeting_does_not_count_or_close_the_idle_episode(plugin, umo, clock):
+async def test_failed_greeting_does_not_count_as_delivered(plugin, umo, clock):
     r = plugin.runner
     r.started = True
+    provider = SimpleNamespace(text_chat=AsyncMock(return_value=SimpleNamespace(
+        completion_text="[[SEND:GREETING]]\n冒个泡，想跟你说声好",
+    )))
+    plugin.context.get_using_provider = lambda **kw: provider
     plugin.context.send_message.side_effect = [False, True]
     assert not (await r._fire(umo))["sent"]
     assert plugin.store.get(umo, "unanswered", 0) == 0
     assert (await plugin.panel_service.send({"umo": umo}))["sent"]
-    assert (await r._fire(umo))["reason"] == "outreach_waiting_for_reply"
     assert plugin.context.send_message.await_count == 2
+    assert plugin.store.get(umo, "unanswered") == 1
 
 
 @pytest.mark.parametrize("turns,expected", [
@@ -403,14 +409,6 @@ async def test_real_topic_uses_one_draft_and_only_writes_safe_segments(plugin, u
     assert plugin.context.send_message.await_args.args[1].get_plain_text().rstrip("？?") == "哪座火山最有意思呀"
     assert "铅笔" not in str(conversations.update_conversation.await_args)
     assert notes.count("model_request") == 1 and notes.count("unconfirmed_inventory") == 1
-
-
-def test_light_greeting_skips_if_every_candidate_matches_recent_delivery(monkeypatch):
-    text = "今天过得怎么样呀？"
-    monkeypatch.setattr(quality, "_GREETINGS", (text,))
-    old = fingerprint(text, 10, UNKNOWN)
-    assert quality.light_greeting(20, UNKNOWN, [old], {}) == ""
-    assert quality.light_greeting(86420, UNKNOWN, [old], {}) == text
 
 
 @pytest.mark.parametrize("sender,can_ground", [("1", True), ("bot", False), ("2", False)])

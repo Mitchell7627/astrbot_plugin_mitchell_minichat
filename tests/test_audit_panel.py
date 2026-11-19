@@ -16,6 +16,24 @@ def client(plugin, base_url='http://127.0.0.1:7627'):
     )
 
 
+async def test_proactive_review_detail_requires_panel_login(plugin, umo, clock):
+    detail = "想问下次要读哪一本书。"
+    plugin.runner.proactive_review.add(
+        {"at": clock.now, "umo": umo, "route": "catch_up", "model": "model_follow_up",
+         "outline": "RECALL/QUESTION", "summary": detail, "reason": "delivery"},
+    )
+    async with client(plugin) as c:
+        response = await c.get('/api/proactive-review')
+        row = response.json()["data"]["items"][0]
+        assert row["outline"] == "RECALL/QUESTION" and "summary" not in row
+        plugin.config["web_panel"]["password"] = "review-test"
+        assert (await c.get('/api/proactive-review')).status_code == 401
+        assert (await c.post('/api/login', json={"password": "review-test"})).status_code == 200
+        logged_in = await c.get('/api/proactive-review')
+        assert logged_in.json()["data"]["items"][0]["summary"] == detail
+        assert logged_in.headers["cache-control"] == "no-store"
+
+
 async def test_cross_origin_simple_form_cannot_disable_local_panel_plugin(plugin):
     # This is a valid text/plain HTML-form body: an input's name ends in the
     # opening pad quote and its value is '"}', so the inserted '=' stays JSON data.

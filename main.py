@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
 
 import astrbot.api.star as star
@@ -16,7 +17,8 @@ from astrbot.core.config.astrbot_config import AstrBotConfig
 
 from .core.event_detector import EventRuleStore, extract_message_text
 from .core.migrations import migrate_config
-from .core.reply_guard import clean_final_response, clean_loaded_messages, clean_result_chain
+from .core.reply_guard import clean_final_response, clean_loaded_messages, clean_result_chain, response_text
+from .core.proactive_quality import check_chat_timing, needs_timing_check
 from .core.panel_api import PanelPageApi, PanelService
 from .core.runner import Runner
 from .core.store import Store
@@ -24,7 +26,7 @@ from .core.persistence import atomic_write_json
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.3.13"
+VERSION = "v0.3.14"
 
 
 class ProactiveMiniPlugin(star.Star):
@@ -295,7 +297,21 @@ class ProactiveMiniPlugin(star.Star):
                 event.set_extra("_minichat_history_originals", ())
         if self.runner is None or not self.runner._result_current(event.unified_msg_origin):
             return
-        reason = clean_final_response(run_context, response)
+        refine = None
+        if needs_timing_check(response_text(response)):
+            now = datetime.now()
+            event_text = getattr(event, "message_str", "") or ""
+            try:
+                turns, appointments = await asyncio.wait_for(self.runner.chat_timing_evidence(
+                    event.unified_msg_origin, event_text, now), timeout=0.75)
+            except asyncio.TimeoutError:
+                turns = ((event_text, now),) if event_text else ()
+                appointments = self.runner._appointments(event.unified_msg_origin)
+
+            def refine(text):
+                return check_chat_timing(text, turns, appointments, now)
+
+        reason = clean_final_response(run_context, response, refine=refine)
         if reason:
             logger.info(f"{TAG} 普通回复已处理：{reason}")
 

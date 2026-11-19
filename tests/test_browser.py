@@ -107,6 +107,19 @@ async def test_task_page_diagnostics_and_delivery_states(plugin, umo, monkeypatc
                 await expect(
                     page.locator(".toast").filter(has_text="已发送，未回复计数")
                 ).to_be_visible()
+                r.proactive_review.add({"at": clock.now, "umo": umo, "route": "topic", "model": "model_follow_up",
+                                         "summary": "想接刚才的话题，问一个新问题。",
+                                         "outline": "RECENT/QUESTION",
+                                         "reason": "proactive_filtered", "checks": ["reply_received"],
+                                         "planned_segments": 0, "delivered_segments": 0})
+                await page.locator('[data-act="review-open"]').click()
+                row = page.locator("#review-list .review-row").first
+                await expect(row).to_contain_text("未发送")
+                await expect(row).to_contain_text("有自然的新话可接")
+                await expect(row.locator(".review-summary")).to_contain_text("最近的对话可以接着聊，想问一句新的。")
+                await expect(row).to_contain_text("你已经回过")
+                await page.locator('[data-act="review-refresh"]').click()
+                await expect(row).to_contain_text("核对后没有可发送内容")
                 assert not errors
                 await page.screenshot(
                     path=str(plugin.data_dir / "minichat-task-page.png"), full_page=True

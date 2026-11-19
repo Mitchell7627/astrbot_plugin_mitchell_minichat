@@ -31,7 +31,7 @@ MAX_TOKENS = 32
 LOGIN_MAX_FAILS = 5
 LOGIN_WINDOW = 300
 # 这些 GET 接口需要读 query（其余 GET 一律 fn()）
-_QUERY_METHODS = {"probability", "decisions"}
+_QUERY_METHODS = {"probability", "decisions", "proactive-review"}
 
 
 class _SignalSafeServer(uvicorn.Server if uvicorn else object):
@@ -289,6 +289,7 @@ class PanelHttpServer:
             "status": ("status", "GET"),
             "tasks": ("tasks", "GET"),
             "decisions": ("decisions", "GET"),
+            "proactive-review": ("proactive_review", "GET"),
             "config": ("config_get", "GET"),
             "config/save": ("config_save", "POST"),
             "reload": ("reload", "POST"),
@@ -328,6 +329,11 @@ class PanelHttpServer:
             if method == "GET":
                 query = dict(request.query_params)
                 data = fn(query) if handler_name in _QUERY_METHODS else fn()
+                if handler_name == "proactive_review":
+                    if not self._password():
+                        data = {**data, "items": [{k: v for k, v in item.items() if k != "summary"}
+                                                 for item in data["items"]]}
+                    return JSONResponse({"status": "ok", "data": data}, headers={"Cache-Control": "no-store"})
             else:
                 body = await self._json(request)
                 if not isinstance(body, dict):
