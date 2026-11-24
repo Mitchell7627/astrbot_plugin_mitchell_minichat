@@ -247,6 +247,9 @@
     $("#review-list").innerHTML = items.length ? items.map((item) => {
       const time = new Date(item.at * 1000).toLocaleString("zh-CN", { hour12: false });
       const sent = item.delivered_segments, planned = item.planned_segments;
+      const segmentSteps = [
+        ["生成", item.generated_segments], ["核对后", item.filtered_segments], ["分段后", item.split_segments],
+      ].filter(([, count]) => Number.isInteger(count)).map(([label, count]) => `${label} ${count} 段`);
       const status = sent ? (sent === planned ? "已发送" : "部分发送") : (planned ? "未送达" : "未发送");
       const route = ({
         greeting: "旧版本地问候", topic: "接近期话题", catch_up: "接之前聊过的事", persona_greeting: "角色问候",
@@ -259,6 +262,7 @@
         <div class="note">${esc(route)} · ${esc(reviewModel[item.model] || "未分类")}</div>
         ${rationale ? `<p class="review-summary"><strong>她的说明：</strong>${esc(rationale)}</p>` : ""}
         <div class="note">程序核对：${esc(reviewReasons[item.reason] || "已结束")}</div>
+        ${segmentSteps.length ? `<div class="note">${esc(segmentSteps.join(" → "))}</div>` : ""}
         ${details.length ? `<ul>${details.map((detail) => `<li>${esc(detail)}</li>`).join("")}</ul>` : ""}
       </article>`;
     }).join("") : '<div class="card note">还没有自检记录。下一次普通主动尝试后会在这里显示。</div>';

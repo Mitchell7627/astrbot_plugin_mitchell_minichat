@@ -671,9 +671,9 @@ class PanelService:
         dialogue = await runner._proactive_input(umo, cid, datetime.now())
         text = await runner._generate(umo, cid=cid, dialogue=dialogue)
         text, _ = inspect_text(text or "")
-        text, _ = read_draft(text)
-        text, _ = runner.ground_proactive_reply(text, snapshot, dialogue, umo=umo)
-        return text
+        authored_text, _ = read_draft(text)
+        text, _ = runner.ground_proactive_reply(authored_text, snapshot, dialogue, umo=umo)
+        return text, authored_text
 
     async def preview(self, payload: dict) -> dict:
         umo = self._validate_umo((payload or {}).get("umo"))
@@ -683,7 +683,7 @@ class PanelService:
             try:
                 cid = await runner._conversation_id(umo)
                 snapshot = runner._delivery_snapshot(umo, cid)
-                text = await asyncio.wait_for(
+                text, authored_text = await asyncio.wait_for(
                     self._generated_proactive_text(runner, umo, cid, snapshot), timeout=90
                 )
             except asyncio.TimeoutError:
@@ -693,7 +693,7 @@ class PanelService:
             except Exception as e:
                 raise PanelError("E_UPSTREAM", f"生成失败: {e}")
 
-        segments = runner.prepare_segments(text)
+        segments = runner.prepare_segments(text, proactive=True, authored_text=authored_text)
         return {
             "umo": umo,
             "text": text,
@@ -724,9 +724,10 @@ class PanelService:
         with _Busy(self, umo, "send"):
             async with lock:
                 automatic = not text
+                authored_text = None
                 if automatic:
                     try:
-                        text = await asyncio.wait_for(
+                        text, authored_text = await asyncio.wait_for(
                             self._generated_proactive_text(runner, umo, cid, scene), timeout=90
                         )
                     except asyncio.TimeoutError:
@@ -737,7 +738,8 @@ class PanelService:
                 report = {}
                 try:
                     ok = bool(await runner.deliver(umo, text, cid=cid, report=report, guard=current,
-                                                   scene=scene[0] if automatic else None))
+                                                   scene=scene[0] if automatic else None,
+                                                   **({"authored_text": authored_text} if automatic else {})))
                 except Exception as e:
                     raise PanelError("E_UPSTREAM", f"发送失败: {e}")
 

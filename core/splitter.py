@@ -27,6 +27,44 @@ ALNUM_CHAR = re.compile(r"[a-zA-Z0-9]")
 ASCII_PUNCT = re.compile(r"^[ \t.?!,;:\-']+$")
 
 
+_CONTINUED_OBJECT = re.compile(r"(?:告诉|请问|听说|知道|想起|说起|提到|提起|聊到|看看|听听|说说|想想|帮帮|问问|提醒|通知|希望|因为|如果|要是)(?:了|啦|吧|呀|喵)?$")
+_NOT_INDEPENDENT = re.compile(r"(?:以后|之后|之前|的时候|的样子|的感觉|的事情|的问题|的事|的)[呀啊啦呢喵]?$")
+_INCOMPLETE_OPENING = re.compile(r"^(?:因为|如果|假如|要是|虽然|只要|除非|为了|例如|比如|关于|以及|或者|而且|并且)")
+_INCOMPLETE_ENDING = re.compile(r"(?:听你说|说|告诉|叫|聊|是|要|把|的|着|以后|之前|的时候)$")
+_ADDRESS_ONLY = re.compile(r"(?:哥哥|姐姐|宝贝|宝宝|同学|老师|主人|老[师公婆])[呀啊喵啦呢哦～]*")
+_SHORT_UTTERANCE = re.compile(
+    r"^(?:晚安|早安|你好|辛苦了|谢谢|抱抱|贴贴|摸摸头|戳戳|拍拍|揉揉|蹭蹭)"
+    r"|(?:[吧呀啊喵啦咯哟呢哦]|起来了|回来啦|我在|到了|过来|喂|哈{2,})$"
+)
+_NEWLINE = re.compile(r"[\r\n]+")
+
+
+def _line_key(text):
+    return text.strip().rstrip("。.!！?？…～~").strip()
+
+
+def explicit_short_lines(text):
+    """Identify complete lines deliberately separated by the model, outside paired signs."""
+    if not text:
+        return frozenset()
+    text = normalize_escapes(text)
+    if "\n" not in text and "\r" not in text:
+        return frozenset()
+    lines = _smart_split(text, _NEWLINE, 1, False, 0, 1, ())
+    if len(lines) < 2:
+        return frozenset()
+    result = set()
+    for line in lines:
+        body = _line_key(line)
+        if (_NEWLINE.search(body) or _ADDRESS_ONLY.fullmatch(body) or _INCOMPLETE_OPENING.search(body)
+                or _CONTINUED_OBJECT.search(body) or _NOT_INDEPENDENT.search(body)
+                or _INCOMPLETE_ENDING.search(body) or sum(c.isalnum() for c in body) < 2):
+            continue
+        if _SHORT_UTTERANCE.search(body) or line.strip().endswith(("。", "？", "！", "?", "!", ".")):
+            result.add(body)
+    return frozenset(result)
+
+
 def normalize_escapes(text: str) -> str:
     """把模型偶尔吐出来的**字面转义**还原成真字符。
 
@@ -55,8 +93,12 @@ def split_text(
     ratio_max=0.9,
     no_split_around=None,
     trim=True,
+    preserve_lines=frozenset(),
+    breakdown=None,
 ):
     """把一段文本切成多条消息。返回字符串列表。"""
+    if breakdown is not None:
+        breakdown["candidates"] = 0
     if not text or not text.strip():
         return []
     text = normalize_escapes(text)
@@ -80,11 +122,11 @@ def split_text(
         compiled = re.compile(DEFAULT_PATTERN)
 
     if smart:
-        segments = _smart_split(text, compiled, ideal, balanced, ratio_min, ratio_max, protected)
+        segments = _smart_split(text, compiled, ideal, balanced, ratio_min, ratio_max, protected, preserve_lines)
     else:
         segments = _simple_split(text, compiled, protected)
 
-    return _postprocess(segments, max_segments, min_length, trim)
+    return _postprocess(segments, max_segments, min_length, trim, preserve_lines, breakdown)
 
 
 def _simple_split(text, compiled, protected):
@@ -128,7 +170,7 @@ def _has_closer(text: str, i: int, closer: str) -> bool:
     return text.find(closer, i + 1) != -1
 
 
-def _smart_split(text, compiled, ideal, balanced, ratio_min, ratio_max, protected):
+def _smart_split(text, compiled, ideal, balanced, ratio_min, ratio_max, protected, preserve_lines=frozenset()):
     segments = []
     stack = []
     chunk = ""
@@ -158,6 +200,11 @@ def _smart_split(text, compiled, ideal, balanced, ratio_min, ratio_max, protecte
             should = not stack
             if should and balanced and weight < ideal * ratio_min:
                 should = False
+                if preserve_lines and _NEWLINE.search(delim):
+                    end = match.end()
+                    next_break = _NEWLINE.search(text, end)
+                    next_line = text[end:next_break.start()] if next_break else text[end:]
+                    should = _line_key(chunk + delim) in preserve_lines or _line_key(next_line) in preserve_lines
             if should and "\n" not in delim and ASCII_PUNCT.match(delim):
                 prev_c = text[i - 1] if i > 0 else ""
                 next_c = text[i + len(delim)] if i + len(delim) < n else ""
@@ -221,7 +268,7 @@ def _smart_split(text, compiled, ideal, balanced, ratio_min, ratio_max, protecte
     return segments
 
 
-def _postprocess(segments, max_segments, min_length, trim):
+def _postprocess(segments, max_segments, min_length, trim, preserve_lines, breakdown):
     cleaned = []
     for seg in segments:
         s = seg.replace("\r", "")
@@ -236,17 +283,20 @@ def _postprocess(segments, max_segments, min_length, trim):
         elif s:
             cleaned.append(s)
 
+    if breakdown is not None:
+        breakdown["candidates"] = len(cleaned)
     if not cleaned:
         return []
 
     # 合并过短片段：优先并入前一段，第一段太短则与下一段合并
     merged = []
     for seg in cleaned:
-        if merged and len(seg) < min_length:
+        if merged and len(seg) < min_length and (not preserve_lines or _line_key(seg) not in preserve_lines):
             merged[-1] = _join_segments(merged[-1], seg)
         else:
             merged.append(seg)
-    if len(merged) > 1 and len(merged[0]) < min_length:
+    if (len(merged) > 1 and len(merged[0]) < min_length
+            and (not preserve_lines or _line_key(merged[0]) not in preserve_lines)):
         merged[1] = _join_segments(merged[0], merged[1])
         merged.pop(0)
 

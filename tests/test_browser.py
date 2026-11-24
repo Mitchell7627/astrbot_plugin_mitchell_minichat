@@ -112,6 +112,7 @@ async def test_task_page_diagnostics_and_delivery_states(plugin, umo, monkeypatc
                                          "summary": "想接刚才的话题，问一个新问题。",
                                          "outline": "RECENT/QUESTION",
                                          "reason": "proactive_filtered", "checks": ["reply_received"],
+                                         "generated_segments": 2, "filtered_segments": 0, "split_segments": 0,
                                          "planned_segments": 0, "delivered_segments": 0})
                 await page.locator('[data-act="review-open"]').click()
                 row = page.locator("#review-list .review-row").first
@@ -119,6 +120,7 @@ async def test_task_page_diagnostics_and_delivery_states(plugin, umo, monkeypatc
                 await expect(row).to_contain_text("有自然的新话可接")
                 await expect(row.locator(".review-summary")).to_contain_text("最近的对话可以接着聊，想问一句新的。")
                 await expect(row).to_contain_text("你已经回过")
+                await expect(row).to_contain_text("生成 2 段 → 核对后 0 段 → 分段后 0 段")
                 await page.locator('[data-act="review-refresh"]').click()
                 await expect(row).to_contain_text("核对后没有可发送内容")
                 plugin.engine_cfg["enable_sleep_reminder"] = True

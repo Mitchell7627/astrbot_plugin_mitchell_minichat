@@ -26,7 +26,7 @@ PROMPT = (
     "斜线前选 RECENT（最近对话）、RECALL（回顾旧话题）、APPOINTMENT（已确认约定）、NO_TOPIC（没具体话题）或 ANSWERED（已接过）；"
     "斜线后选 QUESTION（问一句）、CONTINUE（接着聊）、GREET（问候）或 WAIT（跳过）。"
     "竖线后只用一句话说明发送理由，最多72字；不原样引用聊天，不写个人资料或推理草稿。"
-    "第三行起只写发送的正文，按自己的口吻说完就停。"
+    "第三行起只写正文。可以一句，也可以自然写两三句。第二句有新反应或新意思就写，各句完整表达并单独换行。别把整句话拆开凑段，也别为收尾重复提问。"
     "实在连轻问候也不适合时，可以首行写 [[NO_SEND:NO_NATURAL_LINE]]，第二行写同样格式的跳过理由，之后不写正文。"
 )
 
@@ -137,6 +137,9 @@ class ProactiveReview:
             "planned_segments": segments("planned_segments"),
             "delivered_segments": segments("delivered_segments"),
         }
+        for key in ("generated_segments", "filtered_segments", "split_segments"):
+            if type(row.get(key)) is int:
+                normalized[key] = segments(key)
         summary = _safe_summary(row.get("summary"))
         if summary:
             normalized["summary"] = summary

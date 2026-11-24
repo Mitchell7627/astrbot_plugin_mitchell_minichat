@@ -48,7 +48,7 @@ from .sleep_reminder import (
 )
 from . import text_rules as rules
 from . import timed_sleep, utterance
-from .splitter import calc_delay, normalize_escapes, split_text
+from .splitter import calc_delay, explicit_short_lines, normalize_escapes, split_text
 from .decisions import DecisionLog, clip_text
 from .proactive_review import PROMPT as PROACTIVE_REVIEW_PROMPT, ProactiveReview, read_review
 from . import proactive_quality as quality
@@ -4167,7 +4167,7 @@ class Runner:
             return f"{when}啦，该起床喔"
         return f"{when}啦，提醒你一下，你说的{label}时间到了"
 
-    async def deliver(self, umo, text, *, cid, guard, report, scene=None):
+    async def deliver(self, umo, text, *, cid, guard, report, scene=None, authored_text=None):
         """Send and record successful segments under AstrBot's conversation lock."""
         delivered = []
         async with self.conversation_delivery_lock(umo):
@@ -4177,7 +4177,8 @@ class Runner:
             sent = ""
             try:
                 sent = await self._send_split(umo, text, sent_out=delivered, report=report,
-                                              guard=guard, conversation_id=cid)
+                                              guard=guard, conversation_id=cid, proactive=scene is not None,
+                                              **({"authored_text": authored_text} if authored_text is not None else {}))
                 return sent
             finally:
                 sent_text = sent or "\n".join(delivered)
@@ -4220,6 +4221,7 @@ class Runner:
         shot, appt_at, appt_id = None, None, None
         review_route, model_review, review_checks = None, "not_needed", set()
         review_summary = review_outline = ""
+        authored_text = None
         timed_at, timed_state = 0.0, None
         try:
             if not self.cfg.get("enable", False):
@@ -4325,8 +4327,13 @@ class Runner:
             if draft_reason:
                 self._note_proactive(draft_reason)
                 review_checks.add(draft_reason)
-            if ordinary and text:
-                text, model_review, review_summary, review_outline = read_review(text)
+            if ordinary:
+                if text:
+                    text, model_review, review_summary, review_outline = read_review(text)
+                authored_text = text
+                breakdown = {}
+                generated = self.prepare_segments(text, proactive=True, authored_text=text, breakdown=breakdown)
+                result["generated_segments"] = breakdown.get("candidates", len(generated))
             if shot and (text or draft_reason):
                 item = self._appointment_item_for(umo, appt_at, appt_id) or {}
                 if item.get("label") and item.get("at"):
@@ -4363,6 +4370,7 @@ class Runner:
                 for reason in sorted(refinements):
                     self._note_proactive(reason)
                 if not text:
+                    result.update(filtered_segments=0, split_segments=0)
                     result["reason"] = ("proactive_self_skip" if "proactive_self_skip" in refinements
                                         else "proactive_filtered")
                     return result
@@ -4371,7 +4379,8 @@ class Runner:
                     self._note_proactive("clock_conflict")
                     return result
             sent_text = await self.deliver(umo, text, cid=cid, guard=can_send, report=result,
-                                           scene=snapshot[0] if ordinary else None)
+                                           scene=snapshot[0] if ordinary else None,
+                                           **({"authored_text": authored_text} if authored_text is not None else {}))
             ok = bool(sent_text)
             result["sent"] = ok
             if result["reason"] != "stale_generation":
@@ -5302,12 +5311,11 @@ class Runner:
                 cleaned.append(text)
         return cleaned
 
-    def prepare_segments(self, text: str) -> list[str]:
+    def prepare_segments(self, text: str, *, proactive=False, authored_text=None, breakdown=None) -> list[str]:
         """面板预览与实际发送共用同一份分段设置。"""
         conf = self.cfg.get("segmented_reply_settings", {}) or {}
-        if not bool(conf.get("enable", True)):
-            segments = [re.sub(r"[\r\n]+", " ", normalize_escapes(text)).strip()]
-        else:
+        enabled = bool(conf.get("enable", True))
+        if enabled or breakdown is not None:
             segments = split_text(
                 text,
                 pattern=str(conf.get("split_regex") or r"[。.？！?!\n…～]+"),
@@ -5319,7 +5327,12 @@ class Runner:
                 ratio_max=float(conf.get("balanced_split_ratio_max", 0.9) or 0.9),
                 no_split_around=conf.get("no_split_around") or [],
                 trim=bool(conf.get("trim_edge_blank", True)),
+                preserve_lines=explicit_short_lines(authored_text) if proactive else frozenset(),
+                breakdown=breakdown,
             )
+        if not enabled:
+            joined = re.sub(r"[\r\n]+", " ", normalize_escapes(text)).strip()
+            segments = [joined] if joined else []
         if bool(conf.get("enable_content_cleanup", False)):
             segments = self._cleanup_segments(
                 segments, str(conf.get("content_cleanup_rule") or "")
@@ -5327,13 +5340,17 @@ class Runner:
         return [segment for segment in segments if segment]
 
     async def _send_split(self, umo: str, text: str, sent_out: list | None = None,
-                          report: dict | None = None, guard=None, conversation_id=None) -> str:
+                          report: dict | None = None, guard=None, conversation_id=None, *, proactive=False,
+                          authored_text=None) -> str:
         """返回实际发送成功的段落，保持发送顺序。"""
         conf = self.cfg.get("segmented_reply_settings", {}) or {}
-        segments = self.prepare_segments(text)
+        breakdown = {} if authored_text is not None and report is not None else None
+        segments = self.prepare_segments(text, proactive=proactive, authored_text=authored_text, breakdown=breakdown)
         if report is not None:
             report.update(planned_segments=len(segments), delivered_segments=0,
                           delivery_status="not_sent")
+            if breakdown is not None:
+                report.update(filtered_segments=breakdown.get("candidates", len(segments)), split_segments=len(segments))
         if not segments:
             return ""
 
