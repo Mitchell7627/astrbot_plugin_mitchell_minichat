@@ -47,7 +47,7 @@ from .sleep_reminder import (
     _parse_hhmm,
 )
 from . import text_rules as rules
-from . import utterance
+from . import timed_sleep, utterance
 from .splitter import calc_delay, normalize_escapes, split_text
 from .decisions import DecisionLog, clip_text
 from .proactive_review import PROMPT as PROACTIVE_REVIEW_PROMPT, ProactiveReview, read_review
@@ -132,6 +132,17 @@ def time_text(now: datetime | None = None) -> str:
 
 
 @dataclass(frozen=True)
+class _ProactiveState:
+    scene: tuple
+    hint: str
+    appointments: tuple
+    meal_owner: str
+    facts: quality.SceneFacts
+    timed_sleep_pending: bool
+    replied: bool | None
+
+
+@dataclass(frozen=True)
 class _ProactiveInput:
     history: list
     platform_block: str
@@ -139,6 +150,7 @@ class _ProactiveInput:
     scheduled: bool = False
     outreach: str = "topic"
     earlier_topics: tuple = ()
+    state: _ProactiveState | None = None
 
 
 class Runner:
@@ -295,11 +307,27 @@ class Runner:
                      "next_at": next_at, "steps": list(steps or [])[:8]})
         del rows[:-20]
 
+    def _arm_timer(self, umo, base_at, steps):
+        now = time.time()
+        self._expire_timed_sleep(umo, now)
+        timed_delay = self._timed_sleep_delay(umo, now)
+        if timed_delay is not None and now + timed_delay * 60 <= base_at:
+            base_at = now + timed_delay * 60
+            steps = [*steps, {"reason": "timed_sleep", "minutes": timed_delay}]
+        self.store.set(umo, "next_at", base_at)
+        self._trace_schedule(umo, steps[-1]["reason"], steps, base_at)
+        self.store.save()
+        old = self.timers.pop(umo, None)
+        if old is not None and old is not asyncio.current_task():
+            old.cancel()
+        if self.started:
+            self.timers[umo] = asyncio.create_task(self._wait_and_fire(umo, max(0, base_at - now)))
+
     def reschedule(self, umo: str, *, delay_minutes: float | None = None, keep_if_future: bool = False,
                    after_send: bool = False, source: str = "explicit_delay") -> None:
         """安排下一次主动消息。"""
         old = self.timers.pop(umo, None)
-        if old is not None:
+        if old is not None and old is not asyncio.current_task():
             old.cancel()
         if not self.started or not self._result_current(umo):
             self._trace_schedule(umo, "stopped")
@@ -344,10 +372,7 @@ class Runner:
         delay_seconds = max(60.0, float(delay_minutes) * 60.0)
         if delay_seconds > float(delay_minutes) * 60.0:
             steps.append({"reason": "minimum_delay", "minutes": delay_seconds / 60.0})
-        self.store.set(umo, "next_at", time.time() + delay_seconds)
-        self._trace_schedule(umo, steps[-1]["reason"], steps, self.store.get(umo, "next_at"))
-        self.store.save()
-        self.timers[umo] = asyncio.create_task(self._wait_and_fire(umo, delay_seconds))
+        self._arm_timer(umo, time.time() + delay_seconds, steps)
 
     async def _wait_and_fire(self, umo: str, delay: float) -> None:
         try:
@@ -482,13 +507,7 @@ class Runner:
         next_at = float(self.store.get(umo, "next_at", 0) or 0)
         if next_at >= now + gap - 5:
             return
-        self.store.set(umo, "next_at", now + gap)
-        self._trace_schedule(umo, "bot_reply_gap", next_at=now + gap)
-        self.store.save()
-        old = self.timers.pop(umo, None)
-        if old is not None:
-            old.cancel()
-        self.timers[umo] = asyncio.create_task(self._wait_and_fire(umo, gap))
+        self._arm_timer(umo, now + gap, [{"reason": "bot_reply_gap"}])
         logger.info(f"{TAG} 她刚回过话，下次主动开口推到 {int(gap // 60)} 分钟后")
 
     def _next_promise_minutes(self, umo: str) -> float | None:
@@ -542,17 +561,10 @@ class Runner:
             appt = self._appointment_next_delay(umo, delay / 60.0)
             if appt is not None:
                 delay = max(60.0, appt * 60.0)
-            self.store.set(umo, "next_at", now + delay)
             steps = [{"reason": "event_restore", "minutes": max(60.0, base - now) / 60.0}]
             if appt is not None:
                 steps.append({"reason": "appointment", "minutes": delay / 60.0})
-            self._trace_schedule(umo, steps[-1]["reason"], steps, now + delay)
-            self.store.save()
-            old = self.timers.pop(umo, None)
-            if old is not None:
-                old.cancel()
-            if self.started:
-                self.timers[umo] = asyncio.create_task(self._wait_and_fire(umo, delay))
+            self._arm_timer(umo, now + delay, steps)
             logger.info(
                 f"{TAG} 事件已过：原排程还有 {int(delay // 60)} 分钟，恢复到原时间（不重抽）"
             )
@@ -662,8 +674,10 @@ class Runner:
 
         now = datetime.now()
         ts = time.time()
+        self._expire_timed_sleep(umo, ts)
         state = self._sleep_state(umo) or {}
-
+        if self._timed_sleep_at(umo) and cfg["night_enabled"]:
+            return self._timed_sleep_delay(umo, ts)
         # ① 一次性提醒点（说了「等会再睡」，归晚睡提醒管）
         remind_at = _as_float_safe(state.get("remind_at"))
         if state.get("state") == STATE_WAITING and remind_at and cfg["night_enabled"]:
@@ -678,6 +692,8 @@ class Runner:
         limit = hi_minutes if hi_minutes is not None else self._max_interval_minutes()
         best: float | None = None
         for window in self._sleep_windows(cfg):
+            if window["key"] == "night" and self._suppress_night_sleep(umo, ts):
+                continue
             pos = window_position(window["start"], window["end"], now)
             if not pos or self._reminded_in_window(umo, window, now):
                 continue
@@ -778,17 +794,20 @@ class Runner:
 
         now = datetime.now()
         ts = time.time()
+        self._expire_timed_sleep(umo, ts)
         state = self._sleep_state(umo) or {}
-
+        explicit_at = self._timed_sleep_at(umo)
+        if explicit_at and cfg["night_enabled"] and explicit_at <= ts < explicit_at + timed_sleep.GRACE_SECONDS:
+            return True
         # ① 一次性提醒点到点了（不管在不在窗口里，归晚睡提醒管）
         remind_at = _as_float_safe(state.get("remind_at"))
-        if state.get("state") == STATE_WAITING and remind_at and cfg["night_enabled"] and ts >= remind_at - 60:
+        if not explicit_at and state.get("state") == STATE_WAITING and remind_at and cfg["night_enabled"] and ts >= remind_at - 60:
             return True
 
         if self._reminded_recently(umo, ts):
             return False
         window = self._current_sleep_window(cfg, now)
-        if not window:
+        if not window or window["key"] == "night" and self._suppress_night_sleep(umo, ts):
             return False
         return not self._reminded_in_window(umo, window, now)
 
@@ -1869,6 +1888,134 @@ class Runner:
         # 白天补觉 → 静音 N 小时
         return now + quiet_hours * 3600
 
+    def _timed_sleep_at(self, umo):
+        state = self._sleep_state(umo) or {}
+        if state.get("state") == STATE_WAITING and state.get("explicit_clock"):
+            return _as_float_safe(state.get("remind_at"))
+        return 0.0
+
+    def _timed_sleep_delay(self, umo, now):
+        at = self._timed_sleep_at(umo)
+        if at and self._sleep_cfg()["night_enabled"] and now < at + timed_sleep.GRACE_SECONDS:
+            # A due promise is retried after one minute when a regular appointment won the slot.
+            return (at - now) / 60 if at > now else 1.0
+        return None
+
+    def _sleep_night(self, stamp):
+        return timed_sleep.night_of(stamp, _parse_hhmm(self._sleep_cfg()["night_start"]) or (18, 0))
+
+    def _close_timed_sleep(self, state):
+        closed = {key: value for key, value in state.items()
+                  if key in ("reminded", "last_reminded_at", "last_reminded_window")}
+        closed["timed_sleep_closed_night"] = self._sleep_night(state["remind_at"])
+        return closed
+
+    def _suppress_night_sleep(self, umo, now):
+        state = self._sleep_state(umo) or {}
+        return bool(self._timed_sleep_at(umo)
+                    or state.get("timed_sleep_closed_night") == self._sleep_night(now))
+
+    def _expire_timed_sleep(self, umo, now):
+        at = self._timed_sleep_at(umo)
+        if at and now >= at + timed_sleep.GRACE_SECONDS:
+            self.store.set(umo, SLEEP_KEY, self._close_timed_sleep(self._sleep_state(umo)))
+            self.store.save()
+
+    async def timed_sleep_context(self, umo, cid, text, received_at):
+        pending = bool(self._timed_sleep_at(umo))
+        hits = tuple(timed_sleep.candidates(text, pending=pending))
+        if not hits or all(hit.explicit or hit.cancel for hit in hits) or timed_sleep.is_sleep_topic(text):
+            return False
+        if not cid:
+            return False
+        history = await self._load_history(umo, cid=cid)
+        oldest = received_at - 10 * 60
+        latest = None
+        for message in reversed(history):
+            if not isinstance(message, dict) or message.get("role") not in ("assistant", "user"):
+                continue
+            content = self._plain_content(message.get("content")).split("<system_reminder>", 1)[0].strip()
+            if not content or message.get("tool_calls"):
+                continue
+            if latest is None:
+                # A newer unrelated reply breaks the context even if an older turn mentioned sleep.
+                latest = timed_sleep.is_sleep_topic(inspect_text(content)[0])
+                if not latest:
+                    return False
+            when = self._message_time(message)
+            if when is not None:
+                return oldest <= when.timestamp() <= received_at
+            if message.get("role") == "user":
+                return False
+        return False
+
+    def _update_timed_sleep(self, umo, text, sleep_context):
+        hits = tuple(timed_sleep.candidates(text, pending=bool(self._timed_sleep_at(umo))))
+        if not hits:
+            return text
+        when = time.time()
+        now = datetime.fromtimestamp(when).replace(tzinfo=None)
+        cfg = self._sleep_cfg()
+        hit = hits[-1]
+        prior = self._sleep_state(umo)
+        if hit.cancel:
+            if self._timed_sleep_at(umo):
+                changed = self._close_timed_sleep(prior)
+                status = "cancelled"
+            else:
+                return text
+        elif not hit.explicit and not (sleep_context or timed_sleep.is_sleep_topic(text)):
+            status = "unknown_topic"
+        elif len(hits) > 1 or not hit.clock:
+            status = "ambiguous"
+        elif not cfg["night_enabled"]:
+            status = "disabled"
+        else:
+            limits = self._appointment_cfg()
+            at = timed_sleep.target(
+                text, hit, now, night_start=_parse_hhmm(cfg["night_start"]) or (18, 0),
+                wake=_parse_hhmm(cfg["wake_time"]) or (8, 0),
+                max_hours=limits["max_hours"], days=limits["future_days"],
+            )
+            if at is None:
+                status = "ambiguous"
+            elif self.is_sleeping(umo):
+                status = "sleeping"
+            else:
+                changed = {
+                    "state": STATE_WAITING, "explicit_clock": True, "keyword": "指定时间催睡",
+                    "remind_at": at, "started_at": when, "reminded": self._reminded_marks(prior or {}),
+                    "last_reminded_at": _as_float_safe((prior or {}).get("last_reminded_at")),
+                }
+                status = "saved"
+        if status in ("saved", "cancelled"):
+            self.store.set(umo, SLEEP_KEY, changed)
+            if not self.store.save():
+                if prior is None:
+                    self.store.pop(umo, SLEEP_KEY)
+                else:
+                    self.store.set(umo, SLEEP_KEY, prior)
+                status = "failed"
+        self._timed_sleep_result = {"status": status}
+        if status == "saved":
+            self._timed_sleep_result.update(
+                at=at, received_at=when, night_start=_parse_hhmm(cfg["night_start"]) or (18, 0),
+                wake=_parse_hhmm(cfg["wake_time"]) or (8, 0), max_hours=limits["max_hours"],
+                days=limits["future_days"],
+            )
+        if status in ("saved", "cancelled"):
+            reason = "已保存定点催睡" if status == "saved" else "已取消定点催睡"
+            self._note("wait", {"hit": {"kw": text[hit.start:hit.end].strip(), "idx": hit.start,
+                                        "gate_rule": "TIMED_SLEEP", "reason": reason}})
+        for part in hits:
+            text = self._mask_span(text, part.start, part.end)
+        return text
+
+    def take_timed_sleep_result(self):
+        result = getattr(self, "_timed_sleep_result", None)
+        self._timed_sleep_result = None
+        return result
+
     def _handle_sleep_words(self, umo: str, text: str) -> bool:
         """处理「睡了/晚安」与「待会睡」两类话，驱动睡眠状态机。返回是否已处理。
 
@@ -1912,7 +2059,7 @@ class Runner:
 
         # 2) 待会再睡 → waiting：按「区间 + 三段权重」抽一个一次性提醒点
         #    （归「晚睡提醒」管：它关着就不排，午睡开关不影响这里）
-        if not cfg["night_enabled"]:
+        if not cfg["night_enabled"] or self._timed_sleep_at(umo):
             return False
         wait = match_wait_detail(
             text, cfg["wait_keywords"],
@@ -1973,13 +2120,17 @@ class Runner:
 
     def reminder_hint(self, umo: str) -> str:
         """「该睡了」提醒时给模型的场景提示。优先用 Web 覆盖。"""
+        stamp = time.time()
+        timed_at = self._timed_sleep_at(umo)
+        if timed_at and timed_at <= stamp < timed_at + timed_sleep.GRACE_SECONDS:
+            return f"现在到了用户指定的 {datetime.fromtimestamp(timed_at):%H:%M} 催睡时间，轻声提醒他休息。"
         override = self.plugin.web_override("reminder_hint") if hasattr(self.plugin, "web_override") else None
         if override:
             now = datetime.now()
             return str(override).replace("{{time}}", now.strftime("%H:%M"))
-        return build_reminder_hint(self._sleep_state(umo) or {})
+        return build_reminder_hint({} if timed_at else self._sleep_state(umo) or {})
 
-    def mark_sleep_reminded(self, umo: str) -> None:
+    def mark_sleep_reminded(self, umo: str, *, timed=False) -> None:
         """提醒过一次后打标记：同一窗口不重复催，90 分钟内也不再催第二条。
 
         没有待睡状态时（自动提醒）也建一个，这样面板上能看到「已提醒 · 时间」。
@@ -1996,9 +2147,12 @@ class Runner:
         state["reminded"] = marks
         state["last_reminded_at"] = now
         state["last_reminded_window"] = key
-        state.pop("remind_at", None)  # 一次性提醒点用掉了
-        if state.get("state") != STATE_SLEEPING:
-            state["state"] = STATE_REMINDED
+        if timed or not state.get("explicit_clock"):
+            if state.pop("explicit_clock", False):
+                state["timed_sleep_closed_night"] = self._sleep_night(state["remind_at"])
+            state.pop("remind_at", None)
+            if state.get("state") != STATE_SLEEPING:
+                state["state"] = STATE_REMINDED
         self.store.set(umo, SLEEP_KEY, state)
         self.store.save()
 
@@ -2830,12 +2984,13 @@ class Runner:
         except Exception as e:
             logger.debug(f"{TAG} 约定灰度后重排失败: {e}")
 
-    def update_from_message(self, umo: str, text: str) -> bool:
+    def update_from_message(self, umo: str, text: str, *, sleep_context=False) -> bool:
         """根据消息更新事件与在场状态。返回 False 表示什么都没认出。
         外层只做两件事：进门前拍快照、出门后落判定记录（含一键撤销要用的 before/after）。
         真正的判定顺序在 `_update_inner`；后备候选另由消息入口同步取走。
         """
         self._llm_candidate = None
+        self._timed_sleep_result = None
         self._message_text = text
         if not text:
             return False
@@ -2858,7 +3013,9 @@ class Runner:
             self.store.set(umo, "proactive_topic_updates", updates)
         try:
             effective, corrected = self._clarify_activity(umo, text)
-            handled = self._update_inner(umo, effective) or corrected
+            effective = self._update_timed_sleep(umo, effective, sleep_context)
+            handled = self._update_inner(umo, effective) or corrected or bool(
+                self._timed_sleep_result and self._timed_sleep_result["status"] in ("saved", "cancelled"))
         finally:
             handled = self._flush_decisions(umo, text, before, handled)
             seq = _as_int(self.store.get(umo, 'turn_seq'), 0)
@@ -3764,10 +3921,18 @@ class Runner:
         return [presence, event.get("name", ""), event.get("subject", ""), phase]
 
     def _proactive_hint(self, umo, *, cid=None):
-        now = time.time()
-        scene = self._proactive_scene(umo, now=now, cid=cid)
+        return self._capture_proactive_state(umo, cid, time.time()).hint
+
+    def _capture_proactive_state(self, umo, cid, now, *, turns=(), meal_turns=()):
+        scene = tuple(self._proactive_scene(umo, now=now, cid=cid))
         presence, _, subject, phase = scene
         event = self._confirmed_event(umo, cid, now)
+        if presence == "together" and not (self._has_current_scene(umo, cid) and self._together_alive(umo, now)):
+            presence, scene = "unknown", ("unknown", *scene[1:])
+        appointments = tuple(self._appointments(umo))
+        moment = datetime.fromtimestamp(now)
+        meal_owner = quality.meal_owner(meal_turns, moment, self._bot_nicknames())
+        facts = quality.scene_facts(turns, moment)
         parts = [{"away": "他还在外面", "together": "最近确认同处一个场景",
                   "unknown": "当前是否同处一地未知"}[presence]]
         if phase == "returning":
@@ -3781,14 +3946,23 @@ class Runner:
             signal = self.store.get(umo, "latest_activity_signal") or {}
             if signal.get("label") and 0 <= now - _as_float_safe(signal.get("at")) <= 1800:
                 parts.append(signal["label"])
-        pending = [item for item in self._appointments(umo)
+        parts.extend(facts.hints())
+        if meal_owner:
+            who = "你" if meal_owner == "bot" else "用户"
+            parts.append(f"用户已确认这顿由{who}负责，只确认分工，准备进度未知。")
+        sleep_at = self._timed_sleep_at(umo)
+        sleep_pending = bool(sleep_at > now and self._sleep_cfg()["night_enabled"])
+        if sleep_pending:
+            parts.append(f"已约好 {datetime.fromtimestamp(sleep_at):%m月%d日 %H:%M} 催睡；到点前先不催。")
+        pending = [item for item in appointments
                    if item.get("at", 0) > now and item.get("stage") != "done"]
         if pending:
             parts.append("尚未发生的约定：" + "、".join(
                 f"{item.get('date_text', '')} {item.get('time_text', '')} {item.get('label', '')}"
                 for item in pending
             ))
-        return "\n".join(parts)
+        return _ProactiveState(scene, "\n".join(parts), appointments, meal_owner, facts, sleep_pending,
+                               self._reply_receipt(umo, turns, cid=cid, now=now))
 
     def _delivery_snapshot(self, umo, cid=None):
         event = self._fresh_event(umo, time.time()) or {}
@@ -3882,33 +4056,41 @@ class Runner:
                 turns = list(self._proactive_plan_evidence(history))
         turns.sort(key=lambda turn: turn[1] or datetime.min, reverse=True)
         turns = tuple(turns[:6])
-        scene = self._proactive_scene(umo, now=now.timestamp(), cid=cid)
+        cap = settings["history_cap"]
+        meal_turns = tuple(self._proactive_plan_evidence(all_history[-cap:] if cap else all_history))
         outreach = "topic"
         earlier = ()
-        if not quality.has_topic(scene, turns, self._appointments(umo), now) and not quality.affection_turns(turns):
-            if mode == "platform_message_history" and block:
-                older_settings = {**settings, "proactive_since": self._platform_proactive_since(umo, cid, window=14400)}
-                older_records = await self._platform_records_for_prompt(umo, older_settings)
-                earlier = self._earlier_proactive_topics(
-                    sorted(peer_turns(older_records), key=lambda turn: turn[1], reverse=True), now,
-                )
-            else:
-                cap = settings["history_cap"]
-                earlier = self._earlier_proactive_topics(
-                    self._proactive_plan_evidence(all_history[-cap:] if cap else all_history), now,
-                )
+        has_topic = quality.has_topic(self._proactive_scene(umo, now=now.timestamp(), cid=cid),
+                                      turns, self._appointments(umo), now) or quality.affection_turns(turns)
+        if mode == "platform_message_history" and block:
+            older_settings = {**settings, "proactive_since": self._platform_proactive_since(
+                umo, cid, window=7200 if has_topic else 14400)}
+            meal_turns = tuple(peer_turns(await self._platform_records_for_prompt(umo, older_settings)))
+        if not has_topic:
+            earlier = self._earlier_proactive_topics(
+                sorted(meal_turns, key=lambda turn: turn[1] or datetime.min, reverse=True), now)
             outreach = "catch_up" if earlier else "persona_greeting"
-        return _ProactiveInput(history, block, turns, scheduled, outreach, earlier)
+        scoped = self.store.get(umo, "scene_conversation") or {}
+        since = _as_float_safe(scoped.get("since")) if scoped.get("id") == cid else 0
+        turns_for_meal = tuple(sorted(dict.fromkeys(
+            (body, stamp) for body, stamp in (*turns, *meal_turns)
+            if stamp and stamp.timestamp() >= since
+        ), key=lambda turn: turn[1], reverse=True))
+        state = self._capture_proactive_state(umo, cid, now.timestamp(), turns=turns, meal_turns=turns_for_meal)
+        return _ProactiveInput(history, block, turns, scheduled, outreach, earlier, state)
 
-    def _reply_receipt(self, umo, dialogue, *, inbound_at=None):
-        if not umo:
-            return None
-        latest = max((_as_float_safe(self.store.get(umo, "last_message_at") if inbound_at is None else inbound_at), *(
-            stamp.timestamp() for _, stamp in dialogue.user_turns if stamp
+    def _reply_receipt(self, umo, turns, *, cid, now):
+        scope = self.store.get(umo, "scene_conversation") or {}
+        since = _as_float_safe(scope.get("since")) if scope.get("id") == cid else 0
+        delivery = self.store.get(umo, "last_proactive_delivery") or {}
+        last_sent = _as_float_safe(delivery.get("at")) if delivery.get("cid") == cid else 0
+        if not last_sent and (not scope or scope.get("id") == cid):
+            last_sent = max((row["at"] for row in quality.recent(
+                self.store.get(umo, "proactive_recent", []), now) if row["at"] >= since), default=0)
+        latest = max((_as_float_safe(self.store.get(umo, "last_message_at")), *(
+            stamp.timestamp() for _, stamp in turns if stamp and since <= stamp.timestamp() <= now
         )))
-        last_sent = max((row["at"] for row in quality.recent(
-            self.store.get(umo, "proactive_recent", []), time.time())), default=0)
-        return (latest >= last_sent) if latest and last_sent else None
+        return latest >= last_sent if since <= last_sent <= now and last_sent else None
 
     async def chat_timing_evidence(self, umo, event_text, now):
         history = []
@@ -3929,15 +4111,22 @@ class Runner:
         turns = (dialogue.user_turns if isinstance(dialogue, _ProactiveInput)
                  else tuple(self._proactive_plan_evidence(dialogue)))
         history = dialogue.history if isinstance(dialogue, _ProactiveInput) else dialogue
-        polished, reasons = quality.polish_reply(
-            text, snapshot[0], turns,
-            snapshot[2], now=datetime.now(),
-        )
+        state = dialogue.state if isinstance(dialogue, _ProactiveInput) else None
+        scene, appointments = (state.scene, state.appointments) if state else (snapshot[0], snapshot[2])
         now = datetime.now()
-        replied = (self._reply_receipt(umo, dialogue, inbound_at=snapshot[6])
-                   if isinstance(dialogue, _ProactiveInput) else None)
-        polished, additional = quality.check_proactive_assumptions(polished, turns, snapshot[2], now, replied)
-        reasons.update(additional)
+        checks = set()
+        if state and state.timed_sleep_pending:
+            sentences = quality._review_sentences(text)
+            eligible = [sentence for sentence in sentences if not timed_sleep.early_nudge(sentence)]
+            if len(eligible) < len(sentences):
+                text = "\n".join(eligible)
+                checks.add("timed_sleep_pending")
+        text, fact_reasons = quality.check_scene_facts(
+            text, scene, turns, owner=state.meal_owner if state else "", facts=state.facts if state else None, now=now)
+        polished, reasons = quality.polish_reply(text, scene, turns, appointments, now=now)
+        polished, additional = quality.check_proactive_assumptions(
+            polished, turns, appointments, now, state.replied if state else None, bot_nicknames=self._bot_nicknames())
+        reasons.update(checks | fact_reasons | additional)
         if isinstance(dialogue, _ProactiveInput) and dialogue.outreach != "topic":
             polished, ignored = quality.check_idle_scene(polished)
             if ignored:
@@ -3998,6 +4187,7 @@ class Runner:
                         recent = quality.recent(self.store.get(umo, "proactive_recent", []), sent_at)
                         recent.append(quality.fingerprint(sent_text, sent_at, scene))
                         self.store.set(umo, "proactive_recent", recent[-8:])
+                        self.store.set(umo, "last_proactive_delivery", {"cid": cid, "at": sent_at})
                         self.store.save()
                         self._note_proactive("sent_" + report.get("delivery_status", "partial"))
                     if cid:
@@ -4030,6 +4220,7 @@ class Runner:
         shot, appt_at, appt_id = None, None, None
         review_route, model_review, review_checks = None, "not_needed", set()
         review_summary = review_outline = ""
+        timed_at, timed_state = 0.0, None
         try:
             if not self.cfg.get("enable", False):
                 result["reason"] = "disabled"
@@ -4042,11 +4233,12 @@ class Runner:
             wake_sleep = copy.deepcopy(self._sleep_state(umo)) if wake_due else None
 
             def can_send():
-                return self._result_current(umo, seq) and (
+                return self._result_current(umo, seq) and self.cfg.get("enable", False) and (
                     not self.is_sleeping(umo)
                     or bool(wake_due and self._sleep_state(umo) == wake_sleep)) and (
                         self._delivery_snapshot(umo, cid) == snapshot
-                    )
+                    ) and (not timed_at or self._sleep_cfg()["night_enabled"]
+                           and timed_at <= time.time() < timed_at + timed_sleep.GRACE_SECONDS)
             # 睡眠免打扰：说「睡了」之后静音（智能时长：近起床点到起床、远则 N 小时）
             if self.is_sleeping(umo) and not wake_due:
                 # 到点的约定不能静默丢掉：改排到起床后，醒来再补。
@@ -4073,6 +4265,11 @@ class Runner:
             appt_id = appt.get("id") if appt else None
             if shot:
                 reminding = False
+            if reminding:
+                explicit_at = self._timed_sleep_at(umo)
+                if explicit_at and explicit_at <= time.time() < explicit_at + timed_sleep.GRACE_SECONDS:
+                    timed_at = explicit_at
+                    timed_state = copy.deepcopy(self._sleep_state(umo))
 
             limit = int(schedule.get("max_unanswered_times", 3) or 0)
             unanswered = int(self.store.get(umo, "unanswered", 0) or 0)
@@ -4091,10 +4288,7 @@ class Runner:
                 # wake 是分钟、这里换秒；1 分钟地板 = 最迟 1 分钟内补发，
                 # 不是「1 小时」（外部报告把单位看成了分钟）。
                 delay = max(60.0, wake * 60.0)
-                self.store.set(umo, "next_at", time.time() + delay)
-                self._trace_schedule(umo, "promise_wakeup", next_at=self.store.get(umo, "next_at"))
-                self.store.save()
-                self.timers[umo] = asyncio.create_task(self._wait_and_fire(umo, delay))
+                self._arm_timer(umo, time.time() + delay, [{"reason": "promise_wakeup"}])
                 logger.info(
                     f"{TAG} 连续 {unanswered} 条未回复，暂停普通聊天；"
                     f"{int(delay // 60)} 分钟后为约定/催睡再醒一次"
@@ -4199,7 +4393,8 @@ class Runner:
                         f"{TAG} 已发送约定（{shot}），当前未回复计数 {count}"
                     )
                 elif reminding:
-                    self.mark_sleep_reminded(umo)
+                    if not timed_at:
+                        self.mark_sleep_reminded(umo)
                     logger.info(f"{TAG} 已发送睡眠提醒")
                 else:
                     count = self.store.bump_unanswered(umo)
@@ -4224,6 +4419,8 @@ class Runner:
             if held and lock.locked():
                 lock.release()
             self._firing.discard(umo)
+            if timed_at and (result["sent"] or result["delivered_segments"] > 0) and self._sleep_state(umo) == timed_state:
+                self.mark_sleep_reminded(umo, timed=True)
             if review_route:
                 self.proactive_review.add({"at": time.time(), "umo": umo, "route": review_route,
                                            "model": model_review, "summary": review_summary, "outline": review_outline,
@@ -4278,7 +4475,7 @@ class Runner:
         elif reminder:
             hint = self.reminder_hint(umo)
         else:
-            hint = "[已确认状态与待办]\n" + self._proactive_hint(umo, cid=cid)
+            hint = "[已确认状态与待办]\n" + (dialogue.state.hint if dialogue.state else self._proactive_hint(umo, cid=cid))
         prompt = (
             template.replace("{{current_time}}", time_text())
             .replace("{{unanswered_count}}", str(unanswered))
@@ -4296,8 +4493,9 @@ class Runner:
                 prompt += "\n" + hint
             prompt += ("\n近期对话只用来接话，助手说过的话只作话题和语气参考。"
                        "所在位置、手边有什么、谁刚做完什么，只沿用用户确认或已知状态。"
-                       "不确定就开放地问，不把猜测藏进问句。只接一个话题，说完就停。")
-            replied = self._reply_receipt(umo, dialogue)
+                       "不确定就开放地问，不把猜测藏进问句。只接一个话题，说完就停。"
+                       "你自己的提议不代表用户已开始；别猜食物备好、温度或厨房进度。不要埋怨对方没回。")
+            replied = dialogue.state.replied if dialogue.state else None
             if replied:
                 prompt += "\n收发记录：对方在上次主动消息之后回过，即使只有一两字也算回过。"
             elif replied is None:

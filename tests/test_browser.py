@@ -3,6 +3,7 @@
 import os
 import shutil
 import socket
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 from urllib.parse import urlparse
@@ -120,6 +121,13 @@ async def test_task_page_diagnostics_and_delivery_states(plugin, umo, monkeypatc
                 await expect(row).to_contain_text("你已经回过")
                 await page.locator('[data-act="review-refresh"]').click()
                 await expect(row).to_contain_text("核对后没有可发送内容")
+                plugin.engine_cfg["enable_sleep_reminder"] = True
+                clock.now = datetime(2026, 11, 2, 21, 59).timestamp()
+                r.update_from_message(umo, "凌晨一点半催我睡觉")
+                await page.reload()
+                await page.locator('[data-tab="tasks"]').click()
+                await expect(page.locator("#task-list")).to_contain_text("定点催睡")
+                await expect(page.locator("#task-list")).to_contain_text("2026-11-03 01:30")
                 assert not errors
                 await page.screenshot(
                     path=str(plugin.data_dir / "minichat-task-page.png"), full_page=True

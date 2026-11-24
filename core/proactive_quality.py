@@ -3,8 +3,10 @@
 import hashlib
 import re
 import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from . import text_rules as rules
 from .appointment import _day_markers, find_clock, resolve_clock
 from .splitter import split_text
 
@@ -121,6 +123,11 @@ _COOL_WATER = re.compile(r"水(?:都|已经|快|有点){0,3}(?:要)?凉")
 _OTHER_SOAK = re.compile(r"茶|咖啡|燕麦|泡面|泡脚|泡茶|泡衣服")
 _HYPOTHETICAL = re.compile(r"如果|假如|要是|洗澡的话|泡澡的话|洗澡时|泡澡时|下次.{0,8}(?:洗澡|泡澡)")
 _BATH_DETAIL = re.compile(r"头发|擦干|毛巾|换衣|水温|别着凉")
+_WASH_PROGRESS_QUESTION = re.compile(
+    r"^(?:你|哥哥|姐姐)?\s*(?:现在|这会儿|已经|终于)?"
+    r"(?:(?:澡)?(?:洗|泡)(?:完(?:澡)?|好澡)(?:了)?\s*(?:没有|没(?!有)|吗|么)(?!必要|关系|问题|理由)|"
+    r"还没(?:洗|泡)完(?:澡)?(?:吗|么|吧|呀))"
+)
 _BOOKING = re.compile(r"(?:票|座位|行程)(?:都|也|刚|已经|早就|总算|是|已经都|都已经){0,3}"
                       r"(?:订好|定好|买好|买了|已订)|"
                       r"(?:订好|定好|买好)了[^，。！？；\n]{0,5}(?:票|座位)")
@@ -317,6 +324,20 @@ _IDLE_LOCATION = re.compile(
 )
 
 
+def asks_closed_wash(text):
+    visible = _QUOTED.sub(" ", text)
+    return any(_WASH_PROGRESS_QUESTION.match(clause.strip()) for clause in _CLAUSE_BREAK.split(visible)
+               if not _HYPOTHETICAL.search(clause) and not _OTHER_SOAK.search(clause))
+
+
+_DEFERRED_TOPIC = re.compile(
+    r"^(?:至于|关于)?(?:先聊|聊|讨论|看)?(?P<topic>[\u4e00-\u9fffA-Za-z0-9]{2,16}?)"
+    r"(?:这件事|的事|的话题)?(?:先|就)?(?:等会儿|待会儿|晚点|回头|改天|下次|以后)?"
+    r"(?:再说|再聊|再谈)[啦咯喵呀哦啊呢吧~～\s]*$"
+)
+_UNNAMED_TOPIC = re.compile(r"^(?:先|现在|晚点|等会|到时|那个|这个|这事|这件|这话题|这些|它|你|我)(?:\W|的?事|的话题)?$|(?:完|了|之后)$")
+
+
 def check_idle_scene(text):
     """An older exchange cannot establish where either person is right now."""
     kept, removed = [], False
@@ -449,6 +470,166 @@ def _dependent_on(content, rejected):
     )
 
 
+_WASH_FACE_START = re.compile(r"(?:我)?(?:正在|在|刚开始)洗脸|(?:我)?(?:去|开始)洗脸[了啦咯喵]+")
+_WASH_FACE_END = re.compile(r"洗完脸|脸(?:已经|刚刚|刚)?洗好|(?:没在|没有在|不是在)洗脸")
+_FOOD = r"晚饭|午饭|早饭|早餐|饭菜|饭|布丁|蛋糕|饺子|面条|甜点|冰淇淋|汉堡"
+_FOOD_STATE = re.compile(
+    rf"(?P<food>{_FOOD})(?:已经|早就|刚刚|已经都|都|刚|还没|没有|没|还未|还|放|搁|摆|端|快|要|会|得){{0,5}}"
+    r"(?P<phase>放凉|凉|冷|上桌|摆好|端好|备好|做好|准备好|煮好|吃完)(?:了|啦|咯|喵|啊|吗|没有|呢|吧|呀|$)"
+)
+_HEATING = re.compile(r"(?P<object>开水|热水|水|锅)(?:已经|早就|刚刚|刚|都|也|还没|没有|没|还未|还|在){0,4}(?P<phase>烧上|烧开|烧好|烧着|煮上|架上)(?:了|啦|咯|喵|啊|吗|没有|吧|呢|$)")
+_SCENE_TAIL = re.compile(r"^(?:(?:不然|否则|那就)\s*)?(?:(?:快来|赶紧|记得|你来|哥哥来)(?:把|趁|吃|喝|端|关火|进来)|(?:趁热|再热一下|去关火|快进厨房|把火关了|先端过来))")
+_OLD_SCENE = re.compile(r"以后|下回|刚才.{0,5}(?:说|聊|提)|之前.{0,5}(?:说|聊|提)|以前|每次|平时|(?:要|等).{0,12}的?时候")
+_MEAL_OWNERSHIP = re.compile(r"^(?P<actor>我|你|{names})(?:来|自己|负责)?(?:弄|准备|做|煮)(?:今天的?)?(?:这顿|(?:早|午|晚)?饭|早餐|午餐|晚餐)?(?:就好|好了|吧|喵|呀|啊|啦|哦|了)*$")
+_MEAL_RETRACT = re.compile(r"(?:吃完|吃过了|取消|不用.{0,6}(?:做|弄)|不吃了|算了|换成外卖)")
+_NAMED_MEAL = re.compile(r"(?:早|午|晚)[饭餐]")
+_KITCHEN_ENTRY = re.compile(r"进(?:不进|来|厨房)|要不要过来|到底过不过来")
+_MEAL_OWNER_NUDGE = re.compile(r"(?:到底|究竟|赶紧|你决定).{0,12}(?:吃什么|做什么|弄什么)|(?:到底|究竟|赶紧).{0,12}(?:吃啥|做啥|弄啥)")
+
+
+def meal_owner(user_turns, now, nicknames):
+    names = "|".join(map(re.escape, nicknames)) or r"(?!)"
+    pattern = re.compile(_MEAL_OWNERSHIP.pattern.replace("{names}", names))
+    turns = [(body, at) for body, at in user_turns if at and timedelta(0) <= now - at <= timedelta(hours=2)]
+    meal_until = None
+    owner = ""
+    meal = ""
+    for body, at in reversed(turns):
+        for clause, literal in _scene_clauses(body):
+            if not literal:
+                continue
+            if _MEAL_RETRACT.search(clause):
+                owner, meal_until = "", None
+                continue
+            named = _NAMED_MEAL.search(clause)
+            if named and meal != named[0][0]:
+                if meal:
+                    owner = ""
+                meal = named[0][0]
+            if _MEAL.search(clause) or re.search(r"饭(?:吃|弄|做)", clause):
+                meal_until = at + timedelta(minutes=30)
+            match = pattern.fullmatch(clause)
+            if match and (owner or meal_until and at <= meal_until):
+                owner = "user" if match["actor"] == "我" else "bot"
+    return owner
+
+
+def _scene_clauses(body):
+    visible = _QUOTED.sub(lambda m: " " * len(m[0]), body)
+    for pos in re.finditer(r"[^，,。！？!?；;\r\n、]+", visible):
+        clause = pos[0].strip()
+        if not clause:
+            continue
+        i = pos.start() + len(pos[0]) - len(pos[0].lstrip())
+        literal = not (_NOT_FACT.search(clause) or _OLD_SCENE.search(clause)
+                       or any(guard(visible, i) for guard in (
+                           rules.is_reported_clause, rules.is_conditional_clause, rules.is_dream_clause,
+                           rules.is_far_past_clause, rules.is_future_clause, rules.is_third_person_clause)))
+        yield clause, literal and not rules.is_question_clause(visible, i, kw_len=len(clause))
+
+
+def _fact_key(match):
+    values = match.groupdict()
+    item = values.get("food") or values["object"]
+    phase = values["phase"]
+    if item in {"饭菜", "晚饭", "午饭", "早饭", "早餐"}:
+        item = "饭"
+    if item in {"水", "开水", "热水"}:
+        item = "水"
+    phase = {"放凉": "cool", "凉": "cool", "冷": "cool", "上桌": "ready", "摆好": "ready", "端好": "ready",
+             "备好": "ready", "做好": "ready", "准备好": "ready", "煮好": "ready",
+             "烧上": "heating", "烧着": "heating", "煮上": "heating", "架上": "heating",
+             "烧开": "heated", "烧好": "heated", "吃完": "finished"}[phase]
+    return item, phase
+
+
+def _confirmed_scene_fact(clause, hit, facts):
+    item, phase = _fact_key(hit)
+    affirmed = not re.search(r"没|不是|还未", clause[:hit.start()] + hit[0])
+    return facts.get(item) == (phase, affirmed) or (
+        phase == "ready" and affirmed and facts.get(item) == ("cool", True))
+
+
+@dataclass(frozen=True)
+class SceneFacts:
+    face_wash: bool | None
+    objects: tuple
+
+    def hints(self):
+        if self.face_wash is not None:
+            yield "用户正在洗脸，尚未确认洗完。" if self.face_wash else "用户已结束洗脸或确认没在洗脸。"
+        labels = {"cool": "已放凉", "ready": "已备好", "heating": "正在烧", "heated": "已烧好", "finished": "已吃完"}
+        for item, (phase, affirmed) in self.objects:
+            yield f"用户确认{item}{labels[phase] if affirmed else '尚未' + labels[phase].removeprefix('已')}；位置和经手人须另外确认。"
+
+
+def scene_facts(user_turns, now):
+    facts = {}
+    face = None
+    for body, at in user_turns:
+        if at is not None and not timedelta(0) <= now - at <= timedelta(minutes=30):
+            continue
+        for clause, literal in reversed(tuple(_scene_clauses(body))):
+            if not literal:
+                continue
+            if face is None and not clause.startswith(("你", "他", "她")):
+                if _WASH_FACE_END.search(clause):
+                    face = False
+                elif _WASH_FACE_START.fullmatch(clause):
+                    face = True
+            for pattern in (_FOOD_STATE, _HEATING):
+                for match in pattern.finditer(clause):
+                    item, phase = _fact_key(match)
+                    negative = re.search(r"没|不是|还未", clause[:match.start()] + match[0])
+                    facts.setdefault(item, (phase, not bool(negative)))
+    return SceneFacts(face, tuple(facts.items()))
+
+
+def check_scene_facts(text, scene, user_turns, *, owner="", facts=None, now=None):
+    """Check concrete current premises at clause boundaries, keeping independent wording."""
+    facts = facts or scene_facts(user_turns, now or datetime.now())
+    face = facts.face_wash
+    objects = dict(facts.objects)
+    kept, reasons = [], set()
+    rejected = False
+    for sentence in _review_sentences(text):
+        pieces = []
+        visible = _QUOTED.sub(lambda m: " " * len(m[0]), sentence)
+        safe = _IMAGINED.search(visible) or _FICTIONAL.search(visible.strip()) or _OLD_SCENE.search(visible)
+        missing_heat = (not safe and any(not _confirmed_scene_fact(visible, hit, objects) for hit in _HEATING.finditer(visible)))
+        for match in re.finditer(r"[^，,、]+", sentence):
+            piece = match[0].strip()
+            clause = visible[match.start():match.end()].strip()
+            if not piece:
+                continue
+            reason = None
+            if not safe and not _NOT_FACT.search(clause):
+                if (asks_closed_wash(clause) or re.match(r"(?:你|哥哥|姐姐)?\s*(?:洗完脸|脸洗完)(?:了)?(?:没|吗|么)", clause)
+                        ) and not face and not (scene[1] == "shower" and scene[2] in ("self", "together")):
+                    reason = "unconfirmed_wash_progress"
+                elif any(not _confirmed_scene_fact(clause, hit, objects)
+                         for pattern in (_FOOD_STATE, _HEATING) for hit in pattern.finditer(clause)):
+                    reason = "unconfirmed_scene_detail"
+                elif missing_heat and _KITCHEN_ENTRY.search(clause):
+                    reason = "unsupported_followup"
+                elif owner == "bot" and _MEAL_OWNER_NUDGE.search(clause):
+                    reason = "meal_already_assigned"
+                elif rejected and _SCENE_TAIL.match(clause):
+                    reason = "unsupported_followup"
+            if reason:
+                rejected = True
+                reasons.add(reason)
+            else:
+                pieces.append(piece)
+        if not pieces:
+            continue
+        if len(pieces) == len([part for part in re.split(r"[，,、]", sentence) if part.strip()]):
+            kept.append(sentence)
+        elif len(pieces) > 1 or not re.fullmatch(r"哥哥|姐姐|宝贝|宝宝|你呀", pieces[0]):
+            kept.append("，".join(pieces))
+    return ("\n".join(kept), reasons) if reasons else (text, set())
+
+
 def polish_reply(text, scene, user_turns=(), appointments=(), *, now=None):
     """Filter clear contradictions and repeated actions before QQ segmentation."""
     now = now or datetime.now()
@@ -562,7 +743,19 @@ def topics(text, *, from_user=False):
     return sorted(set(found))
 
 
-_NO_REPLY = re.compile(r"(?:你|哥哥|姐姐)(?:你|怎么|还|一直|到现在|现在|根本|又|都|也|是不是){0,6}(?:没(?:有)?|不)(?:回(?:我|消息|话|复)|理我)")
+_ADDED_PRESSURE = re.compile(r"怎么|一直|根本|都|又|到现在")
+_SOCIAL_SILENCE = re.compile(
+    r"(?:一上午|一下午|一整天|一晚上|大半天|半天|等了(?:好久|很久|一会儿)|(?:这么|那么)久|三个?小时)"
+    r"(?:了|也|还|都|一直|一点|仍然|对方|哥哥|你){0,6}(?:没(?:有)?(?:声音|动静|消息|吭声|说话|回音|回话)|不吭声)"
+)
+_SILENCE_DEVICE = re.compile(r"耳机|喇叭|音响|扬声器|麦克风|直播|视频|音频|语音|设备|游戏|电视|静音|手机外放")
+_WAIT_GUILT = re.compile(r"等(?:着?你)?(?:回(?:复|话|消息))?等?得.{0,12}(?:呆毛.{0,4}蔫|委屈|生气|难过|快哭|快疯|心凉)|等得.{0,7}蔫")
+_CALL_FOR_REPLY = re.compile(r"(?:倒是|好歹)(?:也|先|就|来|跟我|给我){0,2}(?:说(?:句|句话|一声)|回(?:我|句话|一句|一声|话)|吭(?:个|一)?声)")
+_OPENING = re.compile(
+    r"^(?P<greeting>(?:(?:哥哥|姐姐|哥|姐|宝贝|宝宝)[，, \t]*)?"
+    r"(?:早上好|晚上好|午安|早安|早[啊呀喵]?|嗨[呀喵]?))[，, \t]+"
+    r"|^(?P<question>[^，,。！？?！\n]{0,12}(?:在忙|有空|醒了)(?:吗|嘛|么|没))(?=[，, \t])"
+)
 _MEAL = re.compile(r"吃饭|饭点|吃(?:午饭|晚饭|午餐|晚餐|午觉后的饭)|(?:早|午|晚)[饭餐]|饭(?:又|不会|都|已经|好了)|做饭|弄(?:点)?吃的")
 _MEAL_INVITE = re.compile(r"(?:一起|一块|咱俩|我们).{0,5}吃|吃饭(?:吧|去)|我.{0,6}(?:去|要|会)吃饭")
 _MEAL_PRESSURE = re.compile(r"^(?:你|哥哥|姐姐)?(?:不要|不吃|不来吃)(?:的话|也行)[，, ]*(?:那)?我(?:可)?就(?:先)?自己吃")
@@ -683,14 +876,45 @@ def _trim_chat_timing(text, turns, appointments, now):
     return ("\n".join(kept), "unconfirmed_schedule") if edited else (text, None)
 
 
-def check_proactive_assumptions(text, user_turns, appointments, now, replied):
+def _no_reply_pattern(nicknames):
+    names = "|".join(map(re.escape, sorted({"我", *nicknames}, key=len, reverse=True)))
+    return re.compile(
+        rf"(?:(?:你|您|哥哥|姐姐)\s*|(?:^|(?<=[，,、\s吗嘛么]))(?:(?:哥|姐)\s*)?)"
+        rf"(?P<tone>(?:到现在|这会儿|今天|下午|怎么|还|一直|根本|又|都|也|是不是){{0,6}})"
+        rf"\s*(?:没(?:有)?|不)(?:(?P<ignoring>搭理|理)(?:{names})"
+        rf"|回(?:复|应)?(?:{names})(?:的?(?:消息|话))?|回(?:复|应|消息|话))"
+        rf"(?=\s*(?:[了呢啊吧嘛呀喵咯哦。！？?!，、,；;…～]|$))"
+    )
+
+
+def _safe_opening(sentence):
+    match = _OPENING.match(sentence)
+    if match:
+        if match["greeting"]:
+            return match["greeting"] + "。"
+        return match["question"] + "？"
+    return ""
+
+
+def check_proactive_assumptions(text, user_turns, appointments, now, replied, *, bot_nicknames=()):
     clean, timing = check_chat_timing(text, user_turns, appointments, now)
     reasons = {timing} if timing else set()
+    no_reply = _no_reply_pattern(bot_nicknames)
     kept = []
     for sentence in _review_sentences(clean):
         content = _QUOTED.sub(" ", sentence).strip()
-        if replied is not False and _NO_REPLY.search(content) and not _IMAGINED.search(content):
-            reasons.add("reply_received" if replied else "no_reply_unverified")
+        hypothetical = _IMAGINED.search(content)
+        complaint = no_reply.search(content)
+        if not hypothetical and (_CALL_FOR_REPLY.search(content) or _WAIT_GUILT.search(content)
+                                 or (_SOCIAL_SILENCE.search(content) and not _SILENCE_DEVICE.search(content))):
+            reasons.add("reply_pressure")
+            if greeting := _safe_opening(sentence):
+                kept.append(greeting)
+        elif (complaint and not hypothetical
+              and (replied is not False or complaint["ignoring"] or _ADDED_PRESSURE.search(complaint["tone"]))):
+            reasons.add("reply_received" if replied else "no_reply_unverified" if replied is None else "reply_pressure")
+            if greeting := _safe_opening(sentence):
+                kept.append(greeting)
         elif _MEAL_PRESSURE.search(content) and not _meal_supported(user_turns, appointments, now):
             reasons.add("unconfirmed_meal_pressure")
         else:

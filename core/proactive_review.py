@@ -86,6 +86,8 @@ _RESULTS = {
     "outreach_waiting_for_reply", "social_answered", "stale_generation", "empty_generation", "sleeping", "cancelled", "error",
 }
 _CHECKS = {
+    "reply_pressure", "unconfirmed_wash_progress", "unconfirmed_scene_detail", "meal_already_assigned",
+    "timed_sleep_pending",
     "draft_removed", "draft_blocked", "answered_echo", "reply_received", "no_reply_unverified", "unconfirmed_meal_pressure",
     "same_reply", "unconfirmed_schedule", "unconfirmed_presence", "unconfirmed_bath", "unconfirmed_dessert", "unconfirmed_inventory",
     "unconfirmed_experience", "unsupported_followup", "unsupported_plan", "unconfirmed_catch_up",

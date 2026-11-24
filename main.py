@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
+from .core import timed_sleep
 from .core.event_detector import EventRuleStore, extract_message_text
 from .core.migrations import migrate_config
 from .core.reply_guard import clean_final_response, clean_loaded_messages, clean_result_chain, response_text
@@ -26,7 +28,7 @@ from .core.persistence import atomic_write_json
 from .core.web_panel import PanelHttpServer
 
 TAG = "[Minichat]"
-VERSION = "v0.3.14"
+VERSION = "v0.3.15"
 
 
 class ProactiveMiniPlugin(star.Star):
@@ -203,6 +205,7 @@ class ProactiveMiniPlugin(star.Star):
         if umo not in self.runner.sessions():
             return
 
+        received_at = time.time()
         runner = self.runner
         has_manager = getattr(runner.context, "conversation_manager", None) is not None
         cid = None
@@ -216,13 +219,31 @@ class ProactiveMiniPlugin(star.Star):
             runner.bind_message_scene(umo, cid)
 
         text = extract_message_text(event)
+        sleep_context = False
+        timed_candidates = tuple(timed_sleep.candidates(text, pending=bool(runner._timed_sleep_at(umo))))
+        if (has_manager and cid and any(not hit.explicit and not hit.cancel for hit in timed_candidates)
+                and not timed_sleep.is_sleep_topic(text)):
+            last_turn = self.store.get(umo, "turn_seq")
+            try:
+                sleep_context = await asyncio.wait_for(runner.timed_sleep_context(umo, cid, text, received_at), 0.75)
+            except Exception as exc:
+                logger.debug(f"{TAG} 定点催睡的上下文读取失败：{type(exc).__name__}")
+            if (self.runner is not runner or not runner._result_current(umo)
+                    or last_turn != self.store.get(umo, "turn_seq")
+                    or self.store.get(umo, "last_message_at", 0) > received_at):
+                if hasattr(event, "set_extra"):
+                    event.set_extra("_minichat_timed_sleep", {"status": "stale"})
+                return
 
-        self.store.touch_message(umo)
+        self.store.touch_message(umo, received_at)
         self.store.reset_unanswered(umo)
 
         pending = None
         try:
-            self.runner.update_from_message(umo, text)
+            self.runner.update_from_message(umo, text, sleep_context=sleep_context)
+            timed_result = runner.take_timed_sleep_result()
+            if timed_result and hasattr(event, "set_extra"):
+                event.set_extra("_minichat_timed_sleep", timed_result)
             if has_manager and not cid and text.strip() and hasattr(event, "set_extra"):
                 event.set_extra("_minichat_scene_turn", self.store.get(umo, "turn_seq"))
             # 与 update 同步取走，保留原会话、消息序号及未消费片段。
@@ -271,6 +292,23 @@ class ProactiveMiniPlugin(star.Star):
             except Exception as e:
                 logger.debug(f"{TAG} 约定灰度任务创建失败: {e}")
 
+    def _timed_sleep_reply_result(self, event):
+        getter = getattr(event, "get_extra", None)
+        result = getter("_minichat_timed_sleep", None) if getter else None
+        if result and result["status"] == "saved" and (
+                not self.runner or self.runner._timed_sleep_at(event.unified_msg_origin) != result["at"]):
+            return {"status": "stale"}
+        return result
+
+    @getattr(filter, "on_llm_request", lambda **_: lambda method: method)()
+    async def timed_sleep_request(self, event, req):
+        result = self._timed_sleep_reply_result(event)
+        if result:
+            req.system_prompt = (req.system_prompt or "") + (
+                "\n[定点催睡实际结果] " + timed_sleep.confirmation(result) +
+                " 用当前角色语气简短说明这个结果。只有保存成功才可承诺到点催。"
+            )
+
     # The historical test harness predates the 4.29 agent hooks.
     @getattr(filter, "on_agent_begin", lambda **_: lambda method: method)()
     async def guard_chat_history(self, event, run_context):
@@ -298,7 +336,11 @@ class ProactiveMiniPlugin(star.Star):
         if self.runner is None or not self.runner._result_current(event.unified_msg_origin):
             return
         refine = None
-        if needs_timing_check(response_text(response)):
+        timed_result = self._timed_sleep_reply_result(event)
+        if timed_result:
+            def refine(text):
+                return timed_sleep.refine_confirmation(text, self._timed_sleep_reply_result(event))
+        elif needs_timing_check(response_text(response)):
             now = datetime.now()
             event_text = getattr(event, "message_str", "") or ""
             try:

@@ -33,7 +33,7 @@ class Store:
             logger.warning(f"[Minichat] 读取状态失败，将从空状态开始: {e}")
         self.data = {}
 
-    def save(self) -> None:
+    def save(self) -> bool:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
@@ -42,8 +42,10 @@ class Store:
                 encoding="utf-8",
             )
             os.replace(tmp, self.path)
+            return True
         except Exception as e:
             logger.warning(f"[Minichat] 保存状态失败: {e}")
+            return False
 
     def session(self, umo: str) -> dict:
         return self.data.setdefault(umo, {})
@@ -73,8 +75,8 @@ class Store:
         except (TypeError, ValueError):
             return default
 
-    def touch_message(self, umo: str) -> None:
-        self.set(umo, "last_message_at", time.time())
+    def touch_message(self, umo: str, received_at: float | None = None) -> None:
+        self.set(umo, "last_message_at", time.time() if received_at is None else received_at)
 
     def minutes_since_message(self, umo: str) -> float:
         last = float(self.get(umo, "last_message_at", 0) or 0)

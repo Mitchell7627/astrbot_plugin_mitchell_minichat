@@ -369,6 +369,9 @@ class PanelService:
                         "started_at": ss.get("started_at"),
                         "wake_at": ss.get("wake_at"),
                         "remind_at": ss.get("remind_at"),
+                        "explicit_clock": bool(ss.get("explicit_clock")),
+                        "remind_local": datetime.fromtimestamp(ss["remind_at"]).strftime("%Y-%m-%d %H:%M")
+                        if ss.get("explicit_clock") and ss.get("remind_at") else None,
                         "last_reminded_at": ss.get("last_reminded_at"),
                         "last_reminded_window": ss.get("last_reminded_window"),
                     }

@@ -227,6 +227,10 @@
     reply_received: "你已经回过，去掉「没理我」", no_reply_unverified: "没有记录能证明未回复",
     unconfirmed_meal_pressure: "没有确认一起吃饭，去掉催促", unconfirmed_schedule: "没有确认时间或同意，去掉倒计时或承诺",
     same_reply: "已去掉同一条里的重复句", unconfirmed_presence: "所在位置未确认", unconfirmed_bath: "洗澡状态未确认",
+    unconfirmed_wash_progress: "没确认开始洗漱，去掉进度追问",
+    unconfirmed_scene_detail: "未确认食物状态或准备进度",
+    meal_already_assigned: "本餐已有分工，去掉重复追问",
+    timed_sleep_pending: "还没到约好的催睡时间",
     unconfirmed_dessert: "甜点状态未确认", unconfirmed_inventory: "物品状态未确认", unconfirmed_experience: "经历未确认",
     unsupported_followup: "后一句依赖已删掉的前提", unsupported_plan: "安排未确认",
     unconfirmed_catch_up: "较早的对话不能确认当前场景",
@@ -317,6 +321,7 @@
         if (!s || !s.state) return "—";
         if (s.state === "sleeping") return `睡眠免打扰 · 到 ${L.fmtClock(s.wake_at)}`;
         if (s.state === "waiting") {
+          if (s.explicit_clock && s.remind_local) return `定点催睡 · ${s.remind_local}`;
           return s.remind_at ? `待睡 · ${L.fmtClock(s.remind_at)} 提醒` : "待睡等待";
         }
         if (s.state === "reminded") {
@@ -367,7 +372,7 @@
       const reasonNames = {
         explicit_delay: "指定等待时间", restored_schedule: "恢复原排程",
         event_window: "压入事件剩余时间", event_sample: "事件窗口内采样",
-        sample: "按频率采样", sleep_alignment: "对齐睡眠提醒",
+        sample: "按频率采样", sleep_alignment: "对齐睡眠提醒", timed_sleep: "对齐定点催睡",
         appointment: "约定优先调整", minimum_delay: "最短等待一分钟",
         stopped: "运行器已停止", sleeping: "睡眠免打扰",
         bot_reply_gap: "正常回复后推迟主动消息", event_restore: "事件插队后恢复原排程",
